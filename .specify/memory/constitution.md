@@ -1,15 +1,23 @@
 <!--
   Sync Impact Report
   ==================
-  Version change: 0.0.0 (template) → 1.0.0
-  Modified principles: N/A (initial fill)
-  Added sections:
-    - 7 Core Principles (Function Isolation, Schema Validation at Boundary,
-      Metadata Enrichment, Managed Identity, Structured Observability,
-      Idempotency, Event Emission Rules)
-    - Ownership Boundaries
-    - Development Workflow
-    - Governance
+  Version change: 1.0.0 → 1.1.0
+  Modified principles:
+    - II (Schema Validation at Boundary): added schema artifact publishing
+      and discovery guidance, schema naming convention
+    - III (Metadata Enrichment): clarified mapping_version source mechanism
+      (env var / Key Vault, "unknown" sentinel fallback)
+    - VI (Idempotency): reframed as effective exactly-once via dedup;
+      specified atomic check-and-emit requirement with write-before-emit
+      fallback
+    - VII (Event Emission Rules): added event-type naming convention
+      (raw.{vendor}.{data_category}.v{major}) and topics.md manifest
+  Added sections / clauses:
+    - Development Workflow: concurrency/scaling limits requirement
+      (host.json tuning per vendor)
+    - Development Workflow: emission contract test definition (CloudEvents
+      envelope, extension attributes, topic naming, dead-letter routing)
+    - Governance: MAJOR amendment quorum (second reviewer required)
   Removed sections: None
   Templates requiring updates:
     - .specify/templates/plan-template.md — ✅ no update needed
@@ -65,9 +73,18 @@ any further processing occurs.
   error response; invalid data MUST NOT propagate downstream.
 - Schema changes MUST follow a backwards-compatible evolution strategy
   or introduce a new version.
+- Schemas in `schemas/` are the authoritative source; they MUST be
+  published as a versioned artifact (e.g., package or CI-produced
+  archive) so that downstream consumers can validate against the same
+  definitions without duplicating them.
+- A `schemas/README.md` MUST document the discovery mechanism (artifact
+  feed URL or package reference) and the schema naming convention:
+  `{vendor}-v{major}.json` (e.g., `pvdaq-v1.json`).
 
 **Rationale:** The boundary is the single place where external data is
 trusted or rejected — garbage must never enter the event backbone.
+Publishing schemas as artifacts prevents downstream drift and
+duplication.
 
 ### III. Metadata Enrichment
 
@@ -79,7 +96,12 @@ before emission.
   `correlation_id`.
 - `mapping_version` tags the version of the vendor-to-raw mapping logic
   that produced the event; this service tags the version but MUST NOT
-  execute canonical mapping.
+  execute canonical mapping. The authoritative mapping version MUST be
+  published by the mapping service as an environment variable
+  (`MAPPING_VERSION_{VENDOR}`) or a Key Vault secret; this service
+  reads the value at startup and stamps it onto events. If the version
+  is unavailable, the Function MUST use the sentinel value `"unknown"`
+  and emit a warning metric.
 - Enrichment MUST NOT mutate the original payload; metadata MUST be
   attached in an envelope or dedicated metadata block alongside the raw
   data.
@@ -130,15 +152,21 @@ observability here protects the entire pipeline.
 
 ### VI. Idempotency
 
-Every ingestion path MUST guarantee exactly-once semantics for event
-emission within the boundary.
+Every ingestion path MUST guarantee effective exactly-once semantics
+for event emission within the boundary, achieved through at-least-once
+delivery combined with idempotent deduplication.
 
 - Each inbound request or polled record MUST be assigned a
   deterministic idempotency key derived from the payload content (e.g.,
   vendor + site + timestamp hash), not from transport-level IDs.
-- Before emission, the Function MUST check the idempotency store
-  (e.g., Table Storage, Redis) for a prior record of that key; if
-  found, the Function MUST return success without re-emitting.
+- The idempotency check and event emission MUST be performed as an
+  atomic operation: the Function MUST write the idempotency record and
+  emit the event within a single transactional scope (e.g., conditional
+  insert to Table Storage followed by output binding, with rollback on
+  failure). If true atomicity is not achievable, the Function MUST
+  write the idempotency record *before* emission and accept that a
+  crash between write and emit may require manual replay from
+  dead-letter inspection — preferring at-most-once over duplication.
 - Idempotency records MUST include a TTL appropriate to the vendor's
   delivery semantics (minimum 24 hours for poll-based sources).
 - Idempotency MUST be enforced at the boundary — downstream services
@@ -146,7 +174,8 @@ emission within the boundary.
 
 **Rationale:** Vendor APIs retry, webhooks replay, and polls overlap —
 the boundary must absorb duplicates so the event backbone never sees
-them.
+them. True distributed exactly-once is impractical; write-before-emit
+with dead-letter recovery provides the best practical guarantee.
 
 ### VII. Event Emission Rules
 
@@ -160,7 +189,10 @@ immutable, self-describing messages.
   or a dedicated metadata block.
 - Emission MUST target a single, well-known topic or queue per event
   type; routing logic MUST NOT be embedded in the Function beyond
-  topic selection.
+  topic selection. Event types MUST follow the naming convention
+  `raw.{vendor}.{data_category}.v{major}` (e.g.,
+  `raw.pvdaq.generation.v1`, `raw.pvoutput.system.v1`). A new event
+  type MUST be registered in a `topics.md` manifest before first use.
 - Failed emissions MUST be retried with exponential backoff; after
   exhausting retries, the event MUST be routed to a dead-letter
   destination and an alert MUST fire.
@@ -194,11 +226,23 @@ self-describing messages and never silently drop data.
 ## Development Workflow
 
 - All changes MUST pass schema validation unit tests and emission
-  contract tests before merge.
+  contract tests before merge. Emission contract tests MUST verify:
+  (a) the emitted message conforms to the CloudEvents envelope schema,
+  (b) required extension attributes (`source_vendor`, `schema_version`,
+  `correlation_id`) are present, (c) the target topic matches the
+  event-type naming convention, and (d) dead-letter routing activates
+  after retry exhaustion.
 - New vendor integrations MUST include: a JSON Schema, an integration
   test with sample payloads, and observability instrumentation.
 - Infrastructure changes MUST be expressed as code (Bicep / Terraform)
   and reviewed alongside application changes.
+- Each Function MUST declare its concurrency and scaling limits in
+  `host.json` or per-function configuration. At minimum:
+  `maxConcurrentRequests` (HTTP triggers), `batchSize` and
+  `maxBatchSize` (queue triggers), and `maxPollingInterval` (timer
+  triggers) MUST be tuned per vendor to respect upstream rate limits
+  and avoid self-inflicted throttling. Default values MUST NOT be used
+  without explicit justification in the PR description.
 - Every PR MUST demonstrate that the 7 Core Principles are upheld; the
   plan's Constitution Check gate enforces this.
 
@@ -208,7 +252,9 @@ This constitution supersedes all other development practices for the
 energy-ingestion-boundary repository. Amendments require:
 
 1. A written proposal documenting the change and its rationale.
-2. Review and approval by the repository owner.
+2. Review and approval by the repository owner. MAJOR amendments
+   (principle removal or redefinition) MUST additionally be approved by
+   at least one other maintainer or technical lead.
 3. A migration plan if the amendment affects existing Functions or
    emitted event schemas.
 4. Version bump following semantic versioning (MAJOR for principle
@@ -218,4 +264,4 @@ energy-ingestion-boundary repository. Amendments require:
 All pull requests and code reviews MUST verify compliance with these
 principles. Violations MUST be resolved before merge.
 
-**Version**: 1.0.0 | **Ratified**: 2026-02-19 | **Last Amended**: 2026-02-19
+**Version**: 1.1.0 | **Ratified**: 2026-02-19 | **Last Amended**: 2026-02-19
