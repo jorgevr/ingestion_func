@@ -1,50 +1,221 @@
-# [PROJECT_NAME] Constitution
-<!-- Example: Spec Constitution, TaskFlow Constitution, etc. -->
+<!--
+  Sync Impact Report
+  ==================
+  Version change: 0.0.0 (template) → 1.0.0
+  Modified principles: N/A (initial fill)
+  Added sections:
+    - 7 Core Principles (Function Isolation, Schema Validation at Boundary,
+      Metadata Enrichment, Managed Identity, Structured Observability,
+      Idempotency, Event Emission Rules)
+    - Ownership Boundaries
+    - Development Workflow
+    - Governance
+  Removed sections: None
+  Templates requiring updates:
+    - .specify/templates/plan-template.md — ✅ no update needed
+      (Constitution Check section is dynamic; principles are referenced at
+      plan-generation time)
+    - .specify/templates/spec-template.md — ✅ no update needed
+      (generic template; feature specs will reference constitution at authoring)
+    - .specify/templates/tasks-template.md — ✅ no update needed
+      (task phases are feature-driven; constitution gates enforced via plan)
+  Follow-up TODOs: None
+-->
+
+# Energy Ingestion Boundary Constitution
+
+## Purpose
+
+The hardened entry point between the outside world and the event
+backbone. This service owns the Azure Functions (Python) that ingest
+data from PVDAQ, PVOutput, and future vendor webhooks, validate it,
+enrich it with metadata, and emit raw events to Event Grid / Service
+Bus.
 
 ## Core Principles
 
-### [PRINCIPLE_1_NAME]
-<!-- Example: I. Library-First -->
-[PRINCIPLE_1_DESCRIPTION]
-<!-- Example: Every feature starts as a standalone library; Libraries must be self-contained, independently testable, documented; Clear purpose required - no organizational-only libraries -->
+### I. Function Isolation
 
-### [PRINCIPLE_2_NAME]
-<!-- Example: II. CLI Interface -->
-[PRINCIPLE_2_DESCRIPTION]
-<!-- Example: Every library exposes functionality via CLI; Text in/out protocol: stdin/args → stdout, errors → stderr; Support JSON + human-readable formats -->
+Every Azure Function MUST operate as an independent unit of deployment
+and failure.
 
-### [PRINCIPLE_3_NAME]
-<!-- Example: III. Test-First (NON-NEGOTIABLE) -->
-[PRINCIPLE_3_DESCRIPTION]
-<!-- Example: TDD mandatory: Tests written → User approved → Tests fail → Then implement; Red-Green-Refactor cycle strictly enforced -->
+- Each vendor integration (PVDAQ, PVOutput, webhook receiver) MUST
+  reside in its own Function with its own trigger binding.
+- Functions MUST NOT share in-process state; all shared context MUST
+  flow through bindings, environment variables, or external stores.
+- A failure in one Function MUST NOT cascade to another; each Function
+  MUST handle its own errors and return appropriate HTTP / trigger
+  status codes.
+- Functions MUST be independently deployable and independently
+  scalable.
 
-### [PRINCIPLE_4_NAME]
-<!-- Example: IV. Integration Testing -->
-[PRINCIPLE_4_DESCRIPTION]
-<!-- Example: Focus areas requiring integration tests: New library contract tests, Contract changes, Inter-service communication, Shared schemas -->
+**Rationale:** Blast-radius containment — a poison message from one
+vendor must never disrupt ingestion of another.
 
-### [PRINCIPLE_5_NAME]
-<!-- Example: V. Observability, VI. Versioning & Breaking Changes, VII. Simplicity -->
-[PRINCIPLE_5_DESCRIPTION]
-<!-- Example: Text I/O ensures debuggability; Structured logging required; Or: MAJOR.MINOR.BUILD format; Or: Start simple, YAGNI principles -->
+### II. Schema Validation at Boundary
 
-## [SECTION_2_NAME]
-<!-- Example: Additional Constraints, Security Requirements, Performance Standards, etc. -->
+Every payload MUST be validated against a versioned JSON Schema before
+any further processing occurs.
 
-[SECTION_2_CONTENT]
-<!-- Example: Technology stack requirements, compliance standards, deployment policies, etc. -->
+- Inbound data (HTTP body, queue message, poll response) MUST be
+  validated as the first processing step after deserialization.
+- Schemas MUST be versioned (e.g., `pvdaq-v1.json`, `pvoutput-v2.json`)
+  and stored in a `schemas/` directory within the repository.
+- Validation failures MUST be rejected immediately with a structured
+  error response; invalid data MUST NOT propagate downstream.
+- Schema changes MUST follow a backwards-compatible evolution strategy
+  or introduce a new version.
 
-## [SECTION_3_NAME]
-<!-- Example: Development Workflow, Review Process, Quality Gates, etc. -->
+**Rationale:** The boundary is the single place where external data is
+trusted or rejected — garbage must never enter the event backbone.
 
-[SECTION_3_CONTENT]
-<!-- Example: Code review requirements, testing gates, deployment approval process, etc. -->
+### III. Metadata Enrichment
+
+Every raw event MUST be enriched with provenance and routing metadata
+before emission.
+
+- Enrichment MUST add at minimum: `source_vendor`, `ingestion_timestamp`
+  (UTC ISO-8601), `schema_version`, `mapping_version`, and
+  `correlation_id`.
+- `mapping_version` tags the version of the vendor-to-raw mapping logic
+  that produced the event; this service tags the version but MUST NOT
+  execute canonical mapping.
+- Enrichment MUST NOT mutate the original payload; metadata MUST be
+  attached in an envelope or dedicated metadata block alongside the raw
+  data.
+- Additional vendor-specific metadata (e.g., site ID, system ID) MUST
+  be extracted and surfaced when available.
+
+**Rationale:** Downstream consumers depend on metadata for routing,
+replay, and audit — events without provenance are untraceable.
+
+### IV. Managed Identity
+
+All authentication to Azure services MUST use Managed Identity; no
+secrets in code or configuration.
+
+- Functions MUST authenticate to Event Grid, Service Bus, Key Vault,
+  and any other Azure resource using System-Assigned or User-Assigned
+  Managed Identity.
+- Connection strings, API keys, and SAS tokens MUST NOT appear in
+  application settings, source code, or environment variables; secrets
+  required for third-party vendor APIs MUST be retrieved from Key Vault
+  at runtime via Managed Identity.
+- Local development MUST use `DefaultAzureCredential` to fall back to
+  developer identity without code changes.
+- Infrastructure-as-code MUST provision RBAC role assignments; no
+  shared-key access policies.
+
+**Rationale:** Secrets in config are the most common breach vector for
+cloud functions — Managed Identity eliminates this class of risk.
+
+### V. Structured Observability
+
+All logging, tracing, and metrics MUST be structured, correlated, and
+emitted to Azure Monitor / Application Insights.
+
+- Log entries MUST be structured JSON (no free-text print statements);
+  every entry MUST include `correlation_id`, `function_name`, and
+  `vendor`.
+- Functions MUST emit custom metrics for: events received, events
+  validated, events rejected, events emitted, and processing latency.
+- Distributed tracing MUST propagate `traceparent` headers where
+  applicable; all emitted events MUST carry the originating trace ID.
+- Alerts MUST be configurable on: validation failure spikes, emission
+  failures, and abnormal latency.
+
+**Rationale:** The boundary is the first place to detect upstream data
+quality issues and the last place to detect emission failures —
+observability here protects the entire pipeline.
+
+### VI. Idempotency
+
+Every ingestion path MUST guarantee exactly-once semantics for event
+emission within the boundary.
+
+- Each inbound request or polled record MUST be assigned a
+  deterministic idempotency key derived from the payload content (e.g.,
+  vendor + site + timestamp hash), not from transport-level IDs.
+- Before emission, the Function MUST check the idempotency store
+  (e.g., Table Storage, Redis) for a prior record of that key; if
+  found, the Function MUST return success without re-emitting.
+- Idempotency records MUST include a TTL appropriate to the vendor's
+  delivery semantics (minimum 24 hours for poll-based sources).
+- Idempotency MUST be enforced at the boundary — downstream services
+  MUST NOT be relied upon for deduplication of raw events.
+
+**Rationale:** Vendor APIs retry, webhooks replay, and polls overlap —
+the boundary must absorb duplicates so the event backbone never sees
+them.
+
+### VII. Event Emission Rules
+
+All raw events MUST be emitted to Event Grid or Service Bus as
+immutable, self-describing messages.
+
+- Emitted events MUST use a CloudEvents-compatible envelope with
+  `type`, `source`, `id`, `time`, and `datacontenttype` fields.
+- The `data` payload MUST contain the original vendor data unmodified;
+  enrichment metadata MUST reside in CloudEvents extension attributes
+  or a dedicated metadata block.
+- Emission MUST target a single, well-known topic or queue per event
+  type; routing logic MUST NOT be embedded in the Function beyond
+  topic selection.
+- Failed emissions MUST be retried with exponential backoff; after
+  exhausting retries, the event MUST be routed to a dead-letter
+  destination and an alert MUST fire.
+- Events are immutable once emitted — no downstream process may
+  request the boundary to mutate or delete a previously emitted event.
+
+**Rationale:** The event backbone depends on a predictable, immutable
+stream of raw events — the boundary's contract is to emit clean,
+self-describing messages and never silently drop data.
+
+## Ownership Boundaries
+
+### This Service Owns
+
+- Azure Functions (Python) for all vendor integrations
+- Webhook receivers and vendor polling schedules
+- Schema definitions and validation logic
+- Metadata enrichment and mapping version tagging
+- Emission to Event Grid / Service Bus
+- Observability at the ingestion boundary
+- Idempotency store and deduplication logic
+
+### This Service Does NOT Own
+
+- Canonical data model or unit normalization
+- Mapping execution (vendor-to-canonical transformation)
+- AI/ML inference logic
+- Databricks pipelines or downstream processing
+- Event routing rules beyond topic/queue selection
+
+## Development Workflow
+
+- All changes MUST pass schema validation unit tests and emission
+  contract tests before merge.
+- New vendor integrations MUST include: a JSON Schema, an integration
+  test with sample payloads, and observability instrumentation.
+- Infrastructure changes MUST be expressed as code (Bicep / Terraform)
+  and reviewed alongside application changes.
+- Every PR MUST demonstrate that the 7 Core Principles are upheld; the
+  plan's Constitution Check gate enforces this.
 
 ## Governance
-<!-- Example: Constitution supersedes all other practices; Amendments require documentation, approval, migration plan -->
 
-[GOVERNANCE_RULES]
-<!-- Example: All PRs/reviews must verify compliance; Complexity must be justified; Use [GUIDANCE_FILE] for runtime development guidance -->
+This constitution supersedes all other development practices for the
+energy-ingestion-boundary repository. Amendments require:
 
-**Version**: [CONSTITUTION_VERSION] | **Ratified**: [RATIFICATION_DATE] | **Last Amended**: [LAST_AMENDED_DATE]
-<!-- Example: Version: 2.1.1 | Ratified: 2025-06-13 | Last Amended: 2025-07-16 -->
+1. A written proposal documenting the change and its rationale.
+2. Review and approval by the repository owner.
+3. A migration plan if the amendment affects existing Functions or
+   emitted event schemas.
+4. Version bump following semantic versioning (MAJOR for principle
+   removal/redefinition, MINOR for new principles or material
+   expansion, PATCH for clarifications).
+
+All pull requests and code reviews MUST verify compliance with these
+principles. Violations MUST be resolved before merge.
+
+**Version**: 1.0.0 | **Ratified**: 2026-02-19 | **Last Amended**: 2026-02-19
