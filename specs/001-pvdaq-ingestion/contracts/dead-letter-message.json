@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dead-letter-message.json",
+  "title": "PVDAQ Dead-Letter Message",
+  "description": "Schema for messages sent to the pvdaq-dead-letter Service Bus queue when a record fails validation.",
+  "type": "object",
+  "required": [
+    "original_payload",
+    "error_type",
+    "error_details",
+    "correlation_id",
+    "site_id",
+    "timestamp",
+    "source_vendor",
+    "schema_version"
+  ],
+  "properties": {
+    "original_payload": {
+      "type": "object",
+      "description": "The raw PVDAQ record that failed validation — preserved unmodified"
+    },
+    "error_type": {
+      "type": "string",
+      "const": "validation_failure"
+    },
+    "error_details": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["message", "path"],
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "Human-readable validation error message"
+          },
+          "path": {
+            "type": "string",
+            "description": "JSON path to the failing field (e.g., '$.SiteID')"
+          },
+          "validator": {
+            "type": "string",
+            "description": "Name of the JSON Schema validator that failed (e.g., 'required', 'type')"
+          }
+        }
+      },
+      "minItems": 1,
+      "description": "List of validation errors"
+    },
+    "correlation_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Invocation correlation ID for tracing"
+    },
+    "site_id": {
+      "description": "PVDAQ site ID extracted for debugging (integer if available, null if extraction failed)",
+      "oneOf": [
+        { "type": "integer" },
+        { "type": "null" }
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Time of rejection (UTC ISO-8601)"
+    },
+    "source_vendor": {
+      "type": "string",
+      "const": "PVDAQ"
+    },
+    "schema_version": {
+      "type": "string",
+      "description": "Schema version that was used for validation",
+      "examples": ["v1"]
+    }
+  },
+  "additionalProperties": false
+}

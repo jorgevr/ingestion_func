@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell -ExecutionPolicy Bypass -Command \"& ''./.specify/scripts/powershell/setup-plan.ps1'' -Json\")",
+      "Bash(pwsh -NoProfile -File .specify/scripts/powershell/update-agent-context.ps1 -AgentType claude)",
+      "Bash(powershell.exe -NoProfile -File .specify/scripts/powershell/update-agent-context.ps1 -AgentType claude)"
+    ]
+  }
+}

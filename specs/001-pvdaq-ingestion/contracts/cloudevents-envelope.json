@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cloudevents-envelope.json",
+  "title": "PVDAQ Ingestion CloudEvents Envelope",
+  "description": "Schema for CloudEvents-compatible messages emitted to the raw-energy-events Service Bus topic by the PVDAQ ingestion function.",
+  "type": "object",
+  "required": [
+    "specversion",
+    "type",
+    "source",
+    "id",
+    "time",
+    "datacontenttype",
+    "tenant_id",
+    "source_vendor",
+    "schema_version",
+    "mapping_version",
+    "correlation_id",
+    "ingestion_timestamp",
+    "traceparent",
+    "data"
+  ],
+  "properties": {
+    "specversion": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "type": {
+      "type": "string",
+      "pattern": "^raw\\.[a-z]+\\.[a-z_]+\\.v[0-9]+$",
+      "examples": ["raw.pvdaq.generation.v1"]
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^/energy-ingestion-boundary/",
+      "examples": ["/energy-ingestion-boundary/pvdaq"]
+    },
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique event identifier (UUID v4)"
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Event emission timestamp (UTC ISO-8601)"
+    },
+    "datacontenttype": {
+      "type": "string",
+      "const": "application/json"
+    },
+    "tenant_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Tenant identifier from configuration",
+      "examples": ["research"]
+    },
+    "source_vendor": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Vendor name for routing and observability",
+      "examples": ["PVDAQ"]
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^v[0-9]+$",
+      "description": "Version of the validation schema used",
+      "examples": ["v1"]
+    },
+    "mapping_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Version of vendor-to-raw mapping logic; 'unknown' sentinel if unavailable",
+      "examples": ["unknown", "1.0.0"]
+    },
+    "correlation_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Correlation ID generated per function invocation"
+    },
+    "ingestion_timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Time of metadata enrichment (UTC ISO-8601)"
+    },
+    "traceparent": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$",
+      "description": "W3C Trace Context traceparent header from invocation context"
+    },
+    "data": {
+      "type": "object",
+      "description": "Original vendor payload — unmodified"
+    }
+  },
+  "additionalProperties": false
+}
