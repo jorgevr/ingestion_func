@@ -1,0 +1,41 @@
+> """Schema validation for PVDAQ telemetry records.
+  
+> Loads the PVDAQ JSON Schema at module level and exposes a validation
+> function that collects all errors for a given record.
+> """
+  
+> from __future__ import annotations
+  
+> import json
+> from pathlib import Path
+  
+> from jsonschema import Draft202012Validator
+  
+> _SCHEMA_PATH = Path(__file__).resolve().parent.parent / "schemas" / "pvdaq-v1.json"
+> _SCHEMA: dict = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+> _VALIDATOR = Draft202012Validator(_SCHEMA)
+  
+  
+> def validate_record(record: dict) -> tuple[bool, list[dict]]:
+>     """Validate a single PVDAQ record against the schema.
+  
+>     Args:
+>         record: A dictionary representing a PVDAQ telemetry record.
+  
+>     Returns:
+>         A tuple of ``(is_valid, error_details)`` where *error_details* is a
+>         list of dicts with keys ``message``, ``path``, and ``validator``.
+>         The list is empty when the record is valid.
+>     """
+>     errors: list[dict] = []
+>     for error in _VALIDATOR.iter_errors(record):
+>         path = ".".join(str(p) for p in error.absolute_path) if error.absolute_path else "$"
+>         errors.append(
+>             {
+>                 "message": error.message,
+>                 "path": path,
+>                 "validator": error.validator,
+>             }
+>         )
+  
+>     return (len(errors) == 0, errors)

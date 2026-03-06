@@ -1,0 +1,240 @@
+> """OEDI Data Lake client for PVDAQ photovoltaic telemetry.
+  
+> Downloads daily CSV files from the public S3 bucket at
+> https://oedi-data-lake.s3.amazonaws.com/pvdaq/csv/ and normalizes
+> records to match the pvdaq-v1.json schema (SiteID, measdatetime).
+> """
+  
+> from __future__ import annotations
+  
+> import asyncio
+> import csv
+> import io
+> import logging
+> import re
+> from typing import Any
+  
+> import httpx
+  
+> logger = logging.getLogger(__name__)
+  
+> MAX_RETRIES = 3
+> BASE_BACKOFF_SECONDS = 1.0
+  
+  # Regex to strip sensor ID suffixes: dc_power__346 → dc_power
+> _SENSOR_SUFFIX = re.compile(r"__\d+$")
+  
+  
+> class OediAccessError(Exception):
+>     """Raised when an OEDI Data Lake request fails after all retries."""
+  
+  
+> class OediDataLakeClient:
+>     """Async client for the OEDI PVDAQ Data Lake (public S3 bucket).
+  
+>     Args:
+>         bucket_url: Base URL of the S3 bucket
+>             (default ``https://oedi-data-lake.s3.amazonaws.com``).
+>         systems_key: S3 key for the systems inventory CSV.
+>         data_prefix: S3 key prefix for site telemetry data.
+>         http_client: Optional pre-built ``httpx.AsyncClient`` for testability.
+>     """
+  
+>     def __init__(
+>         self,
+>         bucket_url: str = "https://oedi-data-lake.s3.amazonaws.com",
+>         systems_key: str = "pvdaq/csv/systems_20250729.csv",
+>         data_prefix: str = "pvdaq/csv/pvdata",
+>         http_client: httpx.AsyncClient | None = None,
+>     ) -> None:
+>         self._bucket_url = bucket_url.rstrip("/")
+>         self._systems_key = systems_key
+>         self._data_prefix = data_prefix.rstrip("/")
+>         self._http_client = http_client
+>         self._owns_client = http_client is None
+  
+>     async def _get_client(self) -> httpx.AsyncClient:
+>         if self._http_client is None:
+>             self._http_client = httpx.AsyncClient(timeout=60.0)
+>         return self._http_client
+  
+>     async def _get_with_retry(self, url: str) -> httpx.Response:
+>         """GET a URL with exponential backoff on 5xx/timeout errors.
+  
+>         Returns the response on success. Raises OediAccessError after
+>         exhausting retries. Returns None-like 404 handling is done by callers.
+>         """
+>         client = await self._get_client()
+>         last_error: Exception | None = None
+  
+>         for attempt in range(1, MAX_RETRIES + 1):
+>             try:
+>                 response = await client.get(url)
+  
+>                 if response.status_code == 404:
+>                     return response  # Let caller decide how to handle
+  
+>                 if response.status_code >= 500:
+>                     backoff = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+>                     logger.warning(
+>                         "OEDI S3 error %d for %s, retrying in %.1fs (attempt %d/%d)",
+>                         response.status_code,
+>                         url,
+>                         backoff,
+>                         attempt,
+>                         MAX_RETRIES,
+>                     )
+>                     last_error = OediAccessError(f"HTTP {response.status_code} from {url}")
+>                     if attempt < MAX_RETRIES:
+>                         await asyncio.sleep(backoff)
+>                     continue
+  
+>                 response.raise_for_status()
+>                 return response
+  
+>             except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as exc:
+>                 backoff = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
+>                 logger.warning(
+>                     "OEDI connection error for %s: %s, retrying in %.1fs (attempt %d/%d)",
+>                     url,
+>                     exc,
+>                     backoff,
+>                     attempt,
+>                     MAX_RETRIES,
+>                 )
+>                 last_error = exc
+>                 if attempt < MAX_RETRIES:
+>                     await asyncio.sleep(backoff)
+  
+>         raise OediAccessError(f"OEDI request failed for {url} after {MAX_RETRIES} retries: {last_error}")
+  
+>     async def fetch_systems_list(self) -> list[int]:
+>         """Download the systems inventory CSV and extract system IDs.
+  
+>         Returns:
+>             Sorted list of integer system IDs.
+  
+>         Raises:
+>             OediAccessError: If the systems CSV cannot be fetched.
+>         """
+>         url = f"{self._bucket_url}/{self._systems_key}"
+>         response = await self._get_with_retry(url)
+  
+>         if response.status_code == 404:
+>             raise OediAccessError(f"Systems list not found at {url}")
+  
+>         reader = csv.DictReader(io.StringIO(response.text))
+>         system_ids: list[int] = []
+>         for row in reader:
+>             raw_id = row.get("system_id", "").strip()
+>             if raw_id:
+>                 try:
+>                     system_ids.append(int(raw_id))
+>                 except ValueError:
+>                     logger.warning("Skipping non-integer system_id: %s", raw_id)
+  
+>         return sorted(system_ids)
+  
+>     async def fetch_daily_site_data(
+>         self,
+>         system_id: int,
+>         year: int,
+>         month: int,
+>         day: int,
+>     ) -> list[dict[str, Any]]:
+>         """Download a daily CSV for a site and normalize to PVDAQ schema.
+  
+>         Normalization rules:
+>         - ``system_id`` → ``SiteID`` (int)
+>         - ``measured_on`` → ``measdatetime`` (string)
+>         - Sensor suffixes stripped: ``dc_power__346`` → ``dc_power``
+>         - Numeric strings are cast to float where possible
+  
+>         Args:
+>             system_id: PVDAQ system identifier.
+>             year: Data year.
+>             month: Data month (1-12).
+>             day: Data day (1-31).
+  
+>         Returns:
+>             List of normalized record dicts matching pvdaq-v1.json schema.
+>             Empty list if the CSV does not exist (404).
+  
+>         Raises:
+>             OediAccessError: If the request fails after retries (non-404).
+>         """
+>         filename = f"system_{system_id}__date_{year}_{month:02d}_{day:02d}.csv"
+>         key = (
+>             f"{self._data_prefix}/system_id={system_id}"
+>             f"/year={year}/month={month}/day={day}/{filename}"
+>         )
+>         url = f"{self._bucket_url}/{key}"
+  
+>         response = await self._get_with_retry(url)
+  
+>         if response.status_code == 404:
+>             logger.info("No data for system %d on %04d-%02d-%02d (404)", system_id, year, month, day)
+>             return []
+  
+>         reader = csv.DictReader(io.StringIO(response.text))
+>         records: list[dict[str, Any]] = []
+  
+>         for row in reader:
+>             normalized = _normalize_record(row)
+>             if normalized is not None:
+>                 records.append(normalized)
+  
+>         return records
+  
+>     async def close(self) -> None:
+>         """Close the underlying HTTP client if owned by this instance."""
+>         if self._http_client is not None and self._owns_client:
+!             await self._http_client.aclose()
+  
+>     async def __aenter__(self) -> OediDataLakeClient:
+>         return self
+  
+>     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+>         await self.close()
+  
+  
+> def _normalize_record(row: dict[str, str]) -> dict[str, Any] | None:
+>     """Normalize an OEDI CSV row to match the pvdaq-v1.json schema.
+  
+>     Returns None if the row cannot be normalized (missing required fields).
+>     """
+>     raw_system_id = row.get("system_id", "").strip()
+>     measured_on = row.get("measured_on", "").strip()
+  
+>     if not raw_system_id or not measured_on:
+>         logger.warning("Skipping row with missing system_id or measured_on: %s", row)
+>         return None
+  
+>     try:
+>         site_id = int(float(raw_system_id))
+>     except (ValueError, TypeError):
+>         logger.warning("Skipping row with non-numeric system_id: %s", raw_system_id)
+>         return None
+  
+>     record: dict[str, Any] = {
+>         "SiteID": site_id,
+>         "measdatetime": measured_on,
+>     }
+  
+      # Copy remaining columns with sensor suffix stripped and numeric casting
+>     for key, value in row.items():
+>         if key in ("system_id", "measured_on"):
+>             continue
+  
+>         clean_key = _SENSOR_SUFFIX.sub("", key)
+>         stripped = value.strip() if isinstance(value, str) else value
+  
+>         if stripped == "" or stripped is None:
+>             continue
+  
+>         try:
+>             record[clean_key] = float(stripped)
+>         except (ValueError, TypeError):
+>             record[clean_key] = stripped
+  
+>     return record

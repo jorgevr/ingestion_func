@@ -1,0 +1,28 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "OEDI_BUCKET_URL": "https://oedi-data-lake.s3.amazonaws.com",
+    "OEDI_SYSTEMS_KEY": "pvdaq/csv/systems_20250729.csv",
+    "OEDI_DATA_PREFIX": "pvdaq/csv/pvdata",
+    "PVDAQ_SITE_IDS": "",
+    "PVDAQ_SITE_COUNT": "30",
+    "PVDAQ_LOOKBACK_HOURS": "24",
+    "PVDAQ_CRON_SCHEDULE": "0 0 */6 * * *",
+    "SERVICE_BUS_TOPIC_NAME": "raw-energy-events",
+    "DEAD_LETTER_QUEUE_NAME": "pvdaq-dead-letter",
+    "ServiceBusConnection__fullyQualifiedNamespace": "<namespace>.servicebus.windows.net",
+    "IDEMPOTENCY_TABLE_NAME": "pvdaqidempotency",
+    "TableStorageConnection__tableServiceUri": "https://<account>.table.core.windows.net",
+    "TENANT_ID": "research",
+    "MAPPING_VERSION_PVDAQ": "unknown",
+    "SCHEMA_VERSION_PVDAQ": "v1",
+
+    "PVDAQ_HISTORICAL_SITE_IDS": "9068,9069,2107,7333",
+    "PVDAQ_HISTORICAL_CRON_SCHEDULE": "0 0 */6 * * *",
+    "PVDAQ_HISTORICAL_QUEUE_NAME": "pvdaq-historical-work",
+    "FILE_TRACKING_TABLE_NAME": "PvdaqFileTracking",
+    "OEDI_HISTORICAL_PREFIX": "pvdaq/2023-solar-data-prize"
+  }
+}
