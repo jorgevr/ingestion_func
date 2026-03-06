@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pvdaq-v1.json",
+  "title": "PVDAQ Telemetry Record v1",
+  "description": "Validation schema for a single PVDAQ telemetry record. Requires SiteID and measdatetime; all other fields are optional to accommodate varying PVDAQ system types.",
+  "type": "object",
+  "required": ["SiteID", "measdatetime"],
+  "properties": {
+    "SiteID": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "PVDAQ site identifier"
+    },
+    "measdatetime": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}(:\\d{2})?",
+      "description": "Measurement timestamp in ISO-8601 or PVDAQ datetime format"
+    },
+    "ac_power": {
+      "type": "number",
+      "description": "AC power output (W)"
+    },
+    "dc_power": {
+      "type": "number",
+      "description": "DC power output (W)"
+    },
+    "poa_irradiance": {
+      "type": "number",
+      "description": "Plane-of-array irradiance (W/m²)"
+    },
+    "ambient_temp": {
+      "type": "number",
+      "description": "Ambient temperature (°C)"
+    },
+    "module_temp": {
+      "type": "number",
+      "description": "Module temperature (°C)"
+    },
+    "wind_speed": {
+      "type": "number",
+      "description": "Wind speed (m/s)"
+    },
+    "inverter_efficiency": {
+      "type": "number",
+      "description": "Inverter efficiency (%)"
+    }
+  },
+  "additionalProperties": true
+}

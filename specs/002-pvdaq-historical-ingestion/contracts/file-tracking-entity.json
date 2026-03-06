@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "file-tracking-entity.json",
+  "title": "File Tracking Entity",
+  "description": "Azure Table Storage entity tracking discovery and processing status of each CSV file. PartitionKey = site_id (string), RowKey = SHA-256 hash of S3 key.",
+  "type": "object",
+  "required": ["PartitionKey", "RowKey", "S3Key", "FileName", "Size", "LastModified", "Status"],
+  "properties": {
+    "PartitionKey": {
+      "type": "string",
+      "description": "Site ID as string (e.g., '9068')"
+    },
+    "RowKey": {
+      "type": "string",
+      "maxLength": 64,
+      "description": "SHA-256 hash of the full S3 key, truncated to 64 characters"
+    },
+    "S3Key": {
+      "type": "string",
+      "description": "Full S3 object key"
+    },
+    "FileName": {
+      "type": "string",
+      "description": "Basename of the S3 key"
+    },
+    "Size": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "File size in bytes from S3 listing"
+    },
+    "LastModified": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 last-modified timestamp from S3 listing"
+    },
+    "Status": {
+      "type": "string",
+      "enum": ["queued", "processing", "completed", "failed"],
+      "description": "Current processing status"
+    },
+    "EnqueuedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp when the work item was dispatched"
+    },
+    "CompletedAt": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "ISO-8601 timestamp when the worker finished processing"
+    },
+    "RecordsEmitted": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of records successfully emitted from this file"
+    },
+    "CorrelationId": {
+      "type": "string",
+      "description": "Correlation ID of the dispatcher run that enqueued this file"
+    }
+  },
+  "additionalProperties": true
+}

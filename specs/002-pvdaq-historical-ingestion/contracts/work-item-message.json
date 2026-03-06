@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "work-item-message.json",
+  "title": "Historical CSV Work Item Message",
+  "description": "Message dispatched by the historical-dispatcher function to the historical-worker queue. Each message represents one CSV file to download and process.",
+  "type": "object",
+  "required": ["site_id", "s3_key", "file_name", "correlation_id", "enqueued_at"],
+  "properties": {
+    "site_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "PVDAQ site identifier (e.g., 9068)"
+    },
+    "s3_key": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Full S3 object key for the CSV file"
+    },
+    "file_name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Basename of the CSV file (e.g., 9068_ac_power_data.csv)"
+    },
+    "correlation_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "UUID correlation ID for distributed tracing"
+    },
+    "enqueued_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp when the work item was dispatched"
+    }
+  },
+  "additionalProperties": false
+}

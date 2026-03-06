@@ -1,0 +1,16 @@
+tests/
+specs/
+.venv/
+__pycache__/
+.git/
+.github/
+.specify/
+.claude/
+*.pyc
+*.pyo
+local.settings.json
+local.settings.json.template
+requirements-dev.txt
+.gitignore
+CLAUDE.md
+topics.md
