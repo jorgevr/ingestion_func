@@ -20,10 +20,9 @@ from typing import Any
 
 import httpx
 
-logger = logging.getLogger(__name__)
+from src.http_retry import MAX_RETRIES, BASE_BACKOFF_SECONDS, get_with_retry
 
-MAX_RETRIES = 3
-BASE_BACKOFF_SECONDS = 1.0
+logger = logging.getLogger(__name__)
 
 # S3 XML namespace for ListObjectsV2 responses
 _S3_NS = "http://s3.amazonaws.com/doc/2006-03-01/"
@@ -65,43 +64,8 @@ class OediHistoricalClient:
     async def _get_with_retry(self, url: str, **kwargs: Any) -> httpx.Response:
         """GET with exponential backoff on 5xx/timeout errors."""
         client = await self._get_client()
-        last_error: Exception | None = None
-
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                response = await client.get(url, **kwargs)
-
-                if response.status_code == 404:
-                    return response
-
-                if response.status_code >= 500:
-                    backoff = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                    logger.warning(
-                        "OEDI S3 error %d for %s, retrying in %.1fs (attempt %d/%d)",
-                        response.status_code, url, backoff, attempt, MAX_RETRIES,
-                    )
-                    last_error = OediHistoricalAccessError(
-                        f"HTTP {response.status_code} from {url}"
-                    )
-                    if attempt < MAX_RETRIES:
-                        await asyncio.sleep(backoff)
-                    continue
-
-                response.raise_for_status()
-                return response
-
-            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as exc:
-                backoff = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                logger.warning(
-                    "OEDI connection error for %s: %s, retrying in %.1fs (attempt %d/%d)",
-                    url, exc, backoff, attempt, MAX_RETRIES,
-                )
-                last_error = exc
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(backoff)
-
-        raise OediHistoricalAccessError(
-            f"OEDI request failed for {url} after {MAX_RETRIES} retries: {last_error}"
+        return await get_with_retry(
+            client, url, error_class=OediHistoricalAccessError, **kwargs,
         )
 
     async def list_csv_files(self, site_id: int) -> list[dict[str, Any]]:

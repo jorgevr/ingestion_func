@@ -143,15 +143,7 @@ class ServiceBusEmitter:
             content_type: MIME content type (default ``application/json``).
             subject: Message subject (default ``validation_failure``).
         """
-        client = await self._get_client()
-        sender: ServiceBusSender
-        async with client.get_queue_sender(queue_name=queue_name) as sender:
-            message = ServiceBusMessage(
-                body=json.dumps(message_body),
-                content_type=content_type,
-                subject=subject,
-            )
-            await sender.send_messages(message)
+        await self.send_queue_message(queue_name, message_body, content_type, subject)
 
     async def emit_cloudevent(
         self,

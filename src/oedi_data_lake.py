@@ -7,7 +7,6 @@ records to match the pvdaq-v1.json schema (SiteID, measdatetime).
 
 from __future__ import annotations
 
-import asyncio
 import csv
 import io
 import logging
@@ -16,10 +15,9 @@ from typing import Any
 
 import httpx
 
-logger = logging.getLogger(__name__)
+from src.http_retry import get_with_retry
 
-MAX_RETRIES = 3
-BASE_BACKOFF_SECONDS = 1.0
+logger = logging.getLogger(__name__)
 
 # Regex to strip sensor ID suffixes: dc_power__346 → dc_power
 _SENSOR_SUFFIX = re.compile(r"__\d+$")
@@ -59,54 +57,9 @@ class OediDataLakeClient:
         return self._http_client
 
     async def _get_with_retry(self, url: str) -> httpx.Response:
-        """GET a URL with exponential backoff on 5xx/timeout errors.
-
-        Returns the response on success. Raises OediAccessError after
-        exhausting retries. Returns None-like 404 handling is done by callers.
-        """
+        """GET a URL with exponential backoff on 5xx/timeout errors."""
         client = await self._get_client()
-        last_error: Exception | None = None
-
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                response = await client.get(url)
-
-                if response.status_code == 404:
-                    return response  # Let caller decide how to handle
-
-                if response.status_code >= 500:
-                    backoff = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                    logger.warning(
-                        "OEDI S3 error %d for %s, retrying in %.1fs (attempt %d/%d)",
-                        response.status_code,
-                        url,
-                        backoff,
-                        attempt,
-                        MAX_RETRIES,
-                    )
-                    last_error = OediAccessError(f"HTTP {response.status_code} from {url}")
-                    if attempt < MAX_RETRIES:
-                        await asyncio.sleep(backoff)
-                    continue
-
-                response.raise_for_status()
-                return response
-
-            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as exc:
-                backoff = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                logger.warning(
-                    "OEDI connection error for %s: %s, retrying in %.1fs (attempt %d/%d)",
-                    url,
-                    exc,
-                    backoff,
-                    attempt,
-                    MAX_RETRIES,
-                )
-                last_error = exc
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(backoff)
-
-        raise OediAccessError(f"OEDI request failed for {url} after {MAX_RETRIES} retries: {last_error}")
+        return await get_with_retry(client, url, error_class=OediAccessError)
 
     async def fetch_systems_list(self) -> list[int]:
         """Download the systems inventory CSV and extract system IDs.

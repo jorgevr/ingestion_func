@@ -95,7 +95,7 @@ class TestEndToEndEmission:
         assert emitter.emit_cloudevent.call_count == 3
         assert emitter.emit_dead_letter.call_count == 0
         assert idem_store.check_and_reserve.call_count == 3
-        assert idem_store.mark_completed.call_count == 3
+        assert idem_store.mark_completed_for.call_count == 3
 
     @pytest.mark.asyncio
     async def test_invalid_records_dead_lettered(self) -> None:
@@ -238,7 +238,7 @@ class TestEndToEndEmission:
 
         # Only 1 emitted (second was duplicate)
         assert emitter.emit_cloudevent.call_count == 1
-        assert idem_store.mark_completed.call_count == 1
+        assert idem_store.mark_completed_for.call_count == 1
 
     @pytest.mark.asyncio
     async def test_generic_exception_in_record_processing(self) -> None:

@@ -20,7 +20,7 @@
     "SCHEMA_VERSION_PVDAQ": "v1",
 
     "PVDAQ_HISTORICAL_SITE_IDS": "9068,9069,2107,7333",
-    "PVDAQ_HISTORICAL_CRON_SCHEDULE": "0 30 * * * *",
+    "PVDAQ_HISTORICAL_CRON_SCHEDULE": "0 41 * * * *",
     "PVDAQ_HISTORICAL_QUEUE_NAME": "pvdaq-historical-work",
     "FILE_TRACKING_TABLE_NAME": "PvdaqFileTracking",
     "OEDI_HISTORICAL_PREFIX": "pvdaq/2023-solar-data-prize"

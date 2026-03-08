@@ -1,3 +1,4 @@
+
 """Azure Functions entry point for PVDAQ ingestion.
 
 Registers:
@@ -17,16 +18,15 @@ from uuid import uuid4
 
 import azure.functions as func
 
-from src.cloudevents_envelope import build_envelope
 from src.config import load_config, load_historical_config
 from src.csv_normalizer import detect_timestamp_column, normalize_historical_record
 from src.file_tracking_store import FileTrackingStore
-from src.idempotency_store import IdempotencyResult, IdempotencyStore
+from src.idempotency_store import IdempotencyStore
 from src.observability import InvocationStats, create_logger, emit_invocation_metrics, emit_warning_metric
 from src.oedi_data_lake import OediAccessError, OediDataLakeClient
 from src.oedi_historical_client import OediHistoricalAccessError, OediHistoricalClient
-from src.schema_validator import validate_record
-from src.service_bus_emitter import ServiceBusEmitter, build_dead_letter_message
+from src.record_pipeline import process_record
+from src.service_bus_emitter import ServiceBusEmitter
 
 app = func.FunctionApp()
 
@@ -145,65 +145,26 @@ async def pvdaq_ingestion(timer: func.TimerRequest) -> None:
 
                 for record in records:
                     try:
-                        is_valid, errors = validate_record(record)
-
-                        if not is_valid:
-                            stats.number_invalid += 1
-                            dl_message = build_dead_letter_message(
-                                original_payload=record,
-                                error_details=errors,
-                                correlation_id=correlation_id,
-                                site_id=record.get("SiteID"),
-                                schema_version=config.schema_version_pvdaq,
-                            )
-                            await emitter.emit_dead_letter(
-                                queue_name=config.dead_letter_queue_name,
-                                message_body=dl_message,
-                            )
-                            logger.warning(
-                                "Record rejected — site=%s, errors=%d",
-                                record.get("SiteID", "unknown"),
-                                len(errors),
-                            )
-                            continue
-
-                        stats.number_valid += 1
-
-                        # Idempotency check: write-before-emit pattern
                         measdatetime = record.get("measdatetime", "")
                         record_site_id = record.get("SiteID", 0)
-                        idem_result = await idem_store.check_and_reserve(
-                            site_id=record_site_id,
-                            measdatetime=measdatetime,
-                            correlation_id=correlation_id,
-                        )
-
-                        if idem_result == IdempotencyResult.DUPLICATE:
-                            stats.number_duplicates += 1
-                            logger.info(
-                                "Duplicate record skipped — site=%s, measdatetime=%s",
-                                record_site_id,
-                                measdatetime,
-                            )
-                            continue
-
-                        pk = IdempotencyStore._partition_key(measdatetime)
-                        rk = IdempotencyStore._row_key(record_site_id, measdatetime)
-
-                        envelope = build_envelope(
-                            record=record,
+                        await process_record(
+                            record,
                             config=config,
                             correlation_id=correlation_id,
                             traceparent=traceparent,
+                            emitter=emitter,
+                            idem_store=idem_store,
+                            stats=stats,
+                            check_idempotency=lambda: idem_store.check_and_reserve(
+                                site_id=record_site_id,
+                                measdatetime=measdatetime,
+                                correlation_id=correlation_id,
+                            ),
+                            mark_completed=lambda: idem_store.mark_completed_for(
+                                site_id=record_site_id,
+                                measdatetime=measdatetime,
+                            ),
                         )
-                        await emitter.emit_cloudevent(
-                            topic_name=config.service_bus_topic_name,
-                            envelope=envelope,
-                        )
-                        stats.number_emitted += 1
-
-                        await idem_store.mark_completed(partition_key=pk, row_key=rk)
-
                     except Exception as exc:
                         logger.error(
                             "Error processing record from site %s: %s",
@@ -403,57 +364,29 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
 
                 stats.number_of_records_retrieved += 1
 
-                # Validate against schema
-                is_valid, errors = validate_record(record)
-
-                if not is_valid:
-                    stats.number_invalid += 1
-                    dl_message = build_dead_letter_message(
-                        original_payload=record,
-                        error_details=errors,
-                        correlation_id=correlation_id,
-                        site_id=site_id,
-                        schema_version=config.schema_version_pvdaq,
-                    )
-                    await emitter.emit_dead_letter(
-                        queue_name=config.dead_letter_queue_name,
-                        message_body=dl_message,
-                    )
-                    continue
-
-                stats.number_valid += 1
-
-                # Idempotency check: write-before-emit pattern
                 measdatetime = record.get("measdatetime", "")
-                idem_result = await idem_store.check_and_reserve_historical(
-                    site_id=site_id,
-                    file_name=file_name,
-                    measdatetime=measdatetime,
-                    correlation_id=correlation_id,
-                )
-
-                if idem_result == IdempotencyResult.DUPLICATE:
-                    stats.number_duplicates += 1
-                    continue
-
-                pk = IdempotencyStore._partition_key(measdatetime)
-                rk = IdempotencyStore._row_key_historical(site_id, file_name, measdatetime)
-
-                envelope = build_envelope(
-                    record=record,
+                await process_record(
+                    record,
                     config=config,
                     correlation_id=correlation_id,
                     traceparent=traceparent,
+                    emitter=emitter,
+                    idem_store=idem_store,
+                    stats=stats,
+                    check_idempotency=lambda _md=measdatetime: idem_store.check_and_reserve_historical(
+                        site_id=site_id,
+                        file_name=file_name,
+                        measdatetime=_md,
+                        correlation_id=correlation_id,
+                    ),
+                    mark_completed=lambda _md=measdatetime: idem_store.mark_completed_for_historical(
+                        site_id=site_id,
+                        file_name=file_name,
+                        measdatetime=_md,
+                    ),
                     event_type="raw.pvdaq.historical.v1",
                     source="/energy-ingestion-boundary/pvdaq-historical",
                 )
-                await emitter.emit_cloudevent(
-                    topic_name=config.service_bus_topic_name,
-                    envelope=envelope,
-                )
-                stats.number_emitted += 1
-
-                await idem_store.mark_completed(partition_key=pk, row_key=rk)
 
             await tracker.mark_completed(site_id, s3_key, stats.number_emitted)
 

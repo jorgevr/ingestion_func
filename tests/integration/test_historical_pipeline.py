@@ -264,7 +264,7 @@ class TestWorkerIntegration:
             patch("function_app.FileTrackingStore", return_value=mock_tracker),
             patch("function_app.ServiceBusEmitter", return_value=emitter),
             patch("function_app.IdempotencyStore", return_value=idem),
-            patch("function_app.validate_record", side_effect=mock_validate),
+            patch("src.record_pipeline.validate_record", side_effect=mock_validate),
             patch("function_app.create_logger", return_value=MagicMock()),
         ):
             from function_app import historical_worker

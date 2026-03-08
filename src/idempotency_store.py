@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import PurePosixPath
 from typing import Any
 
 from azure.core.exceptions import ResourceExistsError
@@ -75,27 +76,20 @@ class IdempotencyStore:
         collisions between different CSV files for the same site and
         timestamp (e.g. ac_power vs environment).
         """
-        from pathlib import PurePosixPath
-
         stem = PurePosixPath(file_name).stem
         return f"{site_id}_{stem}_{measdatetime}"
 
-    async def check_and_reserve(
+    async def _check_and_reserve(
         self,
-        site_id: int,
-        measdatetime: str,
+        pk: str,
+        rk: str,
         correlation_id: str,
     ) -> IdempotencyResult:
-        """Check whether a record has been processed and reserve it if new.
-
-        Uses conditional insert (``create_entity``) to atomically check
-        and reserve. If the entity already exists, inspects its status
-        to determine whether this is a true duplicate or a crash-recovery
-        scenario.
+        """Core idempotency check: conditional insert then inspect on conflict.
 
         Args:
-            site_id: PVDAQ site identifier.
-            measdatetime: ISO-8601 measurement datetime string.
+            pk: Table Storage PartitionKey.
+            rk: Table Storage RowKey.
             correlation_id: Current invocation correlation ID.
 
         Returns:
@@ -104,9 +98,6 @@ class IdempotencyStore:
             ``RETRY_EMIT`` if a previous attempt crashed before completing.
         """
         client = await self._get_client()
-        pk = self._partition_key(measdatetime)
-        rk = self._row_key(site_id, measdatetime)
-
         entity = {
             "PartitionKey": pk,
             "RowKey": rk,
@@ -123,6 +114,23 @@ class IdempotencyStore:
             if existing.get("Status") == "completed":
                 return IdempotencyResult.DUPLICATE
             return IdempotencyResult.RETRY_EMIT
+
+    async def check_and_reserve(
+        self,
+        site_id: int,
+        measdatetime: str,
+        correlation_id: str,
+    ) -> IdempotencyResult:
+        """Check whether a record has been processed and reserve it if new.
+
+        Args:
+            site_id: PVDAQ site identifier.
+            measdatetime: ISO-8601 measurement datetime string.
+            correlation_id: Current invocation correlation ID.
+        """
+        pk = self._partition_key(measdatetime)
+        rk = self._row_key(site_id, measdatetime)
+        return await self._check_and_reserve(pk, rk, correlation_id)
 
     async def check_and_reserve_historical(
         self,
@@ -143,26 +151,9 @@ class IdempotencyStore:
             measdatetime: ISO-8601 measurement datetime string.
             correlation_id: Current invocation correlation ID.
         """
-        client = await self._get_client()
         pk = self._partition_key(measdatetime)
         rk = self._row_key_historical(site_id, file_name, measdatetime)
-
-        entity = {
-            "PartitionKey": pk,
-            "RowKey": rk,
-            "Status": "pending",
-            "CorrelationId": correlation_id,
-            "CreatedAt": datetime.now(timezone.utc).isoformat(),
-        }
-
-        try:
-            await client.create_entity(entity)
-            return IdempotencyResult.NEW
-        except ResourceExistsError:
-            existing = await client.get_entity(partition_key=pk, row_key=rk)
-            if existing.get("Status") == "completed":
-                return IdempotencyResult.DUPLICATE
-            return IdempotencyResult.RETRY_EMIT
+        return await self._check_and_reserve(pk, rk, correlation_id)
 
     async def mark_completed(
         self,
@@ -185,6 +176,33 @@ class IdempotencyStore:
             },
             mode="merge",
         )
+
+    async def mark_completed_for(
+        self,
+        site_id: int,
+        measdatetime: str,
+    ) -> None:
+        """Mark a daily record as completed using domain arguments.
+
+        Encapsulates key derivation so callers don't access private methods.
+        """
+        pk = self._partition_key(measdatetime)
+        rk = self._row_key(site_id, measdatetime)
+        await self.mark_completed(pk, rk)
+
+    async def mark_completed_for_historical(
+        self,
+        site_id: int,
+        file_name: str,
+        measdatetime: str,
+    ) -> None:
+        """Mark a historical record as completed using domain arguments.
+
+        Encapsulates key derivation so callers don't access private methods.
+        """
+        pk = self._partition_key(measdatetime)
+        rk = self._row_key_historical(site_id, file_name, measdatetime)
+        await self.mark_completed(pk, rk)
 
     async def cleanup_expired(self, ttl_days: int) -> int:
         """Delete idempotency records older than ``ttl_days``.
