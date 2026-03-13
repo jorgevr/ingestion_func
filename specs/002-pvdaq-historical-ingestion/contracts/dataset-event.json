@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "dataset-event.json",
+  "title": "Dataset Available CloudEvent",
+  "description": "CloudEvents v1.0 envelope emitted when a CSV dataset has been successfully downloaded from OEDI S3 and stored in ADLS Gen2. Type: solar.pvdaq.dataset.available.",
+  "type": "object",
+  "required": [
+    "specversion", "type", "source", "id", "time", "datacontenttype",
+    "tenant_id", "source_vendor", "schema_version", "mapping_version", "correlation_id",
+    "ingestion_timestamp", "traceparent", "data"
+  ],
+  "properties": {
+    "specversion": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "type": {
+      "type": "string",
+      "const": "solar.pvdaq.dataset.available"
+    },
+    "source": {
+      "type": "string",
+      "const": "/energy-ingestion-boundary/pvdaq"
+    },
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique event identifier (UUID v4)"
+    },
+    "time": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 emission timestamp"
+    },
+    "datacontenttype": {
+      "type": "string",
+      "const": "application/json"
+    },
+    "tenant_id": {
+      "type": "string",
+      "description": "Tenant identifier from configuration"
+    },
+    "source_vendor": {
+      "type": "string",
+      "const": "PVDAQ"
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^v[0-9]+$",
+      "description": "Schema version for the data block (e.g., 'v1')"
+    },
+    "mapping_version": {
+      "type": "string",
+      "pattern": "^(v[0-9]+|unknown)$",
+      "description": "Mapping version; 'unknown' for dataset-level events where no field mapping occurs"
+    },
+    "correlation_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Correlation ID matching ingestion_id for lineage tracing"
+    },
+    "ingestion_timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp when the ingestion function processed the file"
+    },
+    "traceparent": {
+      "type": "string",
+      "pattern": "^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$",
+      "description": "W3C Trace Context traceparent header"
+    },
+    "data": {
+      "type": "object",
+      "required": ["site_id", "category", "file_format", "storage_path", "ingestion_id", "source_url", "file_size", "file_hash"],
+      "properties": {
+        "site_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "PVDAQ site identifier"
+        },
+        "category": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Measurement category (e.g., 'irradiance', 'ac_power')"
+        },
+        "file_format": {
+          "type": "string",
+          "const": "csv",
+          "description": "File format, always 'csv'"
+        },
+        "storage_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "ADLS Gen2 path where the file is stored"
+        },
+        "ingestion_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "UUID identifying this ingestion"
+        },
+        "source_url": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Original S3 download URL"
+        },
+        "file_size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "File size in bytes"
+        },
+        "file_hash": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 hex digest of the file content"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

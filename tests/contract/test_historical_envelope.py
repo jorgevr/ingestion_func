@@ -35,8 +35,9 @@ def _historical_config() -> HistoricalConfig:
         service_bus_fully_qualified_namespace="test-sb.servicebus.windows.net",
         file_tracking_table_name="PvdaqFileTracking",
         table_storage_uri="https://teststorage.table.core.windows.net",
-        idempotency_table_name="PvdaqIdempotency",
-        tenant_id="research",
+        adls_account_url="https://testaccount.dfs.core.windows.net",
+        adls_container_name="raw",
+        tenant_id="default",
         mapping_version_pvdaq="unknown",
         schema_version_pvdaq="v1",
     )

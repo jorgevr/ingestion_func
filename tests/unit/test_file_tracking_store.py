@@ -191,7 +191,7 @@ class TestMarkProcessing:
 
 
 class TestMarkCompleted:
-    """mark_completed updates status with record count."""
+    """mark_completed updates status with dataset metadata."""
 
     @pytest.mark.asyncio
     async def test_updates_status_and_count(self) -> None:
@@ -199,11 +199,23 @@ class TestMarkCompleted:
         table_client.upsert_entity = AsyncMock(return_value=None)
         store = _make_store(table_client)
 
-        await store.mark_completed(SITE_ID, S3_KEY, records_emitted=42)
+        await store.mark_completed(
+            SITE_ID,
+            S3_KEY,
+            storage_path="pvdaq/site_id=9068/category=ac_power/file.csv",
+            file_hash="abc123",
+            ingestion_id="ingest-uuid",
+            source_url="https://oedi.s3.amazonaws.com/pvdaq/file.csv",
+            ingestion_time="2024-01-15T12:00:00+00:00",
+        )
 
         entity = table_client.upsert_entity.call_args[0][0]
         assert entity["Status"] == "completed"
-        assert entity["RecordsEmitted"] == 42
+        assert entity["StoragePath"] == "pvdaq/site_id=9068/category=ac_power/file.csv"
+        assert entity["FileHash"] == "abc123"
+        assert entity["IngestionId"] == "ingest-uuid"
+        assert entity["SourceUrl"] == "https://oedi.s3.amazonaws.com/pvdaq/file.csv"
+        assert entity["IngestionTime"] == "2024-01-15T12:00:00+00:00"
         assert "CompletedAt" in entity
 
 

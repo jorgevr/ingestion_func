@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "file-tracking-entity.json",
-  "title": "File Tracking Entity",
-  "description": "Azure Table Storage entity tracking discovery and processing status of each CSV file. PartitionKey = site_id (string), RowKey = SHA-256 hash of S3 key.",
+  "title": "File Tracking Entity (with Dataset Metadata)",
+  "description": "Azure Table Storage entity tracking discovery, processing status, and dataset metadata for each CSV file. PartitionKey = site_id (string), RowKey = SHA-256 hash of S3 key. Extended with ADLS storage and ingestion metadata fields (populated on completion).",
   "type": "object",
   "required": ["PartitionKey", "RowKey", "S3Key", "FileName", "Size", "LastModified", "Status"],
   "properties": {
@@ -48,14 +48,33 @@
       "format": "date-time",
       "description": "ISO-8601 timestamp when the worker finished processing"
     },
-    "RecordsEmitted": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Number of records successfully emitted from this file"
-    },
     "CorrelationId": {
       "type": "string",
       "description": "Correlation ID of the dispatcher run that enqueued this file"
+    },
+    "StoragePath": {
+      "type": ["string", "null"],
+      "description": "ADLS Gen2 file path where the CSV was stored (set on completion)"
+    },
+    "FileHash": {
+      "type": ["string", "null"],
+      "minLength": 64,
+      "maxLength": 64,
+      "description": "SHA-256 hex digest of the file content (set on completion)"
+    },
+    "IngestionId": {
+      "type": ["string", "null"],
+      "format": "uuid",
+      "description": "UUID identifying this ingestion run (set on completion)"
+    },
+    "SourceUrl": {
+      "type": ["string", "null"],
+      "description": "Original S3 download URL (set on completion)"
+    },
+    "IngestionTime": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "ISO-8601 timestamp when the file was stored in ADLS (set on completion)"
     }
   },
   "additionalProperties": true

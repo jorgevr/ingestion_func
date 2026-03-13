@@ -154,9 +154,26 @@ class FileTrackingStore:
         )
 
     async def mark_completed(
-        self, site_id: int, s3_key: str, records_emitted: int,
+        self,
+        site_id: int,
+        s3_key: str,
+        storage_path: str,
+        file_hash: str,
+        ingestion_id: str,
+        source_url: str,
+        ingestion_time: str,
     ) -> None:
-        """Update a file tracking entity to status ``completed``."""
+        """Update a file tracking entity to status ``completed`` with metadata.
+
+        Args:
+            site_id: PVDAQ site identifier.
+            s3_key: Full S3 object key.
+            storage_path: ADLS Gen2 path where the CSV was stored.
+            file_hash: SHA-256 hex digest of the file content.
+            ingestion_id: UUID identifying this ingestion run.
+            source_url: Original S3 download URL.
+            ingestion_time: ISO-8601 timestamp when the file was stored.
+        """
         client = await self._get_client()
         await client.upsert_entity(
             {
@@ -164,7 +181,11 @@ class FileTrackingStore:
                 "RowKey": self._row_key(s3_key),
                 "Status": "completed",
                 "CompletedAt": datetime.now(timezone.utc).isoformat(),
-                "RecordsEmitted": records_emitted,
+                "StoragePath": storage_path,
+                "FileHash": file_hash,
+                "IngestionId": ingestion_id,
+                "SourceUrl": source_url,
+                "IngestionTime": ingestion_time,
             },
             mode="merge",
         )
