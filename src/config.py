@@ -70,8 +70,9 @@ class HistoricalConfig:
     file_tracking_table_name: str
     table_storage_uri: str
 
-    # Idempotency
-    idempotency_table_name: str
+    # ADLS Gen2
+    adls_account_url: str
+    adls_container_name: str
 
     # Metadata
     tenant_id: str
@@ -162,8 +163,9 @@ _HISTORICAL_REQUIRED_SETTINGS: list[str] = [
     "DEAD_LETTER_QUEUE_NAME",
     "ServiceBusConnection__fullyQualifiedNamespace",
     "FILE_TRACKING_TABLE_NAME",
-    "IDEMPOTENCY_TABLE_NAME",
     "TableStorageConnection__tableServiceUri",
+    "ADLS_ACCOUNT_URL",
+    "ADLS_CONTAINER_NAME",
 ]
 
 
@@ -205,8 +207,9 @@ def load_historical_config() -> HistoricalConfig:
         ),
         file_tracking_table_name=_require("FILE_TRACKING_TABLE_NAME"),
         table_storage_uri=_require("TableStorageConnection__tableServiceUri"),
-        idempotency_table_name=_require("IDEMPOTENCY_TABLE_NAME"),
-        tenant_id=os.environ.get("TENANT_ID", "research").strip(),
+        adls_account_url=_require("ADLS_ACCOUNT_URL"),
+        adls_container_name=_require("ADLS_CONTAINER_NAME"),
+        tenant_id=os.environ.get("TENANT_ID", "default").strip(),
         mapping_version_pvdaq=os.environ.get("MAPPING_VERSION_PVDAQ", "unknown").strip(),
         schema_version_pvdaq=os.environ.get("SCHEMA_VERSION_PVDAQ", "v1").strip(),
     )

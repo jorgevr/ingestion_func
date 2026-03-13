@@ -1,4 +1,4 @@
-# Quickstart: PVDAQ Historical Data Ingestion
+# Quickstart: PVDAQ Historical Dataset Ingestion
 
 ## Prerequisites
 
@@ -6,21 +6,25 @@
 - Azure Functions Core Tools v4
 - Azurite (local storage emulator) for Table Storage
 - Access to Azure Service Bus namespace (or local emulator)
+- Access to ADLS Gen2 storage account (or Azurite with HNS)
 
 ## Setup
 
 1. **Install dependencies**:
+
    ```bash
    pip install -r requirements.txt
    pip install -r requirements-dev.txt
    ```
 
 2. **Configure local settings** — copy template and fill in values:
+
    ```bash
    cp local.settings.json.template local.settings.json
    ```
 
    Key settings for feature 002:
+
    ```json
    {
      "PVDAQ_HISTORICAL_SITE_IDS": "9068,9069,2107,7333",
@@ -28,16 +32,20 @@
      "PVDAQ_HISTORICAL_QUEUE_NAME": "pvdaq-historical-work",
      "FILE_TRACKING_TABLE_NAME": "PvdaqFileTracking",
      "OEDI_BUCKET_URL": "https://oedi-data-lake.s3.amazonaws.com",
-     "OEDI_HISTORICAL_PREFIX": "pvdaq/2023-solar-data-prize"
+     "OEDI_HISTORICAL_PREFIX": "pvdaq/2023-solar-data-prize",
+     "ADLS_ACCOUNT_URL": "https://{account}.dfs.core.windows.net",
+     "ADLS_CONTAINER_NAME": "raw"
    }
    ```
 
 3. **Start Azurite** (for Table Storage):
+
    ```bash
    azurite --silent --location ./AzuriteConfig --debug ./AzuriteConfig/debug.log
    ```
 
 4. **Run the function app locally**:
+
    ```bash
    func start
    ```
@@ -59,16 +67,13 @@ Service Bus Queue: pvdaq-historical-work
   │
   ▼
 historical_worker() (one invocation per file)
-  ├── Download CSV via streaming HTTP GET
-  ├── Parse rows incrementally (bounded memory)
-  ├── For each row:
-  │     ├── Normalize (inject SiteID, strip suffixes, detect timestamp)
-  │     ├── Validate against pvdaq-v1.json schema
-  │     ├── Idempotency check (site_id + filename + measdatetime)
-  │     ├── Build CloudEvents envelope
-  │     └── Emit to Service Bus topic
-  ├── Mark file as completed in tracking table
-  └── Emit invocation metrics
+  ├── Stream download from S3 (httpx async)
+  ├── Stream upload to ADLS Gen2 (append + flush)
+  ├── Compute SHA-256 hash during streaming (one-pass)
+  ├── Update file tracking entity with metadata
+  │     (storage_path, file_hash, ingestion_id, source_url)
+  ├── Emit solar.pvdaq.dataset.available CloudEvent
+  └── Mark file as completed in tracking table
 ```
 
 ## Running Tests
@@ -78,7 +83,7 @@ historical_worker() (one invocation per file)
 pytest
 
 # Only feature 002 tests
-pytest tests/unit/test_oedi_historical_client.py tests/unit/test_csv_normalizer.py tests/integration/test_historical_pipeline.py
+pytest tests/unit/test_oedi_historical_client.py tests/unit/test_adls_store.py tests/integration/test_historical_pipeline.py
 
 # With coverage
 pytest --cov=src --cov-report=term-missing
@@ -86,19 +91,28 @@ pytest --cov=src --cov-report=term-missing
 
 ## Key Modules
 
-| Module | Purpose |
-| --- | --- |
-| `src/oedi_historical_client.py` | S3 listing + streaming CSV download |
-| `src/csv_normalizer.py` | Timestamp auto-detect, suffix stripping, SiteID injection |
-| `src/config.py` | Extended with feature 002 config fields |
-| `src/idempotency_store.py` | Extended RowKey format for category-aware keys |
-| `src/cloudevents_envelope.py` | Extended to parameterize event type |
-| `function_app.py` | `historical_dispatcher` + `historical_worker` functions |
+| Module                           | Purpose                                               |
+| -------------------------------- | ----------------------------------------------------- |
+| `src/oedi_historical_client.py`  | S3 listing + streaming CSV download                   |
+| `src/adls_store.py`             | ADLS Gen2 streaming upload with SHA-256 hash (NEW)    |
+| `src/config.py`                 | Extended with ADLS config fields                      |
+| `src/file_tracking_store.py`    | Extended with dataset metadata fields                 |
+| `src/cloudevents_envelope.py`   | Extended for dataset-level event builder              |
+| `function_app.py`               | `historical_dispatcher` + `historical_worker`         |
 
 ## Shared Modules (from feature 001, unchanged)
 
-| Module | Purpose |
-| --- | --- |
-| `src/service_bus_emitter.py` | Service Bus topic/queue sender |
-| `src/observability.py` | Structured logging, metrics |
-| `src/schema_validator.py` | JSON Schema validation |
+| Module                          | Purpose                          |
+| ------------------------------- | -------------------------------- |
+| `src/service_bus_emitter.py`    | Service Bus topic/queue sender   |
+| `src/observability.py`          | Structured logging, metrics      |
+| `src/http_retry.py`            | HTTP retry with exponential backoff |
+
+## Modules No Longer Used by Feature 002
+
+| Module                          | Reason                                        |
+| ------------------------------- | --------------------------------------------- |
+| `src/csv_normalizer.py`        | Row parsing moved to downstream processing    |
+| `src/record_pipeline.py`       | Per-row pipeline moved downstream             |
+| `src/schema_validator.py`      | Row validation moved downstream               |
+| `src/idempotency_store.py`     | Per-row idempotency replaced by file tracking |

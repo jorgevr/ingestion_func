@@ -28,6 +28,47 @@ logger = logging.getLogger(__name__)
 _S3_NS = "http://s3.amazonaws.com/doc/2006-03-01/"
 
 
+def extract_category(file_name: str, site_id: int) -> str:
+    """Extract the measurement category from a PVDAQ CSV filename.
+
+    Parses the category from the standard naming pattern
+    ``{site_id}_{category}_data.csv`` or
+    ``{site_id}_{category}_data_{start}_{end}.csv``.
+    Falls back to the full basename (without ``.csv`` extension) if the
+    filename does not match the expected pattern.
+
+    Args:
+        file_name: Basename of the CSV file
+            (e.g. ``"9068_irradiance_data.csv"``).
+        site_id: PVDAQ site identifier used to strip the numeric prefix.
+
+    Returns:
+        The measurement category string (e.g. ``"irradiance"``,
+        ``"ac_power"``), or the full basename without extension on fallback.
+
+    Examples:
+        >>> extract_category("9068_irradiance_data.csv", 9068)
+        'irradiance'
+        >>> extract_category("9068_ac_power_data.csv", 9068)
+        'ac_power'
+        >>> extract_category("9068_meter_15m_data.csv", 9068)
+        'meter_15m'
+        >>> extract_category("unknown_format.csv", 9068)
+        'unknown_format'
+    """
+    import re
+
+    stem = file_name.removesuffix(".csv")
+    prefix = f"{site_id}_"
+    if stem.startswith(prefix):
+        stem = stem[len(prefix):]
+
+    # Strip trailing _data or _data_{start}_{end} suffix
+    stem = re.sub(r"_data(?:_\d{4}-\d{2}-\d{2}_\d{4}-\d{2}-\d{2})?$", "", stem)
+
+    return stem if stem else file_name.removesuffix(".csv")
+
+
 class OediHistoricalAccessError(Exception):
     """Raised when an OEDI historical data request fails after all retries."""
 

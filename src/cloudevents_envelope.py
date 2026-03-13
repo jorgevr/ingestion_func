@@ -16,6 +16,50 @@ from src.config import Config, HistoricalConfig
 _ConfigLike = Config | HistoricalConfig
 
 
+def build_dataset_envelope(
+    data: dict,
+    config: HistoricalConfig,
+    ingestion_id: str,
+    traceparent: str,
+    ingestion_timestamp: str,
+) -> dict:
+    """Build a CloudEvents v1.0 envelope for a dataset-available event.
+
+    Produces a ``solar.pvdaq.dataset.available`` envelope conforming to
+    ``contracts/dataset-event.json``.  ``mapping_version`` is set to
+    ``"unknown"`` per Constitution III fallback (no field mapping at dataset
+    level).
+
+    Args:
+        data: Dataset data block dict (site_id, category, file_format,
+            storage_path, ingestion_id, source_url, file_size, file_hash).
+        config: Historical config providing tenant_id, schema_version.
+        ingestion_id: UUID for this ingestion; used as correlation_id for
+            lineage tracing.
+        traceparent: W3C Trace Context traceparent header value.
+        ingestion_timestamp: ISO-8601 timestamp when the file was processed.
+
+    Returns:
+        A dict conforming to the dataset CloudEvents envelope contract.
+    """
+    return {
+        "specversion": "1.0",
+        "type": "solar.pvdaq.dataset.available",
+        "source": "/energy-ingestion-boundary/pvdaq",
+        "id": str(uuid4()),
+        "time": ingestion_timestamp,
+        "datacontenttype": "application/json",
+        "tenant_id": config.tenant_id,
+        "source_vendor": "PVDAQ",
+        "schema_version": config.schema_version_pvdaq,
+        "mapping_version": "unknown",
+        "correlation_id": ingestion_id,
+        "ingestion_timestamp": ingestion_timestamp,
+        "traceparent": traceparent,
+        "data": data,
+    }
+
+
 def build_envelope(
     record: dict,
     config: _ConfigLike,

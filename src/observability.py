@@ -145,6 +145,47 @@ def emit_invocation_metrics(stats: InvocationStats) -> dict[str, Any]:
     return metrics
 
 
+@dataclass
+class DatasetIngestionStats:
+    """Accumulates dataset-level counters for a single historical ingestion run.
+
+    Used by ``emit_dataset_metrics`` to produce the FR-011 telemetry summary
+    at the end of each dispatcher or worker invocation.
+    """
+
+    source: str
+    correlation_id: str
+    datasets_discovered: int = 0
+    datasets_downloaded: int = 0
+    datasets_stored: int = 0
+    datasets_emitted: int = 0
+    datasets_failed: int = 0
+    duration_ms: float = 0.0
+
+
+def emit_dataset_metrics(stats: DatasetIngestionStats) -> dict[str, Any]:
+    """Log a structured telemetry summary for a dataset ingestion run.
+
+    Args:
+        stats: Accumulated dataset-level counters.
+
+    Returns:
+        The metrics dict (for testing / further processing).
+    """
+    metrics: dict[str, Any] = {
+        "source": stats.source,
+        "datasets_discovered": stats.datasets_discovered,
+        "datasets_downloaded": stats.datasets_downloaded,
+        "datasets_stored": stats.datasets_stored,
+        "datasets_emitted": stats.datasets_emitted,
+        "datasets_failed": stats.datasets_failed,
+        "duration_ms": stats.duration_ms,
+        "correlation_id": stats.correlation_id,
+    }
+    _metrics_logger.info("Dataset metrics: %s", json.dumps(metrics, default=str))
+    return metrics
+
+
 def emit_warning_metric(metric_name: str, details: dict[str, Any]) -> None:
     """Log a warning-level metric for operational alerting.
 

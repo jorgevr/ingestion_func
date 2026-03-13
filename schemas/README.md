@@ -37,17 +37,17 @@ copies deployed with the function app. When updating a schema:
 |------|--------|---------|-----------------|
 | `pvdaq-v1.json` | PVDAQ | v1 | `SiteID` (integer), `measdatetime` (string, ISO-8601) |
 
-## Schema Reuse
+## Schema Usage by Feature
 
-Per constitution Principle II (reuse before new), `pvdaq-v1.json` is shared
-by both feature 001 (daily polling) and feature 002 (historical ingestion).
-The historical pipeline normalises CSV columns to the same `SiteID` /
-`measdatetime` required fields, so no additional schema is needed. The two
-features are distinguished by CloudEvents metadata:
+`pvdaq-v1.json` is used exclusively by feature 001 (daily polling) for per-record
+validation. Feature 002 (historical ingestion) operates at the **dataset level**:
+it streams CSV files directly from S3 to ADLS Gen2 without per-row parsing, so no
+record-level schema is applied. Its CloudEvent data block contract is defined in
+`specs/002-pvdaq-historical-ingestion/contracts/dataset-event.json`.
 
-| Feature | `type` | `source` |
-| ------- | ------ | -------- |
-| 001 - daily polling | `raw.pvdaq.v1` | `/energy-ingestion-boundary/pvdaq` |
-| 002 - historical | `raw.pvdaq.historical.v1` | `/energy-ingestion-boundary/pvdaq-historical` |
+| Feature | Record Schema | CloudEvent `type` |
+| ------- | ------------- | ----------------- |
+| 001 - daily polling | `pvdaq-v1.json` | `raw.pvdaq.generation.v1` |
+| 002 - historical | _(none — dataset-level)_ | `solar.pvdaq.dataset.available` |
 
 

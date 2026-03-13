@@ -1,8 +1,8 @@
 """Integration tests for the historical ingestion pipeline (feature 002).
 
 Tests cover:
-- Dispatcher: lists files, filters unprocessed, enqueues work items
-- Worker: streams CSV, normalizes records, tracks file status
+- Dispatcher: lists files, filters unprocessed, enqueues work items with category
+- Worker: streams S3 → ADLS, registers metadata, emits dataset CloudEvent
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.config import HistoricalConfig
-from src.idempotency_store import IdempotencyResult
 
 
 def _historical_config() -> HistoricalConfig:
@@ -28,8 +27,9 @@ def _historical_config() -> HistoricalConfig:
         service_bus_fully_qualified_namespace="test-sb.servicebus.windows.net",
         file_tracking_table_name="PvdaqFileTracking",
         table_storage_uri="https://teststorage.table.core.windows.net",
-        idempotency_table_name="PvdaqIdempotency",
-        tenant_id="research",
+        adls_account_url="https://testaccount.dfs.core.windows.net",
+        adls_container_name="raw",
+        tenant_id="default",
         mapping_version_pvdaq="unknown",
         schema_version_pvdaq="v1",
     )
@@ -51,7 +51,7 @@ class TestDispatcherIntegration:
 
     @pytest.mark.asyncio
     async def test_dispatcher_enqueues_unprocessed_files(self) -> None:
-        """Two sites with files: all unprocessed → all enqueued."""
+        """Two sites with files: all unprocessed → all enqueued with category."""
         site_9068_files = [
             _file_info(9068, "9068_ac_power_data.csv", 65000000),
             _file_info(9068, "9068_environment_data.csv", 288000000),
@@ -93,12 +93,13 @@ class TestDispatcherIntegration:
         assert mock_emitter.send_queue_message.call_count == 3
         assert mock_tracker.mark_queued.call_count == 3
 
-        # Verify work item structure
+        # Verify work item structure includes category
         first_call = mock_emitter.send_queue_message.call_args_list[0]
         work_item = first_call.kwargs["message_body"]
         assert work_item["site_id"] == 9068
         assert "s3_key" in work_item
         assert "file_name" in work_item
+        assert "category" in work_item
         assert "correlation_id" in work_item
         assert "enqueued_at" in work_item
 
@@ -136,16 +137,6 @@ class TestDispatcherIntegration:
         mock_emitter.send_queue_message.assert_not_called()
 
 
-def _mock_idem_store(result: IdempotencyResult = IdempotencyResult.NEW) -> AsyncMock:
-    """Create a mock IdempotencyStore that returns the given result."""
-    store = AsyncMock()
-    store.check_and_reserve_historical = AsyncMock(return_value=result)
-    store.mark_completed = AsyncMock()
-    store.__aenter__ = AsyncMock(return_value=store)
-    store.__aexit__ = AsyncMock(return_value=False)
-    return store
-
-
 def _mock_emitter() -> AsyncMock:
     """Create a mock ServiceBusEmitter with context manager support."""
     emitter = AsyncMock()
@@ -167,33 +158,25 @@ def _default_work_item(site_id: int = 9068, file_name: str = "9068_ac_power_data
         "site_id": site_id,
         "s3_key": f"{_PREFIX}/{site_id}_OEDI/data/{file_name}",
         "file_name": file_name,
+        "category": "ac_power",
         "correlation_id": "test-corr-id",
         "enqueued_at": "2024-01-15T12:00:00Z",
     }
 
 
 class TestWorkerIntegration:
-    """Worker streams CSV, normalizes, validates, and emits."""
+    """Worker streams S3 → ADLS, registers metadata, emits dataset CloudEvent."""
 
     @pytest.mark.asyncio
-    async def test_worker_processes_valid_csv_file(self) -> None:
-        """Valid rows → emit_cloudevent called, mark_completed with count."""
+    async def test_worker_streams_file_to_adls(self) -> None:
+        """Valid file → stream_upload called, mark_completed with metadata, emit_cloudevent once."""
         work_item = _default_work_item()
         mock_msg = _mock_work_item_msg(work_item)
 
-        csv_rows = [
-            {"measured_on": "2023-01-01 00:00:00", "dc_power_123": "100.5", "temp_456": "25.0"},
-            {"measured_on": "2023-01-01 00:05:00", "dc_power_123": "101.0", "temp_456": "25.1"},
-        ]
-
-        async def mock_stream(s3_key: str):
-            for row in csv_rows:
-                yield row
-
-        mock_oedi = AsyncMock()
-        mock_oedi.stream_csv_rows = mock_stream
-        mock_oedi.__aenter__ = AsyncMock(return_value=mock_oedi)
-        mock_oedi.__aexit__ = AsyncMock(return_value=False)
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(return_value=(65000000, "abc123hash"))
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
 
         mock_tracker = AsyncMock()
         mock_tracker.mark_processing = AsyncMock()
@@ -202,14 +185,12 @@ class TestWorkerIntegration:
         mock_tracker.__aexit__ = AsyncMock(return_value=False)
 
         emitter = _mock_emitter()
-        idem = _mock_idem_store(IdempotencyResult.NEW)
 
         with (
             patch("function_app.load_historical_config", return_value=_historical_config()),
-            patch("function_app.OediHistoricalClient", return_value=mock_oedi),
+            patch("function_app.AdlsStore", return_value=mock_adls),
             patch("function_app.FileTrackingStore", return_value=mock_tracker),
             patch("function_app.ServiceBusEmitter", return_value=emitter),
-            patch("function_app.IdempotencyStore", return_value=idem),
             patch("function_app.create_logger", return_value=MagicMock()),
         ):
             from function_app import historical_worker
@@ -217,96 +198,37 @@ class TestWorkerIntegration:
             await historical_worker(mock_msg)
 
         mock_tracker.mark_processing.assert_called_once_with(9068, work_item["s3_key"])
-        # 2 valid records emitted
-        assert emitter.emit_cloudevent.call_count == 2
-        assert idem.check_and_reserve_historical.call_count == 2
-        mock_tracker.mark_completed.assert_called_once_with(9068, work_item["s3_key"], 2)
+        # stream_upload called with source_url and adls path
+        mock_adls.stream_upload.assert_called_once()
+        call_kwargs = mock_adls.stream_upload.call_args
+        assert "source_url" in call_kwargs.kwargs or len(call_kwargs.args) >= 1
+        # One dataset CloudEvent emitted
+        emitter.emit_cloudevent.assert_called_once()
+        # mark_completed called with metadata
+        mock_tracker.mark_completed.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_worker_dead_letters_invalid_records(self) -> None:
-        """Invalid records → emit_dead_letter called, valid ones emitted."""
+    async def test_worker_envelope_has_correct_type(self) -> None:
+        """Emitted envelope uses solar.pvdaq.dataset.available type."""
         work_item = _default_work_item()
         mock_msg = _mock_work_item_msg(work_item)
 
-        csv_rows = [
-            {"measured_on": "2023-01-01 00:00:00", "dc_power_123": "100.5"},
-            {"measured_on": "2023-01-01 00:05:00", "dc_power_123": "bad_value"},
-        ]
-
-        async def mock_stream(s3_key: str):
-            for row in csv_rows:
-                yield row
-
-        mock_oedi = AsyncMock()
-        mock_oedi.stream_csv_rows = mock_stream
-        mock_oedi.__aenter__ = AsyncMock(return_value=mock_oedi)
-        mock_oedi.__aexit__ = AsyncMock(return_value=False)
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(return_value=(65000000, "abc123hash"))
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
 
         mock_tracker = AsyncMock()
         mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
         mock_tracker.__aexit__ = AsyncMock(return_value=False)
 
         emitter = _mock_emitter()
-        idem = _mock_idem_store(IdempotencyResult.NEW)
-
-        call_count = 0
-
-        def mock_validate(record: dict) -> tuple[bool, list[dict]]:
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                return True, []
-            return False, [{"message": "test error", "path": "$", "validator": "type"}]
 
         with (
             patch("function_app.load_historical_config", return_value=_historical_config()),
-            patch("function_app.OediHistoricalClient", return_value=mock_oedi),
+            patch("function_app.AdlsStore", return_value=mock_adls),
             patch("function_app.FileTrackingStore", return_value=mock_tracker),
             patch("function_app.ServiceBusEmitter", return_value=emitter),
-            patch("function_app.IdempotencyStore", return_value=idem),
-            patch("src.record_pipeline.validate_record", side_effect=mock_validate),
-            patch("function_app.create_logger", return_value=MagicMock()),
-        ):
-            from function_app import historical_worker
-
-            await historical_worker(mock_msg)
-
-        assert emitter.emit_cloudevent.call_count == 1
-        assert emitter.emit_dead_letter.call_count == 1
-        mock_tracker.mark_completed.assert_called_once_with(9068, work_item["s3_key"], 1)
-
-    @pytest.mark.asyncio
-    async def test_worker_envelope_has_correct_type_and_source(self) -> None:
-        """Emitted envelopes use historical event type and source."""
-        work_item = _default_work_item()
-        mock_msg = _mock_work_item_msg(work_item)
-
-        csv_rows = [
-            {"measured_on": "2023-06-15T12:00:00", "ac_power_100": "4500.0"},
-        ]
-
-        async def mock_stream(s3_key: str):
-            for row in csv_rows:
-                yield row
-
-        mock_oedi = AsyncMock()
-        mock_oedi.stream_csv_rows = mock_stream
-        mock_oedi.__aenter__ = AsyncMock(return_value=mock_oedi)
-        mock_oedi.__aexit__ = AsyncMock(return_value=False)
-
-        mock_tracker = AsyncMock()
-        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
-        mock_tracker.__aexit__ = AsyncMock(return_value=False)
-
-        emitter = _mock_emitter()
-        idem = _mock_idem_store(IdempotencyResult.NEW)
-
-        with (
-            patch("function_app.load_historical_config", return_value=_historical_config()),
-            patch("function_app.OediHistoricalClient", return_value=mock_oedi),
-            patch("function_app.FileTrackingStore", return_value=mock_tracker),
-            patch("function_app.ServiceBusEmitter", return_value=emitter),
-            patch("function_app.IdempotencyStore", return_value=idem),
             patch("function_app.create_logger", return_value=MagicMock()),
         ):
             from function_app import historical_worker
@@ -315,23 +237,61 @@ class TestWorkerIntegration:
 
         emitter.emit_cloudevent.assert_called_once()
         envelope = emitter.emit_cloudevent.call_args.kwargs["envelope"]
-        assert envelope["type"] == "raw.pvdaq.historical.v1"
-        assert envelope["source"] == "/energy-ingestion-boundary/pvdaq-historical"
+        assert envelope["type"] == "solar.pvdaq.dataset.available"
 
     @pytest.mark.asyncio
-    async def test_worker_marks_failed_on_error(self) -> None:
-        """Worker marks file as failed when streaming raises."""
+    async def test_worker_envelope_data_block(self) -> None:
+        """Dataset CloudEvent data block contains all required fields."""
         work_item = _default_work_item()
         mock_msg = _mock_work_item_msg(work_item)
 
-        async def mock_stream_error(s3_key: str):
-            raise RuntimeError("Network error")
-            yield  # noqa: RET503 — make it an async generator
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(return_value=(65000000, "abc123hash"))
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
 
-        mock_oedi = AsyncMock()
-        mock_oedi.stream_csv_rows = mock_stream_error
-        mock_oedi.__aenter__ = AsyncMock(return_value=mock_oedi)
-        mock_oedi.__aexit__ = AsyncMock(return_value=False)
+        mock_tracker = AsyncMock()
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        emitter = _mock_emitter()
+
+        with (
+            patch("function_app.load_historical_config", return_value=_historical_config()),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)
+
+        envelope = emitter.emit_cloudevent.call_args.kwargs["envelope"]
+        data = envelope["data"]
+        assert data["site_id"] == 9068
+        assert data["category"] == "ac_power"
+        assert data["file_format"] == "csv"
+        assert "storage_path" in data
+        assert "ingestion_id" in data
+        assert "source_url" in data
+        assert data["file_size"] == 65000000
+        assert data["file_hash"] == "abc123hash"
+
+    @pytest.mark.asyncio
+    async def test_worker_marks_failed_on_upload_error(self) -> None:
+        """Worker marks file as failed and dead-letters when upload raises."""
+        from src.adls_store import AdlsUploadError
+
+        work_item = _default_work_item()
+        mock_msg = _mock_work_item_msg(work_item)
+
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(
+            side_effect=AdlsUploadError("Upload failed"),
+        )
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
 
         mock_tracker = AsyncMock()
         mock_tracker.mark_processing = AsyncMock()
@@ -340,107 +300,62 @@ class TestWorkerIntegration:
         mock_tracker.__aexit__ = AsyncMock(return_value=False)
 
         emitter = _mock_emitter()
-        idem = _mock_idem_store()
 
         with (
             patch("function_app.load_historical_config", return_value=_historical_config()),
-            patch("function_app.OediHistoricalClient", return_value=mock_oedi),
+            patch("function_app.AdlsStore", return_value=mock_adls),
             patch("function_app.FileTrackingStore", return_value=mock_tracker),
             patch("function_app.ServiceBusEmitter", return_value=emitter),
-            patch("function_app.IdempotencyStore", return_value=idem),
             patch("function_app.create_logger", return_value=MagicMock()),
         ):
             from function_app import historical_worker
 
-            with pytest.raises(RuntimeError, match="Network error"):
+            with pytest.raises(AdlsUploadError):
                 await historical_worker(mock_msg)
 
         mock_tracker.mark_failed.assert_called_once_with(9068, work_item["s3_key"])
+        emitter.emit_dead_letter.assert_called_once()
+        dead_letter_body = emitter.emit_dead_letter.call_args.kwargs["message_body"]
+        assert dead_letter_body["file_reference"] == work_item["s3_key"]
+        assert "failure_reason" in dead_letter_body
+        assert dead_letter_body["correlation_id"] == "test-corr-id"
 
     @pytest.mark.asyncio
-    async def test_worker_skips_duplicates(self) -> None:
-        """Duplicate records are skipped, not emitted."""
-        work_item = _default_work_item()
+    async def test_worker_deterministic_adls_path(self) -> None:
+        """ADLS path follows pvdaq/site_id={id}/category={cat}/{file_name} pattern."""
+        work_item = _default_work_item(site_id=9068, file_name="9068_ac_power_data.csv")
         mock_msg = _mock_work_item_msg(work_item)
 
-        csv_rows = [
-            {"measured_on": "2023-01-01 00:00:00", "dc_power_123": "100.5"},
-            {"measured_on": "2023-01-01 00:05:00", "dc_power_123": "101.0"},
-        ]
+        captured_paths: list[str] = []
 
-        async def mock_stream(s3_key: str):
-            for row in csv_rows:
-                yield row
+        async def capture_upload(source_url: str, file_path: str) -> tuple[int, str]:
+            captured_paths.append(file_path)
+            return (1000, "deadbeef")
 
-        mock_oedi = AsyncMock()
-        mock_oedi.stream_csv_rows = mock_stream
-        mock_oedi.__aenter__ = AsyncMock(return_value=mock_oedi)
-        mock_oedi.__aexit__ = AsyncMock(return_value=False)
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = capture_upload
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
 
         mock_tracker = AsyncMock()
         mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
         mock_tracker.__aexit__ = AsyncMock(return_value=False)
 
         emitter = _mock_emitter()
-        # All records are duplicates
-        idem = _mock_idem_store(IdempotencyResult.DUPLICATE)
 
         with (
             patch("function_app.load_historical_config", return_value=_historical_config()),
-            patch("function_app.OediHistoricalClient", return_value=mock_oedi),
+            patch("function_app.AdlsStore", return_value=mock_adls),
             patch("function_app.FileTrackingStore", return_value=mock_tracker),
             patch("function_app.ServiceBusEmitter", return_value=emitter),
-            patch("function_app.IdempotencyStore", return_value=idem),
             patch("function_app.create_logger", return_value=MagicMock()),
         ):
             from function_app import historical_worker
 
             await historical_worker(mock_msg)
 
-        emitter.emit_cloudevent.assert_not_called()
-        # 0 emitted, mark_completed with 0
-        mock_tracker.mark_completed.assert_called_once_with(9068, work_item["s3_key"], 0)
-
-    @pytest.mark.asyncio
-    async def test_worker_retries_pending_records(self) -> None:
-        """RETRY_EMIT records are re-emitted (crash recovery)."""
-        work_item = _default_work_item()
-        mock_msg = _mock_work_item_msg(work_item)
-
-        csv_rows = [
-            {"measured_on": "2023-01-01 00:00:00", "dc_power_123": "100.5"},
-        ]
-
-        async def mock_stream(s3_key: str):
-            for row in csv_rows:
-                yield row
-
-        mock_oedi = AsyncMock()
-        mock_oedi.stream_csv_rows = mock_stream
-        mock_oedi.__aenter__ = AsyncMock(return_value=mock_oedi)
-        mock_oedi.__aexit__ = AsyncMock(return_value=False)
-
-        mock_tracker = AsyncMock()
-        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
-        mock_tracker.__aexit__ = AsyncMock(return_value=False)
-
-        emitter = _mock_emitter()
-        idem = _mock_idem_store(IdempotencyResult.RETRY_EMIT)
-
-        with (
-            patch("function_app.load_historical_config", return_value=_historical_config()),
-            patch("function_app.OediHistoricalClient", return_value=mock_oedi),
-            patch("function_app.FileTrackingStore", return_value=mock_tracker),
-            patch("function_app.ServiceBusEmitter", return_value=emitter),
-            patch("function_app.IdempotencyStore", return_value=idem),
-            patch("function_app.create_logger", return_value=MagicMock()),
-        ):
-            from function_app import historical_worker
-
-            await historical_worker(mock_msg)
-
-        # RETRY_EMIT → record is emitted
-        emitter.emit_cloudevent.assert_called_once()
+        assert len(captured_paths) == 1
+        assert captured_paths[0] == "pvdaq/site_id=9068/category=ac_power/9068_ac_power_data.csv"
 
 
 class TestIncrementalDetection:

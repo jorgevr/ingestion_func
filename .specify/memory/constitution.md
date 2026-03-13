@@ -1,7 +1,7 @@
 <!--
   Sync Impact Report
   ==================
-  Version change: 1.0.0 → 1.1.0
+  Version change: 1.1.0 → 1.2.0
   Modified principles:
     - II (Schema Validation at Boundary): added schema artifact publishing
       and discovery guidance, schema naming convention
@@ -11,7 +11,9 @@
       specified atomic check-and-emit requirement with write-before-emit
       fallback
     - VII (Event Emission Rules): added event-type naming convention
-      (raw.{vendor}.{data_category}.v{major}) and topics.md manifest
+      (raw.{vendor}.{data_category}.v{major}) and topics.md manifest;
+      expanded in 1.2.0 to add domain-level lifecycle event convention
+      ({domain}.{vendor}.{entity}.{action}) for dataset/notification events
   Added sections / clauses:
     - Development Workflow: concurrency/scaling limits requirement
       (host.json tuning per vendor)
@@ -21,12 +23,8 @@
   Removed sections: None
   Templates requiring updates:
     - .specify/templates/plan-template.md — ✅ no update needed
-      (Constitution Check section is dynamic; principles are referenced at
-      plan-generation time)
     - .specify/templates/spec-template.md — ✅ no update needed
-      (generic template; feature specs will reference constitution at authoring)
     - .specify/templates/tasks-template.md — ✅ no update needed
-      (task phases are feature-driven; constitution gates enforced via plan)
   Follow-up TODOs: None
 -->
 
@@ -189,10 +187,13 @@ immutable, self-describing messages.
   or a dedicated metadata block.
 - Emission MUST target a single, well-known topic or queue per event
   type; routing logic MUST NOT be embedded in the Function beyond
-  topic selection. Event types MUST follow the naming convention
-  `raw.{vendor}.{data_category}.v{major}` (e.g.,
-  `raw.pvdaq.generation.v1`, `raw.pvoutput.system.v1`). A new event
-  type MUST be registered in a `topics.md` manifest before first use.
+  topic selection. Event types MUST follow one of these naming
+  conventions: (a) `raw.{vendor}.{data_category}.v{major}` for
+  per-record raw data events (e.g., `raw.pvdaq.generation.v1`), or
+  (b) `{domain}.{vendor}.{entity}.{action}` for domain-level
+  lifecycle events (e.g., `solar.pvdaq.dataset.available`). A new
+  event type MUST be registered in a `topics.md` manifest before
+  first use.
 - Failed emissions MUST be retried with exponential backoff; after
   exhausting retries, the event MUST be routed to a dead-letter
   destination and an alert MUST fire.
@@ -264,4 +265,4 @@ energy-ingestion-boundary repository. Amendments require:
 All pull requests and code reviews MUST verify compliance with these
 principles. Violations MUST be resolved before merge.
 
-**Version**: 1.1.0 | **Ratified**: 2026-02-19 | **Last Amended**: 2026-02-19
+**Version**: 1.2.0 | **Ratified**: 2026-02-19 | **Last Amended**: 2026-03-09

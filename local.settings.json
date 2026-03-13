@@ -9,7 +9,7 @@
     "PVDAQ_SITE_IDS": "",
     "PVDAQ_SITE_COUNT": "30",
     "PVDAQ_LOOKBACK_HOURS": "24",
-    "PVDAQ_CRON_SCHEDULE": "0 0 * 29 2 *",
+    "PVDAQ_CRON_SCHEDULE": "0 0 */6 * * *",
     "SERVICE_BUS_TOPIC_NAME": "raw-energy-events",
     "DEAD_LETTER_QUEUE_NAME": "pvdaq-dead-letter",
     "ServiceBusConnection__fullyQualifiedNamespace": "jorgevr.servicebus.windows.net",
@@ -20,9 +20,11 @@
     "SCHEMA_VERSION_PVDAQ": "v1",
 
     "PVDAQ_HISTORICAL_SITE_IDS": "9068,9069,2107,7333",
-    "PVDAQ_HISTORICAL_CRON_SCHEDULE": "0 41 * * * *",
+    "PVDAQ_HISTORICAL_CRON_SCHEDULE": "0 15 * * * *",
     "PVDAQ_HISTORICAL_QUEUE_NAME": "pvdaq-historical-work",
     "FILE_TRACKING_TABLE_NAME": "PvdaqFileTracking",
-    "OEDI_HISTORICAL_PREFIX": "pvdaq/2023-solar-data-prize"
+    "OEDI_HISTORICAL_PREFIX": "pvdaq/2023-solar-data-prize",
+    "ADLS_ACCOUNT_URL": "https://csb1003bffd999ff1d0.dfs.core.windows.net",
+    "ADLS_CONTAINER_NAME": "raw"
   }
 }

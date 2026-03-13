@@ -18,13 +18,25 @@ from uuid import uuid4
 
 import azure.functions as func
 
+from src.adls_store import AdlsStore, AdlsUploadError
+from src.cloudevents_envelope import build_dataset_envelope
 from src.config import load_config, load_historical_config
-from src.csv_normalizer import detect_timestamp_column, normalize_historical_record
 from src.file_tracking_store import FileTrackingStore
 from src.idempotency_store import IdempotencyStore
-from src.observability import InvocationStats, create_logger, emit_invocation_metrics, emit_warning_metric
+from src.observability import (
+    DatasetIngestionStats,
+    InvocationStats,
+    create_logger,
+    emit_dataset_metrics,
+    emit_invocation_metrics,
+    emit_warning_metric,
+)
 from src.oedi_data_lake import OediAccessError, OediDataLakeClient
-from src.oedi_historical_client import OediHistoricalAccessError, OediHistoricalClient
+from src.oedi_historical_client import (
+    OediHistoricalAccessError,
+    OediHistoricalClient,
+    extract_category,
+)
 from src.record_pipeline import process_record
 from src.service_bus_emitter import ServiceBusEmitter
 
@@ -203,16 +215,14 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
     For each configured site:
     1. List CSV files via S3 ListObjectsV2
     2. Filter to new/changed files via FileTrackingStore
-    3. Enqueue a work-item message per unprocessed file
+    3. Enqueue a work-item message per unprocessed file (mark_queued before send)
     """
     correlation_id = str(uuid4())
     logger = create_logger(correlation_id, vendor="PVDAQ", function_name="historical_dispatcher")
     start_time = time.monotonic()
 
     config = load_historical_config()
-
-    total_discovered = 0
-    total_enqueued = 0
+    stats = DatasetIngestionStats(source="PVDAQ-historical-dispatcher", correlation_id=correlation_id)
     failed_sites: list[int] = []
 
     logger.info(
@@ -244,7 +254,7 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
                 logger.warning("Site %d: no CSV files found", site_id)
                 continue
 
-            total_discovered += len(discovered)
+            stats.datasets_discovered += len(discovered)
 
             unprocessed = await tracker.get_unprocessed_files(site_id, discovered)
             if not unprocessed:
@@ -252,8 +262,10 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
                 continue
 
             for file_info in unprocessed:
-                # Mark queued BEFORE sending to queue to avoid race condition
-                # where the worker picks up the message before the entity exists.
+                file_name = PurePosixPath(file_info["key"]).name
+                category = extract_category(file_name, site_id)
+
+                # Mark queued BEFORE sending to queue — write-before-emit per Constitution VI
                 await tracker.mark_queued(
                     site_id=site_id,
                     s3_key=file_info["key"],
@@ -264,7 +276,8 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
                 work_item = {
                     "site_id": site_id,
                     "s3_key": file_info["key"],
-                    "file_name": PurePosixPath(file_info["key"]).name,
+                    "file_name": file_name,
+                    "category": category,
                     "correlation_id": correlation_id,
                     "enqueued_at": datetime.now(timezone.utc).isoformat(),
                 }
@@ -273,15 +286,15 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
                     message_body=work_item,
                     subject="historical_work_item",
                 )
-                total_enqueued += 1
 
-    duration_ms = (time.monotonic() - start_time) * 1000
+    stats.duration_ms = (time.monotonic() - start_time) * 1000
+    emit_dataset_metrics(stats)
+
     logger.info(
-        "Historical dispatcher completed — discovered=%d, enqueued=%d, failed_sites=%s, duration_ms=%.0f",
-        total_discovered,
-        total_enqueued,
+        "Historical dispatcher completed — discovered=%d, failed_sites=%s, duration_ms=%.0f",
+        stats.datasets_discovered,
         failed_sites,
-        duration_ms,
+        stats.duration_ms,
     )
 
 
@@ -291,15 +304,15 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
     connection="ServiceBusConnection",
 )
 async def historical_worker(msg: func.ServiceBusMessage) -> None:
-    """Process a single historical CSV file from the work queue.
+    """Process a single historical CSV file: stream S3 → ADLS, register metadata, emit event.
 
     Pipeline:
     1. Deserialize work item message
     2. Mark file as processing
-    3. Stream CSV rows, normalize each record
-    4. Validate against pvdaq-v1.json schema
-    5. Emit valid records as CloudEvents, dead-letter invalid ones
-    6. Mark file as completed/failed
+    3. Stream download from S3 + upload to ADLS Gen2 (one-pass, ~4 MiB memory)
+    4. Update tracking entity with storage metadata
+    5. Emit solar.pvdaq.dataset.available CloudEvent
+    6. Mark file as completed
     """
     raw_body = msg.get_body().decode("utf-8")
     work_item = json.loads(raw_body)
@@ -307,6 +320,7 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
     site_id: int = work_item["site_id"]
     s3_key: str = work_item["s3_key"]
     file_name: str = work_item["file_name"]
+    category: str = work_item.get("category") or extract_category(file_name, site_id)
     correlation_id: str = work_item["correlation_id"]
 
     logger = create_logger(correlation_id, vendor="PVDAQ", function_name="historical_worker")
@@ -318,92 +332,98 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
     traceparent = f"00-{trace_id}-{span_id}-01"
 
     config = load_historical_config()
-    stats = InvocationStats(source="PVDAQ-historical", correlation_id=correlation_id)
+    stats = DatasetIngestionStats(source="PVDAQ-historical-worker", correlation_id=correlation_id)
+    ingestion_id = str(uuid4())
 
-    if config.mapping_version_pvdaq == "unknown":
-        emit_warning_metric(
-            metric_name="mapping_version_unknown",
-            details={"mapping_version": config.mapping_version_pvdaq, "vendor": "PVDAQ"},
-        )
+    logger.info("Historical worker started — site=%d, file=%s", site_id, file_name)
 
-    logger.info(
-        "Historical worker started — site=%d, file=%s", site_id, file_name,
+    # Deterministic ADLS destination path (T012)
+    adls_path = f"pvdaq/site_id={site_id}/category={category}/{file_name}"
+    source_url = (
+        f"{config.oedi_bucket_url.rstrip('/')}/{s3_key}"
     )
 
-    async with OediHistoricalClient(
-        bucket_url=config.oedi_bucket_url,
-        historical_prefix=config.oedi_historical_prefix,
-    ) as oedi_client, FileTrackingStore(
+    async with FileTrackingStore(
         table_name=config.file_tracking_table_name,
         table_service_uri=config.table_storage_uri,
-    ) as tracker, ServiceBusEmitter(
+    ) as tracker, AdlsStore(
+        account_url=config.adls_account_url,
+        container_name=config.adls_container_name,
+    ) as adls, ServiceBusEmitter(
         fully_qualified_namespace=config.service_bus_fully_qualified_namespace,
-    ) as emitter, IdempotencyStore(
-        table_name=config.idempotency_table_name,
-        table_service_uri=config.table_storage_uri,
-    ) as idem_store:
+    ) as emitter:
 
         await tracker.mark_processing(site_id, s3_key)
 
         try:
-            timestamp_column: str | None = None
+            # Stream S3 → ADLS with incremental SHA-256 (one-pass, bounded memory)
+            bytes_written, file_hash = await adls.stream_upload(
+                source_url=source_url,
+                file_path=adls_path,
+            )
+            stats.datasets_downloaded = 1
+            stats.datasets_stored = 1
 
-            async for row in oedi_client.stream_csv_rows(s3_key):
-                # Detect timestamp column from first row's headers
-                if timestamp_column is None:
-                    timestamp_column = detect_timestamp_column(list(row.keys()))
+            ingestion_time = datetime.now(timezone.utc).isoformat()
 
-                record = normalize_historical_record(
-                    row=row,
-                    site_id=site_id,
-                    file_name=file_name,
-                    timestamp_column=timestamp_column,
-                )
-                if record is None:
-                    continue
+            # Register metadata in tracking table (US2)
+            await tracker.mark_completed(
+                site_id=site_id,
+                s3_key=s3_key,
+                storage_path=adls_path,
+                file_hash=file_hash,
+                ingestion_id=ingestion_id,
+                source_url=source_url,
+                ingestion_time=ingestion_time,
+            )
 
-                stats.number_of_records_retrieved += 1
+            # Emit dataset-available CloudEvent (US3)
+            envelope = build_dataset_envelope(
+                data={
+                    "site_id": site_id,
+                    "category": category,
+                    "file_format": "csv",
+                    "storage_path": adls_path,
+                    "ingestion_id": ingestion_id,
+                    "source_url": source_url,
+                    "file_size": bytes_written,
+                    "file_hash": file_hash,
+                },
+                config=config,
+                ingestion_id=ingestion_id,
+                traceparent=traceparent,
+                ingestion_timestamp=ingestion_time,
+            )
+            await emitter.emit_cloudevent(
+                topic_name=config.service_bus_topic_name,
+                envelope=envelope,
+            )
+            stats.datasets_emitted = 1
 
-                measdatetime = record.get("measdatetime", "")
-                await process_record(
-                    record,
-                    config=config,
-                    correlation_id=correlation_id,
-                    traceparent=traceparent,
-                    emitter=emitter,
-                    idem_store=idem_store,
-                    stats=stats,
-                    check_idempotency=lambda _md=measdatetime: idem_store.check_and_reserve_historical(
-                        site_id=site_id,
-                        file_name=file_name,
-                        measdatetime=_md,
-                        correlation_id=correlation_id,
-                    ),
-                    mark_completed=lambda _md=measdatetime: idem_store.mark_completed_for_historical(
-                        site_id=site_id,
-                        file_name=file_name,
-                        measdatetime=_md,
-                    ),
-                    event_type="raw.pvdaq.historical.v1",
-                    source="/energy-ingestion-boundary/pvdaq-historical",
-                )
-
-            await tracker.mark_completed(site_id, s3_key, stats.number_emitted)
-
-        except Exception as exc:
+        except (AdlsUploadError, Exception) as exc:
+            stats.datasets_failed = 1
             logger.error(
                 "Historical worker failed — site=%d, file=%s: %s",
                 site_id, file_name, exc, exc_info=True,
             )
             await tracker.mark_failed(site_id, s3_key)
+            await emitter.emit_dead_letter(
+                queue_name=config.dead_letter_queue_name,
+                message_body={
+                    "file_reference": s3_key,
+                    "failure_reason": str(exc),
+                    "correlation_id": correlation_id,
+                },
+                subject="dataset_failure",
+            )
             raise
 
     stats.duration_ms = (time.monotonic() - start_time) * 1000
-    emit_invocation_metrics(stats)
+    emit_dataset_metrics(stats)
 
     logger.info(
-        "Historical worker completed — site=%d, file=%s, retrieved=%d, valid=%d, invalid=%d, emitted=%d, duration_ms=%.0f",
-        site_id, file_name, stats.number_of_records_retrieved,
-        stats.number_valid, stats.number_invalid, stats.number_emitted,
+        "Historical worker completed — site=%d, file=%s, bytes=%d, stored=%d, emitted=%d, duration_ms=%.0f",
+        site_id, file_name, bytes_written,
+        stats.datasets_stored, stats.datasets_emitted,
         stats.duration_ms,
     )

@@ -4,7 +4,7 @@
   "title": "Historical CSV Work Item Message",
   "description": "Message dispatched by the historical-dispatcher function to the historical-worker queue. Each message represents one CSV file to download and process.",
   "type": "object",
-  "required": ["site_id", "s3_key", "file_name", "correlation_id", "enqueued_at"],
+  "required": ["site_id", "s3_key", "file_name", "category", "correlation_id", "enqueued_at"],
   "properties": {
     "site_id": {
       "type": "integer",
@@ -20,6 +20,11 @@
       "type": "string",
       "minLength": 1,
       "description": "Basename of the CSV file (e.g., 9068_ac_power_data.csv)"
+    },
+    "category": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Measurement category extracted from filename (e.g., 'ac_power', 'irradiance')"
     },
     "correlation_id": {
       "type": "string",

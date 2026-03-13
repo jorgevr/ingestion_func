@@ -1,39 +1,41 @@
-# Implementation Plan: PVDAQ Historical Data Ingestion
+# Implementation Plan: PVDAQ Historical Dataset Ingestion
 
-**Branch**: `002-pvdaq-historical-ingestion` | **Date**: 2026-03-02 | **Spec**: [spec.md](spec.md)
+**Branch**: `002-pvdaq-historical-ingestion` | **Date**: 2026-03-09 | **Spec**: [spec.md](spec.md)
 **Input**: Feature specification from `/specs/002-pvdaq-historical-ingestion/spec.md`
+
+**Note**: Revised plan reflecting the architecture change from per-row processing to dataset-level ingestion (store in ADLS + emit dataset event).
 
 ## Summary
 
-Download historical photovoltaic telemetry CSV files from the OEDI Data Lake S3 bucket for 4 specific PVDAQ sites (9068, 9069, 2107, 7333). Uses a fan-out architecture: a timer-triggered dispatcher function lists CSV files and enqueues work items to a Service Bus queue; a queue-triggered worker function downloads and processes one CSV file per invocation. Each valid record is emitted as a CloudEvents v1.0 envelope. Reuses shared modules from feature 001 (Service Bus emitter, idempotency store, observability, CloudEvents envelope builder).
+Download historical CSV files from the OEDI S3 bucket for 4 PVDAQ sites, stream them to ADLS Gen2 raw container, register dataset metadata in the existing file tracking table, and emit a `solar.pvdaq.dataset.available` CloudEvent per file. Uses a fan-out pattern (timer dispatcher + queue worker) to process each file within Azure Function timeout limits. One-pass streaming (S3 → ADLS) with incremental SHA-256 hash keeps memory bounded at ~4 MiB regardless of file size.
 
 ## Technical Context
 
 **Language/Version**: Python 3.11+ (Azure Functions v4 Isolated Worker, v2 programming model)
-**Primary Dependencies**: azure-functions, azure-servicebus, azure-data-tables, azure-identity, httpx, jsonschema (all already in requirements.txt)
-**Storage**: Azure Table Storage (idempotency store — reused from 001), Azure Service Bus (emission + work item queue)
-**Testing**: pytest, pytest-asyncio, respx (HTTP mocking), unittest.mock
-**Target Platform**: Azure Functions (Consumption or Premium plan)
-**Project Type**: Single function app with multiple functions
-**Performance Goals**: Process large CSV files (up to 870 MB) within per-function timeout; bounded memory via streaming reads
-**Constraints**: Azure Function timeout (10 min Consumption / 30 min Premium); per-message Service Bus size limit (256 KB standard / 100 MB premium); S3 public bucket rate limits
-**Scale/Scope**: 4 sites, ~10-40 CSV files total, files ranging 7 MB to 870 MB, 5-minute measurement intervals spanning years of historical data
+**Primary Dependencies**: azure-functions, azure-servicebus, azure-data-tables, azure-identity, azure-storage-file-datalake (NEW), httpx, aiohttp
+**Storage**: Azure Table Storage (file tracking + metadata), Azure Data Lake Storage Gen2 (raw CSV files)
+**Testing**: pytest + pytest-asyncio
+**Target Platform**: Azure Functions (Linux consumption/premium plan)
+**Project Type**: Single project (existing function app)
+**Performance Goals**: Stream 870 MB files with ~4 MiB memory footprint; complete per-file ingestion within function timeout (70 min)
+**Constraints**: Bounded memory via streaming; no full-file buffering; DefaultAzureCredential for all Azure services
+**Scale/Scope**: 4 sites, ~40 CSV files total (7 MB – 870 MB each), ~10 known categories
 
 ## Constitution Check
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-| Principle | Status | Notes |
-| --- | --- | --- |
-| I. Function Isolation | PASS | Dispatcher and worker are separate functions with independent triggers. Feature 002 functions are independent from feature 001 function. |
-| II. Schema Validation at Boundary | PASS | Records validated against JSON Schema before emission. Schema versioned in `schemas/`. Reuse existing `pvdaq-v1.json` since `additionalProperties: true` accommodates varying columns. |
-| III. Metadata Enrichment | PASS | CloudEvents envelope built via shared `build_envelope()`. Includes source_vendor, schema_version, mapping_version, correlation_id, ingestion_timestamp. Event type parameterized for historical data. |
-| IV. Managed Identity | PASS | Service Bus and Table Storage accessed via `DefaultAzureCredential`. OEDI S3 is public HTTPS (no auth needed). |
-| V. Structured Observability | PASS | Reuses shared `create_logger()`, `InvocationStats`, `emit_invocation_metrics()`. JSON-structured logs with correlation_id. |
-| VI. Idempotency | PASS | Write-before-emit pattern via shared `IdempotencyStore`. Key extended to `site_id + category + timestamp` for feature 002 to avoid cross-category collision. |
-| VII. Event Emission Rules | PASS | New event type `raw.pvdaq.historical.v1` registered in `topics.md`. CloudEvents envelope with required extension attributes. Dead-letter on validation failure. |
+| # | Principle | Status | Notes |
+| - | --------- | ------ | ----- |
+| I | Function Isolation | PASS | Dispatcher and worker are separate functions with independent triggers. Feature 001 unaffected. |
+| II | Schema Validation at Boundary | PASS (adjusted) | This feature stores raw files without row-level validation — that moves downstream. The dataset event contract (`dataset-event.json`) is validated at emission. |
+| III | Metadata Enrichment | PASS | Dataset events carry source_vendor, ingestion_timestamp, schema_version, mapping_version, correlation_id, traceparent. `mapping_version` set to `"unknown"` sentinel per constitution fallback (no field mapping at dataset level). |
+| IV | Managed Identity | PASS | DefaultAzureCredential for Table Storage, Service Bus, and ADLS Gen2. No secrets in config. |
+| V | Structured Observability | PASS | Structured logging with correlation_id, dataset-level metrics (discovered/downloaded/stored/emitted/failed). |
+| VI | Idempotency | PASS | File-level idempotency via file tracking store. Key: site_id + category + file_name. Simpler than per-row; write-before-emit pattern preserved (mark_queued before send). |
+| VII | Event Emission Rules | PASS | New event type `solar.pvdaq.dataset.available` registered in topics.md per domain-level lifecycle convention `{domain}.{vendor}.{entity}.{action}` (Constitution v1.2.0). CloudEvents v1.0 envelope with required extension attributes. |
 
-**Post-Phase-1 Re-check**: All principles remain PASS. The fan-out pattern (dispatcher + queue + worker) strengthens isolation (Principle I) and enables per-file timeout management.
+**Post-design re-check**: All 7 principles pass. Constitution Principle II is satisfied at the dataset level — row-level validation is explicitly deferred to the processing layer per spec.
 
 ## Project Structure
 
@@ -42,49 +44,71 @@ Download historical photovoltaic telemetry CSV files from the OEDI Data Lake S3 
 ```text
 specs/002-pvdaq-historical-ingestion/
 ├── plan.md              # This file
-├── research.md          # Phase 0 output
-├── data-model.md        # Phase 1 output
-├── quickstart.md        # Phase 1 output
-├── contracts/           # Phase 1 output
-│   ├── work-item-message.json
-│   └── file-tracking-entity.json
-└── tasks.md             # Phase 2 output (via /speckit.tasks)
+├── spec.md              # Feature specification (revised 2026-03-09)
+├── research.md          # Phase 0 research (revised 2026-03-09)
+├── data-model.md        # Phase 1 data model (revised 2026-03-09)
+├── quickstart.md        # Phase 1 quickstart (revised 2026-03-09)
+├── contracts/
+│   ├── file-tracking-entity.json   # Extended with metadata fields
+│   ├── work-item-message.json      # Unchanged
+│   └── dataset-event.json          # NEW: dataset CloudEvent schema
+├── checklists/
+│   └── requirements.md
+└── tasks.md             # Phase 2 output (generated by /speckit.tasks)
 ```
 
 ### Source Code (repository root)
 
 ```text
 src/
-├── __init__.py                    # (existing)
-├── cloudevents_envelope.py        # (existing — extend to parameterize event type)
-├── config.py                      # (existing — extend with 002 config fields)
-├── idempotency_store.py           # (existing — extend _row_key for category-aware keys)
-├── observability.py               # (existing — reuse as-is)
-├── oedi_data_lake.py              # (existing — feature 001 client, unchanged)
-├── oedi_historical_client.py      # NEW — S3 listing + streaming CSV download for 2023-solar-data-prize
-├── csv_normalizer.py              # NEW — timestamp auto-detect, sensor suffix stripping, numeric casting
-├── schema_validator.py            # (existing — reuse as-is, pvdaq-v1.json already permissive)
-└── service_bus_emitter.py         # (existing — reuse as-is)
-
-function_app.py                    # (existing — add historical_dispatcher + historical_worker functions)
-
-schemas/
-└── pvdaq-v1.json                  # (existing — reuse, additionalProperties: true)
+├── adls_store.py            # NEW: ADLS Gen2 streaming upload + SHA-256 hash
+├── cloudevents_envelope.py  # MODIFIED: add dataset event builder
+├── config.py                # MODIFIED: add ADLS config fields
+├── file_tracking_store.py   # MODIFIED: add metadata fields to mark_completed
+├── observability.py         # MODIFIED: add DatasetIngestionStats
+├── oedi_historical_client.py  # UNCHANGED: list_csv_files reused
+├── service_bus_emitter.py   # UNCHANGED
+├── http_retry.py            # UNCHANGED
+├── csv_normalizer.py        # UNCHANGED (kept for feature 001)
+├── record_pipeline.py       # UNCHANGED (kept for feature 001)
+├── schema_validator.py      # UNCHANGED (kept for feature 001)
+└── idempotency_store.py     # UNCHANGED (kept for feature 001)
 
 tests/
 ├── unit/
-│   ├── test_oedi_historical_client.py  # NEW — S3 listing, streaming download, retry
-│   ├── test_csv_normalizer.py          # NEW — timestamp detection, suffix strip, normalization
-│   └── ...                             # (existing unit tests unchanged)
+│   ├── test_adls_store.py           # NEW
+│   ├── test_file_tracking_store.py  # MODIFIED
+│   └── test_oedi_historical_client.py  # UNCHANGED
 ├── integration/
-│   ├── test_historical_pipeline.py     # NEW — dispatcher + worker end-to-end flow
-│   └── ...                             # (existing integration tests unchanged)
+│   └── test_historical_pipeline.py  # MODIFIED (dataset-level tests)
 └── contract/
-    └── test_historical_envelope.py     # NEW — CloudEvents contract for historical event type
+    └── test_dataset_event.py        # NEW: validate against dataset-event.json
 ```
 
-**Structure Decision**: Single function app with feature 001 and feature 002 functions coexisting. Shared modules in `src/` are extended (not replaced) to support both features. New modules added for 002-specific logic (S3 listing, streaming download, CSV normalization with timestamp auto-detect).
+**Structure Decision**: Single project layout (existing). New module `src/adls_store.py` added; existing modules modified minimally. Feature 001 code remains untouched.
 
 ## Complexity Tracking
 
-No constitution violations requiring justification. All principles pass.
+No constitution violations. No complexity justification needed.
+
+## Key Architecture Decisions
+
+### 1. One-Pass Streaming (S3 → ADLS)
+
+Download from S3 and upload to ADLS in a single streaming pass using httpx `aiter_bytes()` + ADLS `append_data()`. SHA-256 hash computed incrementally on each chunk. Memory footprint: ~4 MiB regardless of file size.
+
+### 2. File Tracking as Metadata Store
+
+The existing `PvdaqFileTracking` Azure Table is extended with metadata columns (StoragePath, FileHash, IngestionId, SourceUrl, IngestionTime) rather than creating a separate store. This keeps file status and dataset metadata co-located.
+
+### 3. Dataset-Level CloudEvent
+
+One event per file instead of per row. Event type `solar.pvdaq.dataset.available` with file-level metadata in the data block. Reduces event volume from millions to tens.
+
+### 4. Worker Pipeline Change
+
+The worker no longer parses CSV rows. New pipeline: download → stream to ADLS → compute hash → update tracking entity → emit dataset event → mark completed.
+
+### 5. Modules Retained for Feature 001
+
+`csv_normalizer.py`, `record_pipeline.py`, `schema_validator.py`, `idempotency_store.py` remain in the codebase for feature 001's per-row pipeline. They are not removed or modified.

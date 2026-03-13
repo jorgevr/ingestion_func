@@ -265,8 +265,9 @@ def _historical_env() -> dict[str, str]:
         "DEAD_LETTER_QUEUE_NAME": "pvdaq-dead-letter",
         "ServiceBusConnection__fullyQualifiedNamespace": "test-sb.servicebus.windows.net",
         "FILE_TRACKING_TABLE_NAME": "PvdaqFileTracking",
-        "IDEMPOTENCY_TABLE_NAME": "PvdaqIdempotency",
         "TableStorageConnection__tableServiceUri": "https://teststorage.table.core.windows.net",
+        "ADLS_ACCOUNT_URL": "https://testaccount.dfs.core.windows.net",
+        "ADLS_CONTAINER_NAME": "raw",
     }
 
 
@@ -285,7 +286,8 @@ class TestLoadHistoricalConfigValid:
         assert cfg.file_tracking_table_name == "PvdaqFileTracking"
         assert cfg.service_bus_topic_name == "raw-energy-events"
         assert cfg.dead_letter_queue_name == "pvdaq-dead-letter"
-        assert cfg.idempotency_table_name == "PvdaqIdempotency"
+        assert cfg.adls_account_url == "https://testaccount.dfs.core.windows.net"
+        assert cfg.adls_container_name == "raw"
 
     def test_oedi_historical_prefix_default(self) -> None:
         env = _historical_env()
@@ -307,7 +309,7 @@ class TestLoadHistoricalConfigValid:
         with patch.dict(os.environ, env, clear=True):
             cfg = load_historical_config()
 
-        assert cfg.tenant_id == "research"
+        assert cfg.tenant_id == "default"
         assert cfg.mapping_version_pvdaq == "unknown"
         assert cfg.schema_version_pvdaq == "v1"
 
