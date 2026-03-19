@@ -2,344 +2,301 @@
 
 **Feature Branch**: `001-pvdaq-ingestion`
 **Created**: 2026-02-19
-**Status**: Draft
+**Updated**: 2026-03-18
+**Status**: Revised — dataset-level ingestion
 **Input**: User description: "PVDAQ Ingestion — boundary-only ingestion of NREL PVDAQ photovoltaic telemetry"
+
+## Revision History
+
+| Version | Date | Change |
+| ------- | ---------- | ------ |
+| 1.0 | 2026-02-19 | Initial — per-row retrieval, validation, and emission |
+| 2.0 | 2026-03-18 | Migrated to dataset-level pattern: download → store bronze → emit dataset event. Row-level parsing/validation/emission moved downstream. |
 
 ## Clarifications
 
 ### Session 2026-02-19
 
-- Q: Which idempotency key derivation strategy — composite (site ID + timestamp) or SHA-256 hash of payload? → A: Composite key (site ID + timestamp) — deterministic, human-readable, maps to natural PVDAQ record uniqueness.
-- Q: Envelope structure — custom envelope or CloudEvents-compatible per constitution? → A: CloudEvents-compatible envelope required. Core fields: `type`, `source`, `id`, `time`, `datacontenttype`. Extension attributes: `tenant_id`, `source_vendor`, `schema_version`, `mapping_version`, `correlation_id`, `ingestion_timestamp`. `data` = original payload unmodified. `mapping_version` = `"unknown"` sentinel in Phase 1 with warning metric.
-- Q: Dead-letter destination — built-in Service Bus DLQ, dedicated queue, or blob storage? → A: Dedicated Service Bus queue (e.g., `pvdaq-dead-letter`) — explicit control, independent monitoring and replay.
+- Q: Envelope structure — custom envelope or CloudEvents-compatible per constitution? → A: CloudEvents-compatible envelope. Core fields: `type`, `source`, `id`, `time`, `datacontenttype`. Extension attributes: `tenant_id`, `source_vendor`, `schema_version`, `mapping_version`, `correlation_id`, `ingestion_timestamp`.
 - Q: Expected data volume per invocation and polling model? → A: Phase 1 targets 1–10 sites, up to 1,000 records per site per poll. Sites polled sequentially to respect NREL rate limits.
+
+### Session 2026-03-18 — Architecture Revision
+
+- Q: What is the event granularity? → A: **One CloudEvent per downloaded CSV file (dataset)**, not per row. Row-level parsing, schema validation, normalization, and per-row emission move to a downstream processing layer (feature 003+). This feature is now: poll → download CSV → store raw file to ADLS bronze → register metadata → emit `solar.pvdaq.dataset.available`.
+- Q: Where are files stored? → A: ADLS Gen2 raw container (bronze layer) using path: `raw/pvdaq/site_id={site_id}/year={year}/month={month}/{file_name}.csv`. Locally, Azurite Blob Storage emulates ADLS Gen2 using the same SDK code path.
+- Q: How is local Service Bus emulated? → A: Azurite Queue (port 10001) replaces Service Bus when `STORAGE_EMULATOR=true`. Same event envelope, different transport. Code uses an abstraction that switches based on the environment variable.
+- Q: File-level idempotency key? → A: Composite of `site_id + date_window` derived from the poll parameters. If the same site+date combination has already been stored, the file write and event emission are skipped.
 
 ## User Scenarios & Testing *(mandatory)*
 
-### User Story 1 — Scheduled Telemetry Retrieval (Priority: P1)
+### User Story 1 — Scheduled CSV Download and Bronze Storage (Priority: P1)
 
-The system retrieves photovoltaic telemetry data from the NREL PVDAQ
-dataset on a recurring schedule without manual intervention. An
-operations engineer configures a set of PVDAQ site IDs and a polling
-schedule; the system then fetches telemetry for those sites within a
-configurable lookback window and emits validated raw events into the
-event backbone.
+The system retrieves photovoltaic telemetry CSV data from the NREL PVDAQ
+dataset on a recurring schedule and stores the raw file in the ADLS Gen2
+bronze layer (or Azurite Blob locally) without parsing rows.
 
-**Why this priority**: This is the core value — without scheduled
-retrieval, no downstream processing can occur. It is the minimum viable
-slice that proves end-to-end data flow from PVDAQ to the event backbone.
+**Why this priority**: Storing the raw file is the foundational step. Without
+it, no downstream processing can occur.
 
-**Independent Test**: Can be fully tested by triggering the function
-with a mock PVDAQ API response and verifying that a correctly shaped
-message appears on the Service Bus topic.
+**Independent Test**: Trigger the function with a mock PVDAQ API response.
+Verify a CSV file appears at the correct ADLS/Azurite Blob path with intact
+content and a matching SHA-256 hash.
 
 **Acceptance Scenarios**:
 
-1. **Given** a configured CRON schedule and site ID list, **When** the
-   timer fires, **Then** the function calls the PVDAQ API for each site
-   within the configured time window and emits one raw event per valid
-   record to the Service Bus topic.
+1. **Given** a configured CRON schedule and site ID list, **When** the timer
+   fires, **Then** the function calls the PVDAQ API for each site within the
+   configured time window and stores the resulting CSV file at
+   `raw/pvdaq/site_id={site_id}/year={year}/month={month}/{file_name}.csv`.
 2. **Given** the PVDAQ API returns zero records for a site, **When** the
-   function processes that site, **Then** no events are emitted and a
-   structured log entry records "0 records retrieved" for that site.
-3. **Given** the PVDAQ API is unreachable, **When** the function
-   attempts retrieval, **Then** the function retries with exponential
-   backoff (max 3 attempts) and logs a failure with correlation ID
-   after exhaustion.
+   function processes that site, **Then** no file is written and a structured
+   log entry records "0 records retrieved" for that site.
+3. **Given** the PVDAQ API is unreachable, **When** the function attempts
+   retrieval, **Then** it retries with exponential backoff (max 3 attempts)
+   and logs a failure with correlation ID after exhaustion.
+4. **Given** a large CSV response, **When** the function writes it to storage,
+   **Then** the write uses streaming so memory usage remains bounded.
 
 ---
 
-### User Story 2 — Schema Validation Gate (Priority: P1)
+### User Story 2 — Dataset Metadata Registration (Priority: P1)
 
-Every record retrieved from PVDAQ is validated against a versioned JSON
-schema before any further processing. Invalid records are rejected at
-the boundary, dead-lettered with error metadata, and never propagated
-downstream.
+Metadata for each stored dataset is registered in the file tracking store so
+downstream systems can discover available data without scanning storage.
 
-**Why this priority**: Tied with P1 because schema validation is
-non-negotiable per the constitution — no data may enter the event
-backbone without passing validation.
+**Why this priority**: Without metadata, consumers cannot know what was
+ingested or verify file integrity.
 
-**Independent Test**: Can be tested by submitting a deliberately
-malformed payload and verifying it is rejected, dead-lettered, and
-logged — while a valid payload passes through.
+**Independent Test**: Ingest a site's CSV and verify the file tracking table
+contains an entry with all required fields (site_id, storage_path, file_size,
+file_hash, ingestion_time, ingestion_id).
 
 **Acceptance Scenarios**:
 
-1. **Given** a record that conforms to `pvdaq-v1.json`, **When** the
-   function validates it, **Then** validation succeeds and the record
-   proceeds to enrichment.
-2. **Given** a record with a missing required field, **When** the
-   function validates it, **Then** the record is rejected, a structured
-   `validation_failure` log entry is emitted, and the record is sent to
-   the dead-letter queue with error metadata (field name, violation
-   description, correlation ID).
-3. **Given** a record with an unexpected data type (e.g., string where
-   number expected), **When** the function validates it, **Then** the
-   record is rejected with the same dead-letter and logging behaviour.
+1. **Given** a CSV file has been stored, **When** metadata is registered,
+   **Then** the entry includes: site_id, source_url, storage_path, file_size,
+   ingestion_time (UTC), file_hash (SHA-256), and ingestion_id (GUID).
+2. **Given** a site is polled again with the same date window, **When** an
+   existing idempotency record is found, **Then** no write or metadata
+   registration occurs and the function returns success.
 
 ---
 
-### User Story 3 — Metadata Enrichment & Event Emission (Priority: P1)
+### User Story 3 — Dataset Event Emission (Priority: P1)
 
-Each validated record is enriched with provenance metadata and emitted
-as a self-describing raw event to the Service Bus topic. The original
-payload is preserved unmodified; metadata is attached in an envelope.
+After a CSV file is successfully stored and metadata registered, the function
+emits a single `solar.pvdaq.dataset.available` CloudEvent so downstream
+consumers are notified without polling storage.
 
-**Why this priority**: Enrichment and emission are inseparable from
-retrieval — an event without metadata is untraceable and violates the
-constitution.
+**Why this priority**: The dataset event is the signal that triggers all
+downstream processing. Emission is inseparable from the storage step.
 
-**Independent Test**: Can be tested by providing a valid PVDAQ record
-and asserting that the emitted Service Bus message is a valid
-CloudEvents envelope with the correct core fields (`type`, `source`,
-`id`, `time`, `datacontenttype`), required extension attributes
-(`tenant_id`, `source_vendor`, `schema_version`, `mapping_version`,
-`correlation_id`, `ingestion_timestamp`), and the unmodified original
-payload under `data`.
+**Independent Test**: Ingest a file and verify one `solar.pvdaq.dataset.available`
+CloudEvent appears on the configured topic/queue containing the correct
+site_id, storage_path, file_hash, and ingestion_id.
 
 **Acceptance Scenarios**:
 
-1. **Given** a validated PVDAQ record, **When** the function enriches
-   and emits it, **Then** the emitted event is a CloudEvents-compatible
-   message with: `type` = `raw.pvdaq.generation.v1`, `source` =
-   `/energy-ingestion-boundary/pvdaq`, `id` = UUID, `time` = UTC
-   ISO-8601, `datacontenttype` = `application/json`; extension
-   attributes `tenant_id` (from config), `source_vendor` = "PVDAQ",
-   `schema_version` = "v1", `mapping_version` = "unknown",
-   `correlation_id` = UUID (per invocation), `ingestion_timestamp` =
-   UTC ISO-8601; and `data` containing the original payload unmodified.
-2. **Given** a Service Bus publish failure, **When** the function
-   attempts emission, **Then** it retries with exponential backoff and,
-   after exhaustion, fails the invocation so the runtime can surface the
-   error.
-3. **Given** the `MAPPING_VERSION_PVDAQ` environment variable is not
-   set, **When** the function enriches a record, **Then**
-   `mapping_version` is set to the sentinel value `"unknown"` and a
-   warning metric is emitted.
+1. **Given** a CSV file has been stored and metadata registered, **When** the
+   function emits the event, **Then** a CloudEvents-compatible message is
+   published with: `type` = `solar.pvdaq.dataset.available`, `source` =
+   `/energy-ingestion-boundary/pvdaq`, `id` = UUID, `time` = UTC ISO-8601,
+   `datacontenttype` = `application/json`; extension attributes `tenant_id`,
+   `source_vendor` = "PVDAQ", `schema_version`, `correlation_id`,
+   `ingestion_timestamp`; `data` containing site_id, storage_path, file_size,
+   file_hash, ingestion_id, and source_url.
+2. **Given** the message bus publish fails, **When** the function retries,
+   **Then** it uses exponential backoff and dead-letters after exhaustion.
+3. **Given** `STORAGE_EMULATOR=true`, **When** the event is emitted, **Then**
+   it is sent to an Azurite Queue instead of Service Bus, using the same
+   CloudEvents envelope.
 
 ---
 
-### User Story 4 — Idempotent Emission (Priority: P2)
+### User Story 4 — File-level Idempotency (Priority: P2)
 
-The function prevents duplicate events from reaching the event backbone
-when the same PVDAQ record is encountered more than once (due to
-overlapping poll windows, retries, or replayed timer triggers).
+The function prevents duplicate downloads and emissions when the same site
+and date window are encountered more than once (retries, overlapping polls).
 
-**Why this priority**: Idempotency is constitutionally required but
-ranks slightly below core retrieval/validation/emission because it
-builds on top of a working pipeline.
+**Why this priority**: Required by the constitution but ranked below core
+storage/emission because it builds on a working pipeline.
 
-**Independent Test**: Can be tested by submitting the same PVDAQ record
-twice and verifying only one event is emitted; the second invocation
-returns success without emission.
+**Independent Test**: Run the function for a site+date combination twice.
+Verify the file is written and the event emitted exactly once; the second
+run returns success without any write or emission.
 
 **Acceptance Scenarios**:
 
-1. **Given** a PVDAQ record that has not been seen before, **When** the
-   function processes it, **Then** the idempotency key is written to the
-   store and the event is emitted.
-2. **Given** a PVDAQ record whose idempotency key already exists in the
-   store, **When** the function processes it, **Then** no event is
-   emitted and the function returns success.
-3. **Given** an idempotency record older than the configured TTL
-   (minimum 24 hours), **When** the same record reappears, **Then** the
-   record is treated as new and emitted again.
+1. **Given** a site+date window not previously seen, **When** the function
+   processes it, **Then** the idempotency record is written and the dataset
+   is stored and emitted.
+2. **Given** a site+date window whose idempotency key exists, **When** the
+   function processes it, **Then** no storage write and no event emission
+   occur.
 
 ---
 
 ### User Story 5 — Structured Observability (Priority: P2)
 
-Every invocation emits structured telemetry — metrics and logs — so
-that operators can monitor ingestion health, detect upstream data
-quality regressions, and troubleshoot failures.
-
-**Why this priority**: Observability is constitutionally required and
-essential for production readiness, but the pipeline can function (in a
-degraded operational state) without it.
-
-**Independent Test**: Can be tested by triggering the function and
-asserting that structured log entries and custom metrics appear with the
-expected fields and values.
+Every invocation emits structured telemetry so operators can monitor
+ingestion health.
 
 **Acceptance Scenarios**:
 
-1. **Given** a successful invocation, **When** processing completes,
-   **Then** structured telemetry is emitted containing: `source` =
-   "PVDAQ", `number_of_records_retrieved`, `number_valid`,
-   `number_invalid`, `number_emitted`, `duration_ms`, and
-   `correlationId`.
-2. **Given** an unhandled exception, **When** the function fails,
-   **Then** the exception is logged as structured JSON with
-   `correlation_id`, `function_name`, and `vendor`, and surfaced as a
-   failure status.
+1. **Given** a successful invocation, **When** processing completes, **Then**
+   structured telemetry includes: `source` = "PVDAQ", `sites_processed`,
+   `datasets_stored`, `datasets_skipped`, `datasets_failed`, `duration_ms`,
+   and `correlation_id`.
+2. **Given** an unhandled exception, **When** the function fails, **Then** it
+   is logged as structured JSON with `correlation_id`, `function_name`, and
+   `vendor`.
 
 ---
 
 ### Edge Cases
 
-- What happens when the PVDAQ API returns a **partial page** mid-stream
-  and then errors? The function continues processing already-retrieved
-  records and logs the partial failure.
-- What happens when **all records in a batch fail validation**? No
-  events are emitted; all records are dead-lettered; observability
-  metrics reflect `number_valid = 0`, `number_invalid = N`.
-- What happens when the **idempotency store is unavailable**? The
-  function fails the invocation rather than risk duplicate emission
-  (fail-closed).
-- What happens when a configured **site ID does not exist** in PVDAQ?
-  The function logs a warning for that site and continues processing
-  remaining sites.
-- What happens when the **time window configuration yields zero
-  records** across all sites? The function completes successfully with
-  `number_of_records_retrieved = 0` and emits no events.
-- What happens when the **Service Bus topic does not exist** at
-  emission time? The function fails with a clear error indicating the
-  missing topic.
+- What happens when **ADLS/Azurite write fails**? The dataset is marked as
+  failed; no event is emitted (write-before-emit enforced).
+- What happens when **all sites return zero records**? The function completes
+  successfully with `datasets_stored = 0`; no events are emitted.
+- What happens when the **idempotency store is unavailable**? The function
+  fails the invocation rather than risk duplicate writes (fail-closed).
+- What happens when a **site ID does not exist** in PVDAQ? The function logs
+  a warning for that site and continues processing remaining sites.
+- What happens when the **message bus does not exist** at emission time? The
+  function fails with a clear error indicating the missing topic/queue.
 
 ## Requirements *(mandatory)*
 
 ### Functional Requirements
 
-- **FR-001**: System MUST execute PVDAQ telemetry retrieval on a
-  configurable CRON schedule via a timer trigger.
-- **FR-002**: System MUST call the PVDAQ API (via the `pvdaq_access`
-  library) for each configured site ID and retrieve telemetry within a
-  configurable lookback time window.
-- **FR-003**: System MUST retry PVDAQ API calls on timeout with
-  exponential backoff (max 3 attempts) and respect `Retry-After`
-  headers when rate-limited.
-- **FR-004**: System MUST validate every retrieved record against the
-  versioned JSON schema `pvdaq-v1.json` as the first processing step
-  after deserialization.
-- **FR-005**: System MUST reject records that fail schema validation —
-  rejected records MUST NOT be emitted to the event backbone, MUST be
-  logged as `validation_failure`, and MUST be sent to a dedicated
-  dead-letter Service Bus queue (e.g., `pvdaq-dead-letter`) with error
-  metadata. The dead-letter queue name MUST be configuration-driven.
-- **FR-006**: System MUST emit each valid record as a
-  CloudEvents-compatible message. The envelope MUST include:
-  - Core fields: `type` (e.g., `raw.pvdaq.generation.v1`), `source`
-    (`/energy-ingestion-boundary/pvdaq`), `id` (UUID), `time` (UTC
-    ISO-8601), `datacontenttype` (`application/json`).
-  - Extension attributes: `tenant_id` (from configuration),
-    `source_vendor` = "PVDAQ", `schema_version` matching the validation
-    schema, `mapping_version` (read from `MAPPING_VERSION_PVDAQ`
-    environment variable or Key Vault; sentinel `"unknown"` if
-    unavailable, with warning metric emitted), `correlation_id` (UUID
-    generated per invocation), `ingestion_timestamp` (UTC ISO-8601),
-    `traceparent` (W3C Trace Context header from invocation context).
-  - `data`: the original vendor payload unmodified.
-- **FR-007**: System MUST emit validated, enriched events to a
-  configuration-driven Service Bus topic (default: `raw-energy-events`).
-  The event type MUST follow the naming convention
-  `raw.{vendor}.{data_category}.v{major}` and be registered in the
-  `topics.md` manifest before first use.
+- **FR-001**: System MUST execute PVDAQ telemetry retrieval on a configurable
+  CRON schedule via a timer trigger.
+- **FR-002**: System MUST call the PVDAQ API for each configured site ID and
+  retrieve telemetry within a configurable lookback time window.
+- **FR-003**: System MUST retry PVDAQ API calls on timeout with exponential
+  backoff (max 3 attempts) and respect `Retry-After` headers when
+  rate-limited.
+- **FR-004**: System MUST write the retrieved CSV data to the bronze storage
+  layer at the deterministic path
+  `raw/pvdaq/site_id={site_id}/year={year}/month={month}/{file_name}.csv`
+  using a streaming upload. In local development (`STORAGE_EMULATOR=true`),
+  the target MUST be Azurite Blob Storage using the same `azure-storage-blob`
+  SDK code path.
+- **FR-005**: System MUST compute a SHA-256 hash of the file content during
+  streaming upload and store it in the dataset metadata entry.
+- **FR-006**: System MUST register dataset metadata in the file tracking store
+  after a successful storage write. Metadata MUST include: site_id,
+  source_url, storage_path, file_size, ingestion_time (UTC), file_hash
+  (SHA-256), and ingestion_id (GUID).
+- **FR-007**: System MUST emit one `solar.pvdaq.dataset.available` CloudEvent
+  per stored dataset. The event MUST conform to the CloudEvents envelope
+  (Principle VII). In local development (`STORAGE_EMULATOR=true`), the event
+  MUST be sent to an Azurite Queue instead of Service Bus.
 - **FR-008**: System MUST derive a deterministic idempotency key from
-  each record's composite identity (site ID + timestamp) and check
-  against an idempotency store before emission; duplicates MUST NOT be
-  emitted.
+  `site_id + date_window` and skip storage write and event emission if the key
+  already exists in the idempotency store.
 - **FR-009**: System MUST emit structured telemetry per invocation:
-  `source`, `number_of_records_retrieved`, `number_valid`,
-  `number_invalid`, `number_emitted`, `duration_ms`, and
-  `correlation_id`.
-- **FR-009a**: System MUST propagate distributed trace context by
-  including the originating `traceparent` value (W3C Trace Context) as
-  a CloudEvents extension attribute on every emitted event. If no
-  inbound trace context exists (e.g., timer trigger), the function MUST
-  generate a new trace ID for the invocation.
-- **FR-009b**: System MUST define configurable alert conditions for:
-  validation failure rate spikes (e.g., >10% of records in an
-  invocation), emission failures (any Service Bus send error after retry
-  exhaustion), and abnormal processing latency (invocation duration
-  exceeding a configurable threshold). Alert definitions MUST be
-  expressed as infrastructure-as-code (Bicep/Terraform) or documented
-  as Application Insights alert rule specifications.
-- **FR-010**: System MUST retrieve secrets (API keys) exclusively via
-  Managed Identity and Key Vault — no secrets in code, config files, or
-  environment variables.
-- **FR-011**: System MUST externalise all configuration: PVDAQ API base
-  URL, site ID list, time window, CRON schedule, schema version, Service
-  Bus topic name, dead-letter queue name, tenant ID, and mapping
-  version source (`MAPPING_VERSION_PVDAQ`). No runtime constants may be
-  hardcoded.
-- **FR-012**: System MUST continue processing remaining records when
-  individual records in a batch fail (partial batch failure resilience).
+  `sites_processed`, `datasets_stored`, `datasets_skipped`, `datasets_failed`,
+  `duration_ms`, and `correlation_id`.
+- **FR-010**: System MUST continue processing remaining sites when a single
+  site's API call or storage write fails (partial-failure resilience).
+- **FR-011**: System MUST externalise all configuration: PVDAQ API base URL,
+  site ID list, time window, CRON schedule, storage container name, message
+  bus topic/queue name, dead-letter queue name, tenant ID. No runtime
+  constants may be hardcoded.
+- **FR-012**: System MUST NOT parse CSV rows, validate row schema, normalize
+  row data, or emit per-row events. These responsibilities belong to the
+  downstream processing layer.
 
 ### Key Entities
 
-- **PVDAQ Telemetry Record**: A single measurement row retrieved from
-  the PVDAQ API, identified by site ID and timestamp. Contains raw
-  photovoltaic performance data (power output, irradiance, temperature,
-  etc.).
-- **Ingestion Event (CloudEvents)**: A CloudEvents-compatible message
-  emitted to Service Bus. Core fields: `type`, `source`, `id`, `time`,
-  `datacontenttype`. Extension attributes: `tenant_id`, `source_vendor`,
-  `schema_version`, `mapping_version`, `correlation_id`,
-  `ingestion_timestamp`. The `data` field contains the unmodified
-  original vendor payload.
-- **Idempotency Record**: A store entry keyed by a composite of site ID
-  + timestamp, with a TTL (minimum 24 hours) used to prevent duplicate
-  emission.
-- **Dead-Letter Entry**: A rejected record sent to the dedicated
-  dead-letter Service Bus queue, containing the original payload,
-  validation error details, and correlation metadata.
+- **PVDAQ Dataset**: A single CSV file downloaded for one site covering one
+  polling window. Identified by site_id + date_window. Contains raw
+  photovoltaic performance data (unparsed).
+- **Dataset Metadata Record**: A file tracking store entry per ingested dataset.
+  Fields: site_id, source_url, storage_path, file_size, file_hash (SHA-256),
+  ingestion_id (GUID), ingestion_time (UTC).
+- **Dataset Event**: A `solar.pvdaq.dataset.available` CloudEvent emitted
+  after successful storage. Data block: site_id, storage_path, file_size,
+  file_hash, ingestion_id, source_url.
+- **Idempotency Record**: A store entry keyed by `site_id + date_window` with
+  a TTL (minimum 24 hours) to prevent duplicate downloads and emissions.
+
+## Storage Layout
+
+ADLS Gen2 (prod) / Azurite Blob container `bronze` (local):
+
+```text
+raw/pvdaq/
+  site_id=9068/
+    year=2024/
+      month=01/
+        pvdaq_9068_2024-01-15.csv
+      month=02/
+        pvdaq_9068_2024-02-03.csv
+  site_id=9069/
+    year=2024/
+      month=01/
+        pvdaq_9069_2024-01-15.csv
+```
+
+## Local vs Production Behaviour
+
+| Concern        | Local (`STORAGE_EMULATOR=true`)      | Production                                |
+| -------------- | ------------------------------------ | ----------------------------------------- |
+| Bronze storage | Azurite Blob port 10000 (`bronze`)   | ADLS Gen2 raw container                   |
+| Event emission | Azurite Queue port 10001             | Service Bus topic                         |
+| Table storage  | Azurite Table port 10002             | Azure Table Storage                       |
+| Auth           | Connection string (devstoreaccount1) | DefaultAzureCredential (managed identity) |
 
 ## Success Criteria *(mandatory)*
 
 ### Measurable Outcomes
 
-- **SC-001**: Valid PVDAQ records are retrievable and emitted to the
-  event backbone within 60 seconds of the scheduled trigger firing
-  (excluding upstream API latency).
-- **SC-002**: 100% of records that fail schema validation are rejected
-  and dead-lettered — zero invalid records reach the event backbone.
-- **SC-003**: Duplicate records (same site ID + timestamp) are emitted
-  at most once within a 24-hour window.
-- **SC-004**: Every invocation produces a complete set of structured
-  telemetry metrics visible in the observability backend.
-- **SC-005**: The function operates without any hardcoded secrets — all
-  credentials are resolved at runtime via Managed Identity and Key
-  Vault.
-- **SC-006**: All configuration values are externally changeable without
-  code deployment.
-- **SC-007**: A single vendor API failure does not prevent processing of
-  records from other configured sites (partial-failure resilience).
+- **SC-001**: PVDAQ CSV files for all configured sites are stored in the bronze
+  layer within 60 seconds of the scheduled trigger firing (excluding upstream
+  API latency).
+- **SC-002**: Each stored dataset produces exactly one `solar.pvdaq.dataset.available`
+  event on the configured topic/queue.
+- **SC-003**: Duplicate site+date combinations are stored and emitted at most
+  once within a 24-hour window.
+- **SC-004**: Every invocation produces a complete structured telemetry summary.
+- **SC-005**: No raw CSV row parsing, normalization, or per-row event emission
+  occurs in this function.
+- **SC-006**: Local development works end-to-end using only Azurite (no real
+  Azure resources required).
 
 ## Assumptions
 
-- The PVDAQ ingestion function uses an internal `pvdaq_access` module
-  (implemented in `src/pvdaq_access.py`) that wraps the NREL Developer
-  API via `httpx` and handles retry, timeout, and `Retry-After` logic.
-  No external `pvdaq_access` PyPI package exists.
-- PVDAQ site IDs are known at configuration time and do not change
-  frequently; they are managed as a list in application configuration.
-  Phase 1 targets 1–10 sites.
-- Each site returns up to 1,000 records per poll (based on typical
-  PVDAQ 1-minute granularity over a 24-hour lookback). Total per
-  invocation: up to ~10,000 records.
-- Sites are polled sequentially (one API call at a time) to respect
-  NREL rate limits. Concurrent polling may be considered in future
-  phases if rate limits allow.
-- The default lookback time window (e.g., previous 24 hours) is
-  sufficient to capture new data without excessive overlap, and is
-  tunable per deployment.
-- The `tenantId` value "research" is the default for Phase 1 but is
-  configuration-driven to support future multi-tenant scenarios.
-- `correlationId` is generated once per function invocation and shared
-  across all records in that batch, providing a grouping key for
-  troubleshooting.
-- The PVDAQ API may return records in varying structures across
-  different system types; the JSON schema `pvdaq-v1.json` accounts for
-  known variations.
+- The PVDAQ API is accessed via the internal `pvdaq_access` module
+  (`src/pvdaq_access.py`) which wraps the NREL Developer API via `httpx`.
+- PVDAQ site IDs are known at configuration time. Phase 1 targets 1–10 sites.
+- The default lookback window (e.g., previous 24 hours) produces one CSV file
+  per site per invocation at the configured granularity.
+- `correlation_id` is generated once per function invocation and shared across
+  all sites in that batch.
 
 ## Constraints
 
-- This feature implements boundary-only ingestion. No domain
-  normalization, unit conversion, canonical mapping, or transformation
-  of any kind occurs at this stage.
-- The function operates within Azure Functions v4 (Python Isolated
-  Worker) runtime constraints: execution timeout, memory limits, and
-  concurrency settings as declared in `host.json`.
+- Row-level parsing, schema validation, normalization, and per-row event
+  emission are explicitly out of scope. All such logic belongs to the
+  downstream processing layer (feature 003+).
+- The function operates within Azure Functions v4 (Python Isolated Worker)
+  runtime constraints as declared in `host.json`.
 - All timestamps are stored and emitted in UTC.
 - No raw payload content containing PII may appear in log output.
+
+## What Moved Downstream
+
+The following responsibilities from spec v1.0 are now in the processing
+layer (feature 003+):
+
+| Responsibility              | Old FR   | New Location       |
+| --------------------------- | -------- | ------------------ |
+| CSV row parsing             | FR-002   | Processing layer   |
+| Row-level schema validation | FR-004   | Processing layer   |
+| Per-row metadata enrichment | FR-006   | Processing layer   |
+| Per-row CloudEvent emission | FR-007   | Processing layer   |
+| Per-row dead-lettering      | FR-005   | Processing layer   |
+| Per-row idempotency         | FR-008   | Processing layer   |

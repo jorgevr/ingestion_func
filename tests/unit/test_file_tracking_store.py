@@ -184,10 +184,16 @@ class TestMarkProcessing:
         table_client.upsert_entity = AsyncMock(return_value=None)
         store = _make_store(table_client)
 
-        await store.mark_processing(SITE_ID, S3_KEY)
+        await store.mark_processing(SITE_ID, S3_KEY, version=1)
 
-        entity = table_client.upsert_entity.call_args[0][0]
-        assert entity["Status"] == "processing"
+        # mark_processing does 2 upserts: versioned entity + base entity
+        assert table_client.upsert_entity.call_count == 2
+        # Both should reflect processing status
+        versioned_entity = table_client.upsert_entity.call_args_list[0][0][0]
+        base_entity = table_client.upsert_entity.call_args_list[1][0][0]
+        assert versioned_entity["Status"] == "processing"
+        assert versioned_entity["Version"] == 1
+        assert base_entity["Status"] == "processing"
 
 
 class TestMarkCompleted:
@@ -202,21 +208,32 @@ class TestMarkCompleted:
         await store.mark_completed(
             SITE_ID,
             S3_KEY,
-            storage_path="pvdaq/site_id=9068/category=ac_power/file.csv",
+            version=1,
+            category="ac_power",
+            storage_path="source=pvdaq/dataset=9068_ac_power/ingestion_date=2024-01-15/9068_ac_power_v1.csv",
             file_hash="abc123",
             ingestion_id="ingest-uuid",
             source_url="https://oedi.s3.amazonaws.com/pvdaq/file.csv",
             ingestion_time="2024-01-15T12:00:00+00:00",
+            row_count=1000,
+            metadata_path="source=pvdaq/dataset=9068_ac_power/ingestion_date=2024-01-15/metadata.json",
         )
 
-        entity = table_client.upsert_entity.call_args[0][0]
-        assert entity["Status"] == "completed"
-        assert entity["StoragePath"] == "pvdaq/site_id=9068/category=ac_power/file.csv"
-        assert entity["FileHash"] == "abc123"
-        assert entity["IngestionId"] == "ingest-uuid"
-        assert entity["SourceUrl"] == "https://oedi.s3.amazonaws.com/pvdaq/file.csv"
-        assert entity["IngestionTime"] == "2024-01-15T12:00:00+00:00"
-        assert "CompletedAt" in entity
+        # mark_completed does 2 upserts: versioned entity (full metadata) + base entity (status only)
+        assert table_client.upsert_entity.call_count == 2
+        versioned_entity = table_client.upsert_entity.call_args_list[0][0][0]
+        base_entity = table_client.upsert_entity.call_args_list[1][0][0]
+        assert versioned_entity["Status"] == "completed"
+        assert versioned_entity["Version"] == 1
+        assert versioned_entity["Category"] == "ac_power"
+        assert versioned_entity["StoragePath"] == "source=pvdaq/dataset=9068_ac_power/ingestion_date=2024-01-15/9068_ac_power_v1.csv"
+        assert versioned_entity["FileHash"] == "abc123"
+        assert versioned_entity["IngestionId"] == "ingest-uuid"
+        assert versioned_entity["SourceUrl"] == "https://oedi.s3.amazonaws.com/pvdaq/file.csv"
+        assert versioned_entity["IngestionTime"] == "2024-01-15T12:00:00+00:00"
+        assert versioned_entity["RowCount"] == 1000
+        assert "CompletedAt" in versioned_entity
+        assert base_entity["Status"] == "completed"
 
 
 class TestMarkFailed:

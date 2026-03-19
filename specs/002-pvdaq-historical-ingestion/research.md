@@ -141,3 +141,47 @@ file_hash = hasher.hexdigest()
 **Naming**: Departs from the `raw.{vendor}.{data_category}.v{major}` convention since this is a dataset-available notification, not a raw data event. The `solar.` prefix indicates a domain-level event.
 
 **Topic**: Same `raw-energy-events` topic — consumers filter by `subject` or `type`.
+
+---
+
+## R9: ADLS Path — Gate Failure Resolution (2026-03-19)
+
+**Decision**: Path MUST be `raw/pvdaq/site_id={site_id}/year={year}/month={month}/{file_name}`.
+`year` and `month` derived in UTC from S3 `LastModified` timestamp; fall back to ingestion date.
+
+**Current state (bug)**: `function_app.py:341` builds `pvdaq/site_id={site_id}/category={category}/{file_name}`.
+- Missing `raw/` prefix — violates Constitution VIII and spec FR-004.
+- Uses `category` partition instead of `year/month` — diverges from the standard bronze layout.
+
+**Fix strategy**:
+1. Add `last_modified` to work-item message in dispatcher (already available from S3 listing).
+2. In worker, parse `last_modified` with UTC normalisation:
+   ```python
+   dt = datetime.fromisoformat(last_modified.replace("Z", "+00:00")).astimezone(timezone.utc)
+   adls_path = f"raw/pvdaq/site_id={site_id}/year={dt.year}/month={dt.month:02d}/{file_name}"
+   ```
+3. Fallback to ingestion date when `last_modified` is absent.
+4. Update `contracts/work-item-message.json` — add optional `last_modified` field.
+5. Fix integration test assertion in `test_worker_deterministic_adls_path`.
+
+## R10: Work-Item Schema Validation Gap (Constitution II) (2026-03-19)
+
+**Decision**: Validate incoming work-item queue message in `historical_worker` using `schema_validator.py`.
+
+**Current state**: Worker does raw `json.loads` then accesses fields directly — no validation.
+
+**Fix**: At the top of `historical_worker`, before `mark_processing`, validate the parsed dict
+against `work-item-message.json`. On failure, dead-letter and return (no retry for malformed messages).
+
+Note: `quickstart.md` listed `src/schema_validator.py` as unused by feature 002 — this is now incorrect.
+
+## R11: Local Emulation Switching (2026-03-19)
+
+**Decision**:
+- **ADLS Azurite**: Set `ADLS_ACCOUNT_URL=http://127.0.0.1:10000/devstoreaccount1` in
+  `local.settings.json`. No code change needed — `AdlsStore` accepts `account_url` from config.
+  Azurite ≥3.22.0 supports the DFS endpoint used by `azure-storage-file-datalake`.
+- **Service Bus → Azurite Queue**: Introduce `AzuriteQueueEmitter` using `azure-storage-queue`
+  SDK. Activated when `STORAGE_EMULATOR=true`. Both emitter types expose the same interface
+  (`emit_cloudevent`, `emit_dead_letter`, `send_queue_message`). Factory in `function_app.py`
+  selects the correct type based on env var.

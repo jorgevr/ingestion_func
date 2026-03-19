@@ -65,21 +65,24 @@ class AdlsStore:
         source_url: str,
         file_path: str,
         http_client: httpx.AsyncClient | None = None,
-    ) -> tuple[int, str]:
+    ) -> tuple[int, str, int]:
         """Stream a remote file into ADLS Gen2.
 
         Downloads *source_url* in 4 MiB chunks, appends each chunk to the
-        ADLS file, and computes the SHA-256 hash incrementally.  A single
-        ``flush_data`` call at the end makes the file visible.
+        ADLS file, and computes the SHA-256 hash and newline count
+        incrementally.  A single ``flush_data`` call at the end makes the
+        file visible.
 
         Args:
             source_url: HTTP(S) URL to download from (typically an S3 URL).
             file_path: Destination path within the container, without a
-                leading slash (e.g. ``"pvdaq/site_id=9068/category=irradiance/...csv"``).
+                leading slash.
             http_client: Optional ``httpx.AsyncClient`` for testability.
 
         Returns:
-            A ``(bytes_written, sha256_hex)`` tuple.
+            A ``(bytes_written, sha256_hex, newline_count)`` tuple.
+            ``newline_count`` is the number of ``\\n`` bytes encountered
+            during streaming — a zero-cost row count proxy (no CSV parsing).
 
         Raises:
             AdlsUploadError: If the download or upload fails.
@@ -100,6 +103,7 @@ class AdlsStore:
 
             hasher = hashlib.sha256()
             offset = 0
+            newline_count = 0
 
             async with http_client.stream("GET", source_url) as response:
                 if response.status_code == 404:
@@ -108,6 +112,7 @@ class AdlsStore:
 
                 async for chunk in response.aiter_bytes(chunk_size=CHUNK_SIZE):
                     hasher.update(chunk)
+                    newline_count += chunk.count(b"\n")
                     length = len(chunk)
                     await file_client.append_data(
                         data=chunk, offset=offset, length=length,
@@ -118,10 +123,10 @@ class AdlsStore:
             file_hash = hasher.hexdigest()
 
             logger.debug(
-                "Uploaded %d bytes to %s/%s (sha256=%s)",
-                offset, self._container_name, file_path, file_hash[:16],
+                "Uploaded %d bytes to %s/%s (sha256=%s, rows~=%d)",
+                offset, self._container_name, file_path, file_hash[:16], newline_count,
             )
-            return offset, file_hash
+            return offset, file_hash, newline_count
 
         except AdlsUploadError:
             raise
@@ -132,6 +137,42 @@ class AdlsStore:
         finally:
             if owns_http:
                 await http_client.aclose()
+
+    async def write_json(self, file_path: str, data: dict) -> None:
+        """Write a JSON-serialisable dict as a single file in ADLS Gen2.
+
+        Uses the same ``create_file → append_data → flush_data`` pattern as
+        ``stream_upload`` but as a single chunk (no streaming required since
+        ``metadata.json`` is always small, < 2 KB).
+
+        Args:
+            file_path: Destination path within the container, without a
+                leading slash (e.g. ``"source=pvdaq/.../metadata.json"``).
+            data: JSON-serialisable dict to write.
+
+        Raises:
+            AdlsUploadError: If the write fails.
+        """
+        import json as _json
+
+        try:
+            service = await self._get_service_client()
+            fs_client = service.get_file_system_client(self._container_name)
+            file_client = fs_client.get_file_client(file_path)
+
+            payload = _json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+            await file_client.create_file()
+            await file_client.append_data(data=payload, offset=0, length=len(payload))
+            await file_client.flush_data(len(payload))
+
+            logger.debug(
+                "Wrote %d bytes of JSON to %s/%s",
+                len(payload), self._container_name, file_path,
+            )
+        except Exception as exc:
+            raise AdlsUploadError(
+                f"Failed to write JSON to {file_path}: {exc}"
+            ) from exc
 
     async def close(self) -> None:
         """Close the service client and credential if owned by this instance."""

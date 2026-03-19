@@ -7,6 +7,8 @@ Auto-generated from all feature plans. Last updated: 2026-02-19
 - Azure Table Storage (idempotency store — reused from 001), Azure Service Bus (emission + work item queue) (002-pvdaq-historical-ingestion)
 - Python 3.11+ (Azure Functions v4 Isolated Worker, v2 programming model) + azure-functions, azure-servicebus, azure-data-tables, azure-identity, azure-storage-file-datalake (NEW), httpx, aiohttp (002-pvdaq-historical-ingestion)
 - Azure Table Storage (file tracking + metadata), Azure Data Lake Storage Gen2 (raw CSV files) (002-pvdaq-historical-ingestion)
+- Python 3.11+, Azure Functions v4 Isolated Worker (v2 programming model) + azure-functions, azure-servicebus, azure-data-tables, azure-identity, (002-pvdaq-historical-ingestion)
+- Azure Table Storage (`PvdaqFileTracking`) + ADLS Gen2 bronze container (`raw`) (002-pvdaq-historical-ingestion)
 
 - Python 3.11+ (Azure Functions v4 Isolated Worker, v2 programming model) + azure-functions, azure-servicebus, azure-data-tables, azure-identity, httpx, jsonschema (001-pvdaq-ingestion)
 
@@ -26,10 +28,10 @@ cd src; pytest; ruff check .
 Python 3.11+ (Azure Functions v4 Isolated Worker, v2 programming model): Follow standard conventions
 
 ## Recent Changes
+- 002-pvdaq-historical-ingestion: Added Python 3.11+, Azure Functions v4 Isolated Worker (v2 programming model) + azure-functions, azure-servicebus, azure-data-tables, azure-identity,
 - 002-pvdaq-historical-ingestion: Added Python 3.11+ (Azure Functions v4 Isolated Worker, v2 programming model) + azure-functions, azure-servicebus, azure-data-tables, azure-identity, azure-storage-file-datalake (NEW), httpx, aiohttp
 - 002-pvdaq-historical-ingestion: Added Python 3.11+ (Azure Functions v4 Isolated Worker, v2 programming model) + azure-functions, azure-servicebus, azure-data-tables, azure-identity, httpx, jsonschema (all already in requirements.txt)
 
-- 001-pvdaq-ingestion: Added Python 3.11+ (Azure Functions v4 Isolated Worker, v2 programming model) + azure-functions, azure-servicebus, azure-data-tables, azure-identity, httpx, jsonschema
 
 <!-- MANUAL ADDITIONS START -->
 ## Skills & Standards

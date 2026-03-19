@@ -28,7 +28,7 @@ def _historical_config() -> HistoricalConfig:
         file_tracking_table_name="PvdaqFileTracking",
         table_storage_uri="https://teststorage.table.core.windows.net",
         adls_account_url="https://testaccount.dfs.core.windows.net",
-        adls_container_name="raw",
+        adls_container_name="bronze",
         tenant_id="default",
         mapping_version_pvdaq="unknown",
         schema_version_pvdaq="v1",
@@ -161,6 +161,7 @@ def _default_work_item(site_id: int = 9068, file_name: str = "9068_ac_power_data
         "category": "ac_power",
         "correlation_id": "test-corr-id",
         "enqueued_at": "2024-01-15T12:00:00Z",
+        "last_modified": "2024-01-15T12:00:00Z",
     }
 
 
@@ -174,11 +175,13 @@ class TestWorkerIntegration:
         mock_msg = _mock_work_item_msg(work_item)
 
         mock_adls = AsyncMock()
-        mock_adls.stream_upload = AsyncMock(return_value=(65000000, "abc123hash"))
+        mock_adls.stream_upload = AsyncMock(return_value=(65000000, "abc123hash", 105121))
+        mock_adls.write_json = AsyncMock()
         mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
         mock_adls.__aexit__ = AsyncMock(return_value=False)
 
         mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
         mock_tracker.mark_processing = AsyncMock()
         mock_tracker.mark_completed = AsyncMock()
         mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
@@ -197,11 +200,13 @@ class TestWorkerIntegration:
 
             await historical_worker(mock_msg)
 
-        mock_tracker.mark_processing.assert_called_once_with(9068, work_item["s3_key"])
+        mock_tracker.mark_processing.assert_called_once_with(9068, work_item["s3_key"], 1)
         # stream_upload called with source_url and adls path
         mock_adls.stream_upload.assert_called_once()
         call_kwargs = mock_adls.stream_upload.call_args
         assert "source_url" in call_kwargs.kwargs or len(call_kwargs.args) >= 1
+        # metadata.json written alongside CSV
+        mock_adls.write_json.assert_called_once()
         # One dataset CloudEvent emitted
         emitter.emit_cloudevent.assert_called_once()
         # mark_completed called with metadata
@@ -214,11 +219,13 @@ class TestWorkerIntegration:
         mock_msg = _mock_work_item_msg(work_item)
 
         mock_adls = AsyncMock()
-        mock_adls.stream_upload = AsyncMock(return_value=(65000000, "abc123hash"))
+        mock_adls.stream_upload = AsyncMock(return_value=(65000000, "abc123hash", 105121))
+        mock_adls.write_json = AsyncMock()
         mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
         mock_adls.__aexit__ = AsyncMock(return_value=False)
 
         mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
         mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
         mock_tracker.__aexit__ = AsyncMock(return_value=False)
 
@@ -246,11 +253,13 @@ class TestWorkerIntegration:
         mock_msg = _mock_work_item_msg(work_item)
 
         mock_adls = AsyncMock()
-        mock_adls.stream_upload = AsyncMock(return_value=(65000000, "abc123hash"))
+        mock_adls.stream_upload = AsyncMock(return_value=(65000000, "abc123hash", 105121))
+        mock_adls.write_json = AsyncMock()
         mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
         mock_adls.__aexit__ = AsyncMock(return_value=False)
 
         mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
         mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
         mock_tracker.__aexit__ = AsyncMock(return_value=False)
 
@@ -294,6 +303,7 @@ class TestWorkerIntegration:
         mock_adls.__aexit__ = AsyncMock(return_value=False)
 
         mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
         mock_tracker.mark_processing = AsyncMock()
         mock_tracker.mark_failed = AsyncMock()
         mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
@@ -313,7 +323,7 @@ class TestWorkerIntegration:
             with pytest.raises(AdlsUploadError):
                 await historical_worker(mock_msg)
 
-        mock_tracker.mark_failed.assert_called_once_with(9068, work_item["s3_key"])
+        mock_tracker.mark_failed.assert_called_once_with(9068, work_item["s3_key"], 1)
         emitter.emit_dead_letter.assert_called_once()
         dead_letter_body = emitter.emit_dead_letter.call_args.kwargs["message_body"]
         assert dead_letter_body["file_reference"] == work_item["s3_key"]
@@ -322,26 +332,36 @@ class TestWorkerIntegration:
 
     @pytest.mark.asyncio
     async def test_worker_deterministic_adls_path(self) -> None:
-        """ADLS path follows pvdaq/site_id={id}/category={cat}/{file_name} pattern."""
+        """ADLS path follows bronze convention: source=pvdaq/dataset={d}/ingestion_date={date}/{d}_v{n}.csv."""
+        from datetime import datetime, timezone
+
         work_item = _default_work_item(site_id=9068, file_name="9068_ac_power_data.csv")
         mock_msg = _mock_work_item_msg(work_item)
 
         captured_paths: list[str] = []
 
-        async def capture_upload(source_url: str, file_path: str) -> tuple[int, str]:
+        async def capture_upload(source_url: str, file_path: str) -> tuple[int, str, int]:
             captured_paths.append(file_path)
-            return (1000, "deadbeef")
+            return (1000, "deadbeef" * 8, 500)
 
         mock_adls = AsyncMock()
         mock_adls.stream_upload = capture_upload
+        mock_adls.write_json = AsyncMock()
         mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
         mock_adls.__aexit__ = AsyncMock(return_value=False)
 
         mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])  # first ingestion → v1
         mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
         mock_tracker.__aexit__ = AsyncMock(return_value=False)
 
         emitter = _mock_emitter()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        expected_path = (
+            f"source=pvdaq/dataset=9068_ac_power"
+            f"/ingestion_date={today}"
+            f"/9068_ac_power_v1.csv"
+        )
 
         with (
             patch("function_app.load_historical_config", return_value=_historical_config()),
@@ -355,7 +375,67 @@ class TestWorkerIntegration:
             await historical_worker(mock_msg)
 
         assert len(captured_paths) == 1
-        assert captured_paths[0] == "pvdaq/site_id=9068/category=ac_power/9068_ac_power_data.csv"
+        assert captured_paths[0] == expected_path
+
+    @pytest.mark.asyncio
+    async def test_worker_writes_metadata_json(self) -> None:
+        """Worker writes a metadata.json sidecar conforming to contracts/metadata-file.json."""
+        from datetime import datetime, timezone
+
+        work_item = _default_work_item(site_id=9068, file_name="9068_ac_power_data.csv")
+        mock_msg = _mock_work_item_msg(work_item)
+
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(return_value=(65000000, "a" * 64, 105121))
+        captured_json_args: list[tuple] = []
+
+        async def capture_write_json(file_path: str, data: dict) -> None:
+            captured_json_args.append((file_path, data))
+
+        mock_adls.write_json = capture_write_json
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
+
+        mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        emitter = _mock_emitter()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        with (
+            patch("function_app.load_historical_config", return_value=_historical_config()),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)
+
+        assert len(captured_json_args) == 1
+        meta_path, meta = captured_json_args[0]
+        assert meta_path == (
+            f"source=pvdaq/dataset=9068_ac_power/ingestion_date={today}/metadata.json"
+        )
+        # Validate 7-block structure
+        assert meta["dataset"]["dataset_id"] == "9068_ac_power"
+        assert meta["dataset"]["version"] == 1
+        assert meta["dataset"]["schema_version"] == "unknown"
+        assert meta["source"]["source"] == "pvdaq"
+        assert meta["source"]["provider"] == "NREL"
+        assert meta["ingestion"]["pipeline"] == "energy-ingestion-boundary-v1"
+        assert meta["ingestion"]["trigger_type"] == "scheduled"
+        assert meta["ingestion"]["file_size_bytes"] == 65000000
+        assert meta["ingestion"]["checksum"] == "a" * 64
+        assert meta["ingestion"]["status"] == "success"
+        assert meta["ingestion"]["retry_count"] == 0
+        assert meta["event_time"]["expected_frequency_seconds"] == 300
+        assert meta["data_profile"]["row_count"] == 105121
+        assert meta["quality_hint"]["notes"] == []
+        assert meta["lineage"]["parent_dataset_version"] is None  # first ingestion
 
 
 class TestIncrementalDetection:

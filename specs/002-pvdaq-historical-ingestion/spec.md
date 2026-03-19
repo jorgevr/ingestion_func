@@ -2,7 +2,7 @@
 
 **Feature Branch**: `002-pvdaq-historical-ingestion`
 **Created**: 2026-03-02
-**Updated**: 2026-03-09
+**Updated**: 2026-03-18
 **Status**: Draft
 **Input**: User description: "Discover, download, and store historical photovoltaic CSV files from the OEDI Data Lake for 4 specific PVDAQ sites into ADLS Gen2, registering metadata and emitting a dataset-level CloudEvent per file."
 
@@ -17,10 +17,37 @@
 
 - Q: What is the event granularity? → A: **One CloudEvent per dataset (file)**, not per row. Row-level parsing, validation, schema normalization, and per-row emission move to a downstream processing layer (feature 003+). This feature is now **dataset ingestion only**: discover → download → store → register → emit dataset event.
 - Q: How should idempotency work? → A: Per-file idempotency keyed on `site_id + category + file_name`. Much simpler and cheaper than per-row tracking.
-- Q: Where are files stored? → A: Azure Data Lake Storage Gen2 raw container using a deterministic path: `/raw/pvdaq/site_id={site_id}/category={category}/{file_name}.csv`.
+- Q: Where are files stored? → A: Azure Data Lake Storage Gen2 raw container (or Azurite Blob locally) using a deterministic path: `raw/pvdaq/site_id={site_id}/year={year}/month={month}/{file_name}.csv`.
 - Q: Where is dataset metadata stored? → A: Extend the existing `PvdaqFileTracking` Azure Table with new columns (storage_path, file_hash, ingestion_id) rather than creating a separate store. Keeps file tracking and metadata in one table.
-- Q: Does feature 001 continue with per-row processing? → A: Feature 001 will also migrate to dataset-level ingestion in a future phase. For now, feature 001 continues as-is; this spec (002) establishes the dataset-level pattern that 001 will adopt later.
+- Q: Does feature 001 continue with per-row processing? → A: Feature 001 has also migrated to the dataset-level pattern (spec updated 2026-03-18). Both 001 and 002 now share the same bronze storage pattern.
 - Q: What hash algorithm for file_hash? → A: SHA-256 — consistent with the existing `IdempotencyStore._row_key()` which already uses SHA-256, and provides strong integrity guarantees for large files.
+
+### Session 2026-03-19
+
+- Q: What is the default maximum retry count for S3 HTTP retries (FR-009)? → A: 3 retries.
+- Q: What timezone is used when deriving `year` and `month` from the S3 LastModified date for the ADLS path? → A: UTC.
+- Q: Should the worker function have an application-level concurrency cap on parallel downloads? → A: No application-level cap; rely on host-level `maxConcurrentCalls` in `host.json`. Per-file idempotency store prevents duplicate work if races occur.
+- Q: Which signal determines that an existing file has changed and should be re-ingested? → A: S3 `LastModified` timestamp only, compared against the stored `ingestion_time` in the tracking table.
+- Q: Should S3 prefix listing be paginated? → A: Yes — paginate using `NextContinuationToken` until `IsTruncated` is false, to handle sites with >1000 files.
+
+### Session 2026-03-19 (continued)
+
+- Q: What is the ADLS container name — `bronze` (spec) or `raw` (`local.settings.json` + tests)? → A: Container `bronze`; path within the container must follow the bronze layer folder convention (see Session 2026-03-19 bronze conventions below). `local.settings.json` and integration tests must use `ADLS_CONTAINER_NAME=bronze`.
+- Q: For incremental file detection, which comparison determines re-ingestion: current S3 `LastModified` vs stored S3 `LastModified`, or vs stored `ingestion_time`? → A: Compare current S3 `LastModified` against the stored S3 `LastModified` in the tracking entity. This matches the implementation and avoids clock-skew issues between S3 and Azure.
+
+### Session 2026-03-19 — Bronze Layer Conventions
+
+- Q: What folder structure must the bronze container follow? → A: `source=pvdaq/dataset={site_id}_{category}/ingestion_date=YYYY-MM-DD/{dataset}_v{version}.csv` plus a `metadata.json` alongside each CSV. No `raw/` prefix — the container itself is the bronze layer. `ingestion_date` is the UTC date of ingestion, not the S3 LastModified date.
+- Q: How should files be named? → A: `{dataset}_v{version}.csv` where `{dataset}` is `{site_id}_{category}` (e.g. `9068_ac_power`) and `{version}` is an incrementing integer starting at 1. Example: `9068_ac_power_v1.csv`.
+- Q: Should each ingestion create a new file version rather than overwrite? → A: Yes — append-only. Every ingestion of the same logical dataset creates a new version (v1, v2, …). Previous versions are never overwritten or deleted. Re-ingestion triggered by a changed S3 `LastModified` creates the next version.
+- Q: What metadata must be written alongside each CSV? → A: A `metadata.json` file at the same path prefix, containing: `dataset_id`, `source`, `version`, `ingestion_time`, `checksum` (SHA-256), `status: "raw"`. `row_count` is computed by counting newline characters during streaming (no semantic CSV parsing). `event_time_start` and `event_time_end` are set to `null` at the bronze layer — they are computed by the silver layer which knows the schema.
+- Q: How is the version number determined? → A: Query the `PvdaqFileTracking` table for the highest `Version` value stored for the given `(site_id, category)` combination. The next version is `max_version + 1`; first ingestion is version 1.
+
+### Session 2026-03-18 — Local Emulation
+
+- Q: How should ADLS Gen2 be emulated locally? → A: Azurite Blob Storage (port 10000) using the same `azure-storage-blob` SDK code path. Container `bronze`, same path structure. Switched via `STORAGE_EMULATOR=true`.
+- Q: How should Service Bus be emulated locally? → A: Azurite Queue (port 10001) using `azure-storage-queue`. Same CloudEvents envelope, different transport. Switched via same `STORAGE_EMULATOR=true` flag.
+- Q: Storage path — does it include category? → A: Path follows the constitution's partition convention: `raw/pvdaq/site_id={site_id}/year={year}/month={month}/{file_name}.csv`. Category is encoded in the filename (`{site_id}_{category}_data.csv`) and in the metadata record, not as a separate path segment.
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -37,7 +64,7 @@ As a data engineer, I want to download all historical CSV telemetry files for 4 
 1. **Given** the system is configured with 4 site IDs (9068, 9069, 2107, 7333), **When** the ingestion function is triggered, **Then** the system discovers all CSV files in each site's `data/` folder on the OEDI S3 bucket.
 2. **Given** a site has multiple CSV categories (ac_power, environment, irradiance, tracker, etc.), **When** the system processes that site, **Then** all category CSV files are downloaded and stored in ADLS.
 3. **Given** a CSV file is very large (hundreds of megabytes), **When** the system downloads it, **Then** the download uses streaming/chunked reads so that memory usage remains bounded.
-4. **Given** a CSV file is downloaded successfully, **When** the worker stores it, **Then** the file is written to ADLS at the path `/raw/pvdaq/site_id={site_id}/category={category}/{file_name}.csv`.
+4. **Given** a CSV file is downloaded successfully, **When** the worker stores it, **Then** the file is written to the bronze container at the path `source=pvdaq/dataset={site_id}_{category}/ingestion_date=YYYY-MM-DD/{site_id}_{category}_v{version}.csv` alongside a `metadata.json` (ADLS Gen2 in prod, Azurite Blob locally). Each ingestion creates a new version; existing files are never overwritten.
 5. **Given** the S3 bucket is temporarily unavailable or returns a server error, **When** the system encounters the error, **Then** it retries with exponential backoff before failing that file.
 
 ---
@@ -52,8 +79,8 @@ As a data engineer, I want metadata registered for each ingested dataset so that
 
 **Acceptance Scenarios**:
 
-1. **Given** a CSV file has been stored in ADLS, **When** metadata is registered, **Then** the metadata entry includes: site_id, category, source_url, storage_path, file_size, ingestion_time, and file_hash.
-2. **Given** a dataset is re-ingested (same file, updated content), **When** metadata is registered, **Then** the existing entry is updated with the new ingestion_time and file_hash.
+1. **Given** a CSV file has been stored in ADLS, **When** metadata is registered, **Then** the `PvdaqFileTracking` table entry includes: site_id, category, source_url, storage_path, file_size, ingestion_time, file_hash, and version. Additionally, a `metadata.json` file is written alongside the CSV containing: dataset_id, source, version, ingestion_time, row_count, checksum, and status ("raw").
+2. **Given** a dataset is re-ingested (S3 `LastModified` changed), **When** metadata is registered, **Then** a NEW version is created — a new tracking entity with incremented version and a new `metadata.json`. The previous CSV and its `metadata.json` remain untouched (append-only).
 
 ---
 
@@ -67,8 +94,9 @@ As a data engineer, I want a dataset-level CloudEvent emitted for each successfu
 
 **Acceptance Scenarios**:
 
-1. **Given** a CSV file has been stored in ADLS and metadata registered, **When** the worker completes, **Then** a CloudEvent of type `solar.pvdaq.dataset.available` is emitted containing site_id, category, file_format, storage_path, and ingestion_id.
+1. **Given** a CSV file has been stored and metadata registered, **When** the worker completes, **Then** a CloudEvent of type `solar.pvdaq.dataset.available` is emitted containing site_id, category, file_format, storage_path, and ingestion_id.
 2. **Given** the message bus is temporarily unavailable, **When** event emission fails, **Then** the system retries before marking the dataset as failed.
+3. **Given** `STORAGE_EMULATOR=true`, **When** the event is emitted, **Then** it is sent to an Azurite Queue (port 10001) instead of Service Bus, using the same CloudEvents envelope.
 
 ---
 
@@ -84,7 +112,7 @@ As a data engineer, I want the system to detect new or updated CSV files on subs
 
 1. **Given** the system has previously ingested all CSV files for a site, **When** a new incremental CSV file appears in the site's data folder, **Then** the system downloads and processes only the new file.
 2. **Given** no new files have appeared since the last run, **When** the timer triggers, **Then** no CSV downloads occur and the run completes quickly.
-3. **Given** an existing file has changed (different size or last-modified), **When** the dispatcher detects it, **Then** the file is re-queued for download and re-stored in ADLS.
+3. **Given** an existing file has a different S3 `LastModified` timestamp than the `LastModified` stored in the file tracking entity (i.e., the file changed on S3 since it was last queued), **When** the dispatcher detects it, **Then** the file is re-queued for download and re-stored in ADLS.
 
 ---
 
@@ -117,20 +145,23 @@ As an operations engineer, I want structured logs and summary metrics emitted af
 ### Functional Requirements
 
 - **FR-001**: System MUST support a fixed, configured list of 4 PVDAQ site IDs: 9068, 9069, 2107, 7333.
-- **FR-002**: System MUST discover all CSV files in each site's OEDI S3 data folder by listing the contents of `pvdaq/2023-solar-data-prize/{site_id}_OEDI/data/`.
+- **FR-002**: System MUST discover all CSV files in each site's OEDI S3 data folder by listing the contents of `pvdaq/2023-solar-data-prize/{site_id}_OEDI/data/`, paginating through all S3 listing pages using `NextContinuationToken` until `IsTruncated` is false.
 - **FR-003**: System MUST download each CSV file using streaming/chunked reads to keep memory usage bounded regardless of file size.
-- **FR-004**: System MUST store each downloaded CSV file in Azure Data Lake Storage Gen2 raw container using a deterministic path pattern: `/raw/pvdaq/site_id={site_id}/category={category}/{file_name}.csv`.
-- **FR-005**: System MUST register metadata for each ingested dataset by extending the `PvdaqFileTracking` table entity with: source_url, storage_path, file_size, ingestion_time, file_hash (SHA-256), and ingestion_id.
-- **FR-006**: System MUST emit a dataset-level CloudEvent of type `solar.pvdaq.dataset.available` indicating that a new dataset is available. The event data block includes: site_id, category, file_format, storage_path, ingestion_id, source_url, file_size, and file_hash (per `contracts/dataset-event.json`).
+- **FR-004**: System MUST store each downloaded CSV file in the bronze container (`bronze`) at the deterministic path `source=pvdaq/dataset={site_id}_{category}/ingestion_date={YYYY-MM-DD}/{site_id}_{category}_v{version}.csv`. `ingestion_date` is the UTC calendar date at the moment of ingestion (not the S3 LastModified date). `version` is an incrementing integer starting at 1. Each ingestion of the same logical dataset creates a new version file; existing files are never overwritten or deleted (append-only). In production the container is an ADLS Gen2 filesystem named `bronze`; in local development (`STORAGE_EMULATOR=true`) the target is Azurite Blob Storage container `bronze` (port 10000), configured via `ADLS_CONTAINER_NAME=bronze`.
+- **FR-005**: System MUST register metadata for each ingested dataset by extending the `PvdaqFileTracking` table entity with: source_url, storage_path, file_size, ingestion_time, file_hash (SHA-256), ingestion_id, and version (integer).
+- **FR-006**: System MUST emit a dataset-level CloudEvent of type `solar.pvdaq.dataset.available` indicating that a new dataset is available. The event data block includes: site_id, category, file_format, storage_path, ingestion_id, source_url, file_size, and file_hash (per `contracts/dataset-event.json`). In local development (`STORAGE_EMULATOR=true`), the event MUST be sent to an Azurite Queue instead of Service Bus.
 - **FR-007**: System MUST dead-letter dataset-level failures (download failed, file corrupt, storage write failed) to a dead-letter queue with the file reference, failure reason, and correlation ID.
 - **FR-008**: System MUST check each file against a file tracking store before processing and skip files that have already been successfully ingested. The idempotency key is composed of `site_id + category + file_name`.
-- **FR-009**: System MUST retry failed HTTP requests to S3 (5xx errors and timeouts) with exponential backoff, up to a configurable maximum number of retries.
+- **FR-009**: System MUST retry failed HTTP requests to S3 (5xx errors and timeouts) with exponential backoff, up to a configurable maximum number of retries (default: 3).
 - **FR-010**: System MUST continue processing remaining sites if one site's data fetch fails, logging the error with the site ID and correlation ID.
 - **FR-011**: System MUST emit structured summary metrics after each invocation: datasets_discovered, datasets_downloaded, datasets_stored, datasets_emitted, datasets_failed, and processing duration.
-- **FR-012**: System MUST support incremental file detection — on subsequent runs, only CSV files not previously processed (or changed) should be downloaded.
+- **FR-012**: System MUST support incremental file detection — on subsequent runs, only CSV files not previously processed (or whose current S3 `LastModified` timestamp differs from the `LastModified` stored in the file tracking entity at queue time) should be downloaded.
 - **FR-013**: System MUST be triggerable on a configurable timer schedule via a dispatcher function that lists unprocessed files and enqueues one work item per file.
 - **FR-014**: System MUST handle CSV files with varying naming conventions across different measurement categories without requiring per-category configuration.
 - **FR-015**: System MUST use a fan-out pattern: a timer-triggered dispatcher function discovers CSV files and enqueues work items; a queue-triggered worker function downloads, stores, registers metadata, and emits a dataset event per file. This ensures each file is processed within function timeout limits regardless of file size.
+- **FR-016**: System MUST write a `metadata.json` file alongside each stored CSV at `source=pvdaq/dataset={dataset}/ingestion_date={date}/metadata.json`. The file MUST conform to `contracts/metadata-file.json` and be structured in 7 blocks: `dataset` (identity — dataset_id, version, schema_version, tags), `source` (origin — endpoint, provider, region), `ingestion` (HOW — ingestion_id, batch_id, pipeline, trigger_type, retry_count, checksum, latency, status), `event_time` (WHAT time — null range fields at bronze, `expected_frequency_seconds=300` for PVDAQ), `data_profile` (signals — only `row_count` populated at bronze via newline count; all other fields null), `quality_hint` (all null at bronze), `lineage` (version ancestry). Fields requiring CSV column parsing MUST be null at bronze and populated by the silver layer.
+- **FR-017**: System MUST implement versioning: each ingestion of the same logical dataset (`site_id + category`) increments the version counter. Version 1 is the first ingestion. The version is determined by querying `PvdaqFileTracking` for the current maximum version of the dataset before writing. Previous versions MUST NOT be overwritten or deleted.
+- **FR-018**: Storage MUST be append-only. The system MUST NOT update, overwrite, or delete previously stored CSV files or their `metadata.json`. Re-ingestion of a changed file creates a new version rather than replacing the existing file.
 
 ### Key Entities
 
@@ -150,22 +181,62 @@ As an operations engineer, I want structured logs and summary metrics emitted af
 
 ## Storage Layout
 
-ADLS Gen2 raw container — medallion architecture raw layer:
+Container name: **`bronze`** (both production ADLS Gen2 and local Azurite). Configured via `ADLS_CONTAINER_NAME=bronze`. The container IS the bronze layer — no additional `raw/` prefix.
+
+**Naming conventions**:
+
+- `source`: lowercase (e.g. `pvdaq`)
+- `dataset`: `{site_id}_{category}` in snake_case (e.g. `9068_ac_power`)
+- `ingestion_date`: UTC calendar date of ingestion in `YYYY-MM-DD` format
+- file: `{dataset}_v{version}.csv` where version is an incrementing integer (e.g. `9068_ac_power_v1.csv`)
 
 ```text
-adls://{storage-account}/raw/pvdaq/
-  site_id=9068/
-    category=ac_power/
-      9068_ac_power_data.csv
-    category=irradiance/
-      9068_irradiance_data.csv
-    category=environment/
-      9068_environment_data.csv
-  site_id=9069/
-    category=ac_power/
-      9069_ac_power_data.csv
+bronze container root/
+  source=pvdaq/
+    dataset=9068_ac_power/
+      ingestion_date=2024-01-15/
+        9068_ac_power_v1.csv          ← first ingestion
+        metadata.json                  ← written alongside CSV
+      ingestion_date=2024-02-03/
+        9068_ac_power_v2.csv          ← re-ingestion (S3 file changed)
+        metadata.json
+    dataset=9068_environment/
+      ingestion_date=2024-01-15/
+        9068_environment_v1.csv
+        metadata.json
+    dataset=9069_ac_power/
+      ingestion_date=2024-01-15/
+        9069_ac_power_v1.csv
+        metadata.json
     ...
 ```
+
+**metadata.json** (written alongside each CSV, full schema in `contracts/metadata-file.json`):
+
+Structured in 7 blocks. Bronze populates fields it can compute without opening the CSV; the silver layer fills in the rest.
+
+```json
+{
+  "dataset":    { "dataset_id": "9068_ac_power", "dataset_type": "time_series", "version": 1, "schema_version": "unknown", "tags": ["pvdaq","solar"] },
+  "source":     { "source": "pvdaq", "source_type": "s3_public", "endpoint": "pvdaq/2023-solar-data-prize/9068_OEDI/data/", "provider": "NREL", "region": "us-east-1" },
+  "ingestion":  { "ingestion_time": "2024-01-15T08:32:00Z", "ingestion_id": "uuid...", "batch_id": "correlation-id...", "pipeline": "energy-ingestion-boundary-v1", "trigger_type": "scheduled", "retry_count": 0, "source_file_name": "9068_ac_power_data.csv", "file_size_bytes": 65000000, "checksum": "a3f1...64hex", "ingestion_latency_seconds": 47.3, "status": "success" },
+  "event_time": { "event_time_start": null, "event_time_end": null, "expected_frequency_seconds": 300, "expected_records": null },
+  "data_profile": { "row_count": 105121, "null_percentage": null, "duplicate_rows": null, "min_timestamp": null, "max_timestamp": null, "schema_detected": null, "corrupted_rows": null },
+  "quality_hint": { "basic_quality_score": null, "schema_valid": null, "time_continuity_suspected_gap": null, "notes": [] },
+  "lineage":    { "parent_dataset_version": null, "rerun_of": null, "related_incident_id": null }
+}
+```
+
+Fields null at bronze (`event_time_start/end`, `data_profile.*` except `row_count`, all `quality_hint.*` except `notes`) require CSV column parsing — intentionally deferred to the silver layer. `row_count` is the newline character count during streaming (no CSV interpretation). `expected_frequency_seconds` is the PVDAQ domain constant (300 s = 5-minute intervals).
+
+## Local vs Production Behaviour
+
+| Concern        | Local (`STORAGE_EMULATOR=true`)      | Production                                |
+| -------------- | ------------------------------------ | ----------------------------------------- |
+| Bronze storage | Azurite Blob port 10000 (`bronze`)   | ADLS Gen2 raw container                   |
+| Event emission | Azurite Queue port 10001             | Service Bus topic                         |
+| Table storage  | Azurite Table port 10002             | Azure Table Storage                       |
+| Auth           | Connection string (devstoreaccount1) | DefaultAzureCredential (managed identity) |
 
 ## Success Criteria *(mandatory)*
 
@@ -184,16 +255,17 @@ adls://{storage-account}/raw/pvdaq/
 
 - The OEDI S3 bucket (`oedi-data-lake`) remains publicly accessible over HTTPS without authentication.
 - CSV file encoding is UTF-8.
-- The S3 bucket supports XML-based listing responses for enumerating objects within a prefix.
+- The S3 bucket supports XML-based listing responses for enumerating objects within a prefix, including paginated responses via `NextContinuationToken`.
 - The 4 target sites are stable and their data folders follow the convention `pvdaq/2023-solar-data-prize/{site_id}_OEDI/data/`.
 - Different measurement categories (ac_power, environment, irradiance, etc.) have varying column sets, but this feature does not parse or validate CSV content — it stores files as-is.
 - The timer schedule is configurable via environment variables and defaults to `0 0 */6 * * *` (every 6 hours).
+- Worker function concurrency is controlled exclusively by `maxConcurrentCalls` in `host.json` (Azure Functions host-level setting); no application-level semaphore is used. Per-file idempotency prevents duplicate work if concurrent workers race on the same file.
 - The `tenant_id` field in emitted CloudEvents defaults to `"default"` (single-tenant deployment for PVDAQ).
 - Dead-letter queue and message bus topic are pre-provisioned infrastructure — the system does not create them.
 - ADLS Gen2 storage account with hierarchical namespace enabled is pre-provisioned.
 - This feature is implemented as a new, separate function within the same function app as feature 001. It reuses shared modules (Service Bus emitter, config patterns, observability) but has its own trigger, entry point, and OEDI client tailored to the 2023-solar-data-prize path structure.
 - **Row-level processing is out of scope**: CSV parsing, row validation, per-row CloudEvent emission, schema normalization, per-row dead-lettering, and per-row idempotency are responsibilities of a downstream processing layer (feature 003+).
-- **Feature 001 future migration**: Feature 001 (daily PVDAQ polling) continues with per-row processing for now but will migrate to the dataset-level pattern established by this feature in a future phase.
+- **Feature 001 migration complete**: Feature 001 (daily PVDAQ polling) has migrated to the same dataset-level pattern as this feature (spec updated 2026-03-18). Both features share the same bronze storage path convention and `solar.pvdaq.dataset.available` event type.
 
 ## Target Sites
 

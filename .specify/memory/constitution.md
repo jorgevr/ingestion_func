@@ -1,25 +1,22 @@
 <!--
   Sync Impact Report
   ==================
-  Version change: 1.1.0 → 1.2.0
+  Version change: 1.2.0 → 1.3.0
   Modified principles:
-    - II (Schema Validation at Boundary): added schema artifact publishing
-      and discovery guidance, schema naming convention
-    - III (Metadata Enrichment): clarified mapping_version source mechanism
-      (env var / Key Vault, "unknown" sentinel fallback)
-    - VI (Idempotency): reframed as effective exactly-once via dedup;
-      specified atomic check-and-emit requirement with write-before-emit
-      fallback
-    - VII (Event Emission Rules): added event-type naming convention
-      (raw.{vendor}.{data_category}.v{major}) and topics.md manifest;
-      expanded in 1.2.0 to add domain-level lifecycle event convention
-      ({domain}.{vendor}.{entity}.{action}) for dataset/notification events
+    - VII (Event Emission Rules): clarified that dataset-level
+      ({domain}.{vendor}.{entity}.{action}) is the canonical pattern for
+      all ingestion paths; per-row emission is explicitly downstream
   Added sections / clauses:
-    - Development Workflow: concurrency/scaling limits requirement
-      (host.json tuning per vendor)
-    - Development Workflow: emission contract test definition (CloudEvents
-      envelope, extension attributes, topic naming, dead-letter routing)
-    - Governance: MAJOR amendment quorum (second reviewer required)
+    - Principle VIII (Raw Dataset Storage — Bronze Layer): mandates ADLS
+      Gen2 (or Azurite Blob locally) as the raw storage tier; defines
+      deterministic path convention, streaming write requirement, and
+      file-hash integrity requirement
+    - Development Workflow: Local Emulation Contract — Azurite Blob must
+      stand in for ADLS Gen2, Azurite Queue must stand in for Service Bus
+      in local development; same SDK code path, different endpoints
+    - Ownership Boundaries: added ADLS bronze writes and blob client
+      management to "This Service Owns"; added row-level parsing and
+      downstream event routing to "This Service Does NOT Own"
   Removed sections: None
   Templates requiring updates:
     - .specify/templates/plan-template.md — ✅ no update needed
@@ -34,9 +31,11 @@
 
 The hardened entry point between the outside world and the event
 backbone. This service owns the Azure Functions (Python) that ingest
-data from PVDAQ, PVOutput, and future vendor webhooks, validate it,
-enrich it with metadata, and emit raw events to Event Grid / Service
-Bus.
+data from PVDAQ, PVOutput, and future vendor webhooks, download and
+store raw datasets to the ADLS Gen2 bronze layer, register dataset
+metadata, and emit dataset-level CloudEvents to Event Grid / Service
+Bus. Row-level parsing, validation, and transformation are the
+responsibility of downstream processing layers.
 
 ## Core Principles
 
@@ -177,23 +176,24 @@ with dead-letter recovery provides the best practical guarantee.
 
 ### VII. Event Emission Rules
 
-All raw events MUST be emitted to Event Grid or Service Bus as
-immutable, self-describing messages.
+All events emitted by this service MUST target Event Grid or Service
+Bus (production) or Azurite Queue (local development) as immutable,
+self-describing messages.
 
 - Emitted events MUST use a CloudEvents-compatible envelope with
   `type`, `source`, `id`, `time`, and `datacontenttype` fields.
-- The `data` payload MUST contain the original vendor data unmodified;
-  enrichment metadata MUST reside in CloudEvents extension attributes
-  or a dedicated metadata block.
+- The `data` payload MUST describe the ingested dataset (storage path,
+  file hash, site ID, etc.); enrichment metadata MUST reside in
+  CloudEvents extension attributes or a dedicated metadata block.
 - Emission MUST target a single, well-known topic or queue per event
   type; routing logic MUST NOT be embedded in the Function beyond
-  topic selection. Event types MUST follow one of these naming
-  conventions: (a) `raw.{vendor}.{data_category}.v{major}` for
-  per-record raw data events (e.g., `raw.pvdaq.generation.v1`), or
-  (b) `{domain}.{vendor}.{entity}.{action}` for domain-level
-  lifecycle events (e.g., `solar.pvdaq.dataset.available`). A new
-  event type MUST be registered in a `topics.md` manifest before
-  first use.
+  topic selection. The canonical event type for this service is the
+  domain-level dataset lifecycle convention:
+  `{domain}.{vendor}.{entity}.{action}` (e.g.,
+  `solar.pvdaq.dataset.available`). Per-row raw data event types
+  (`raw.{vendor}.{data_category}.v{major}`) are reserved for future
+  downstream layers, not this boundary service. A new event type MUST
+  be registered in a `topics.md` manifest before first use.
 - Failed emissions MUST be retried with exponential backoff; after
   exhausting retries, the event MUST be routed to a dead-letter
   destination and an alert MUST fire.
@@ -201,8 +201,31 @@ immutable, self-describing messages.
   request the boundary to mutate or delete a previously emitted event.
 
 **Rationale:** The event backbone depends on a predictable, immutable
-stream of raw events — the boundary's contract is to emit clean,
-self-describing messages and never silently drop data.
+stream of dataset-level signals — the boundary's role is to store raw
+files and announce their availability, not to parse or transform rows.
+
+### VIII. Raw Dataset Storage — Bronze Layer
+
+All downloaded vendor data MUST be persisted to the ADLS Gen2 raw
+container (bronze layer) before any event is emitted.
+
+- Files MUST be written using streaming/chunked uploads so that memory
+  usage remains bounded regardless of file size.
+- Files MUST be stored at a deterministic, partition-friendly path:
+  `raw/{vendor}/site_id={site_id}/year={year}/month={month}/{file_name}`
+  (e.g., `raw/pvdaq/site_id=9068/year=2024/month=01/9068_ac_power_data.csv`).
+- A SHA-256 file hash MUST be computed during streaming upload and
+  stored in dataset metadata for downstream integrity verification.
+- Event emission MUST NOT occur until the file write has been confirmed
+  by the storage layer (write-before-emit).
+- In local development, Azurite Blob Storage MUST be used in place of
+  ADLS Gen2. The same Azure Blob Storage SDK code path MUST be used
+  for both environments — the only difference is the endpoint and
+  credentials (see Local Emulation Contract in Development Workflow).
+
+**Rationale:** Storing raw files in a durable bronze layer decouples
+ingestion latency from downstream processing capacity and provides a
+replay source if downstream failures occur.
 
 ## Ownership Boundaries
 
@@ -210,15 +233,19 @@ self-describing messages and never silently drop data.
 
 - Azure Functions (Python) for all vendor integrations
 - Webhook receivers and vendor polling schedules
-- Schema definitions and validation logic
-- Metadata enrichment and mapping version tagging
-- Emission to Event Grid / Service Bus
+- Streaming download of raw vendor files
+- ADLS Gen2 bronze writes (streaming upload, path management, blob client)
+- Dataset metadata registration (file tracking store)
+- File-level idempotency — skip files already successfully ingested
+- Dataset-level CloudEvent emission (`solar.pvdaq.dataset.available`)
+- Emission to Event Grid / Service Bus (prod) or Azurite Queue (local)
 - Observability at the ingestion boundary
-- Idempotency store and deduplication logic
 
 ### This Service Does NOT Own
 
-- Canonical data model or unit normalization
+- Row-level CSV parsing, schema validation, or normalization
+- Per-row event emission or per-row dead-lettering
+- Canonical data model or unit conversion
 - Mapping execution (vendor-to-canonical transformation)
 - AI/ML inference logic
 - Databricks pipelines or downstream processing
@@ -244,8 +271,33 @@ self-describing messages and never silently drop data.
   triggers) MUST be tuned per vendor to respect upstream rate limits
   and avoid self-inflicted throttling. Default values MUST NOT be used
   without explicit justification in the PR description.
-- Every PR MUST demonstrate that the 7 Core Principles are upheld; the
+- Every PR MUST demonstrate that the 8 Core Principles are upheld; the
   plan's Constitution Check gate enforces this.
+
+### Local Emulation Contract
+
+All local development MUST emulate Azure cloud services using Azurite
+so that no real Azure resources are required to run or test the service
+locally. The contract is:
+
+| Production service      | Local emulator                    | SDK used               |
+| ----------------------- | --------------------------------- | ---------------------- |
+| ADLS Gen2 (bronze)      | Azurite Blob (port 10000)         | `azure-storage-blob`   |
+| Service Bus topic/queue | Azurite Queue (port 10001)        | `azure-storage-queue`  |
+| Azure Table Storage     | Azurite Table (port 10002)        | `azure-data-tables`    |
+
+- Code MUST use the same Azure SDK interfaces for both environments.
+  Environment selection MUST be controlled by a single environment
+  variable (`STORAGE_EMULATOR=true` or presence of a connection string
+  pointing to Azurite).
+- Azurite endpoints MUST be set via the well-known
+  `AzureWebJobsStorage` connection string (Azurite devstoreaccount1).
+- Blob container names, queue names, and table names MUST be identical
+  in both environments. The only difference is the storage endpoint
+  and credential resolver.
+- Integration tests MUST run against the Azurite emulator (no real
+  Azure resources) and MUST be deterministic and repeatable without
+  network access.
 
 ## Governance
 
@@ -265,4 +317,4 @@ energy-ingestion-boundary repository. Amendments require:
 All pull requests and code reviews MUST verify compliance with these
 principles. Violations MUST be resolved before merge.
 
-**Version**: 1.2.0 | **Ratified**: 2026-02-19 | **Last Amended**: 2026-03-09
+**Version**: 1.3.0 | **Ratified**: 2026-02-19 | **Last Amended**: 2026-03-18

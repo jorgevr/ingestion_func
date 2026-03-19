@@ -1,0 +1,35 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+.pytest_cache/
+.coverage
+*.egg-info/
+dist/
+
+# Azure Functions local dev files — never ship to container
+local.settings.json
+.python_packages/
+
+# Azurite local data
+.azurite/
+__azurite_db_*.json
+
+# Dev tooling
+.git/
+.gitignore
+.vscode/
+.claude/
+.specify/
+.ruff_cache/
+src/.ruff_cache/
+
+# Tests
+tests/
+specs/

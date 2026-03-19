@@ -1,0 +1,279 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "metadata-file.json",
+  "title": "Bronze Layer Metadata File",
+  "description": "Schema for metadata.json written alongside each ingested CSV in the bronze ADLS container at source=pvdaq/dataset={dataset}/ingestion_date={date}/metadata.json. Fields that require CSV column parsing are null at bronze and populated by the silver layer.",
+  "type": "object",
+  "required": ["dataset", "source", "ingestion", "event_time", "data_profile", "quality_hint", "lineage"],
+  "additionalProperties": false,
+
+  "properties": {
+
+    "dataset": {
+      "type": "object",
+      "description": "Dataset identity — the primary key across Bronze, Silver, and Gold layers.",
+      "required": ["dataset_id", "dataset_type", "version", "schema_version", "tags"],
+      "additionalProperties": false,
+      "properties": {
+        "dataset_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Logical dataset identifier: {site_id}_{category} (e.g. '9068_ac_power'). Stable across versions."
+        },
+        "dataset_type": {
+          "type": "string",
+          "const": "time_series",
+          "description": "Always 'time_series' for PVDAQ photovoltaic telemetry."
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Ingestion version. Starts at 1 and increments on each re-ingestion triggered by a changed S3 LastModified."
+        },
+        "schema_version": {
+          "type": "string",
+          "const": "unknown",
+          "description": "Schema version is 'unknown' at bronze — no schema is applied to the raw CSV."
+        },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Classification tags for discovery and filtering. Example: ['pvdaq', 'solar']."
+        }
+      }
+    },
+
+    "source": {
+      "type": "object",
+      "description": "Origin of the dataset — WHERE it came from. Enables per-provider debugging and outage correlation.",
+      "required": ["source", "source_type", "endpoint", "provider", "region"],
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "const": "pvdaq",
+          "description": "Lowercase source system identifier."
+        },
+        "source_type": {
+          "type": "string",
+          "const": "s3_public",
+          "description": "How data is accessed. 's3_public' = unauthenticated public S3 bucket (OEDI)."
+        },
+        "endpoint": {
+          "type": "string",
+          "minLength": 1,
+          "description": "S3 prefix of the source file (e.g. 'pvdaq/2023-solar-data-prize/9068_OEDI/data/')."
+        },
+        "provider": {
+          "type": "string",
+          "const": "NREL",
+          "description": "Organisation that publishes the data. OEDI is operated by NREL."
+        },
+        "region": {
+          "type": "string",
+          "const": "us-east-1",
+          "description": "AWS region hosting the oedi-data-lake S3 bucket."
+        }
+      }
+    },
+
+    "ingestion": {
+      "type": "object",
+      "description": "HOW the file arrived — enables deduplication, idempotency, rerun tracking, and latency anomaly detection.",
+      "required": [
+        "ingestion_time",
+        "ingestion_id",
+        "batch_id",
+        "pipeline",
+        "trigger_type",
+        "retry_count",
+        "source_file_name",
+        "file_size_bytes",
+        "checksum",
+        "ingestion_latency_seconds",
+        "status"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "ingestion_time": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO-8601 UTC timestamp when the file finished writing to ADLS."
+        },
+        "ingestion_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "UUID identifying this specific ingestion run. Shared with the CloudEvent correlation_id."
+        },
+        "batch_id": {
+          "type": "string",
+          "description": "Correlation ID of the dispatcher run that enqueued this file. Groups all files ingested together."
+        },
+        "pipeline": {
+          "type": "string",
+          "const": "energy-ingestion-boundary-v1",
+          "description": "Name and version of the ingestion pipeline that wrote this file."
+        },
+        "trigger_type": {
+          "type": "string",
+          "enum": ["scheduled", "rerun"],
+          "description": "'scheduled' for normal timer-triggered runs; 'rerun' when re-ingesting a file whose S3 LastModified changed (version > 1)."
+        },
+        "retry_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of S3 HTTP retries performed before success. 0 = first attempt succeeded."
+        },
+        "source_file_name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Original S3 basename of the downloaded file (e.g. '9068_ac_power_data.csv')."
+        },
+        "file_size_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "File size in bytes as reported by the S3 listing."
+        },
+        "checksum": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 hex digest of the file content computed incrementally during streaming upload (64 lowercase hex chars)."
+        },
+        "ingestion_latency_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Wall-clock seconds from stream download start to ADLS flush completion."
+        },
+        "status": {
+          "type": "string",
+          "const": "success",
+          "description": "Always 'success' — metadata.json is only written on successful ingestion."
+        }
+      }
+    },
+
+    "event_time": {
+      "type": "object",
+      "description": "WHAT time window the data represents. Critical for gap detection. Range fields are null at bronze (require CSV column parsing) and populated by the silver layer.",
+      "required": ["event_time_start", "event_time_end", "expected_frequency_seconds", "expected_records"],
+      "additionalProperties": false,
+      "properties": {
+        "event_time_start": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "Earliest event timestamp in the dataset. null at bronze — populated by silver layer with timestamp column knowledge."
+        },
+        "event_time_end": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "Latest event timestamp in the dataset. null at bronze — populated by silver layer with timestamp column knowledge."
+        },
+        "expected_frequency_seconds": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Expected measurement interval in seconds. For PVDAQ: 300 (5-minute intervals). Used by silver layer for gap detection."
+        },
+        "expected_records": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Expected number of rows given event_time range and frequency. null at bronze since event_time_start/end are unknown."
+        }
+      }
+    },
+
+    "data_profile": {
+      "type": "object",
+      "description": "Lightweight data signals computed during ingestion. Fields requiring column-level parsing are null at bronze and computed by silver. row_count is the only field populated at bronze (newline count during streaming).",
+      "required": ["row_count", "null_percentage", "duplicate_rows", "min_timestamp", "max_timestamp", "schema_detected", "corrupted_rows"],
+      "additionalProperties": false,
+      "properties": {
+        "row_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Count of newline characters encountered during streaming upload. Approximates CSV rows (includes header) without column parsing. The only data_profile field populated at bronze."
+        },
+        "null_percentage": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Fraction of cells that are null across all columns. null at bronze — computed by silver layer."
+        },
+        "duplicate_rows": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Number of exact duplicate rows. null at bronze — computed by silver layer."
+        },
+        "min_timestamp": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "Minimum value in the primary timestamp column. null at bronze — computed by silver layer."
+        },
+        "max_timestamp": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "Maximum value in the primary timestamp column. null at bronze — computed by silver layer."
+        },
+        "schema_detected": {
+          "type": ["boolean", "null"],
+          "description": "Whether a schema was inferred from the file. Always null at bronze (no schema inference). Populated by silver."
+        },
+        "corrupted_rows": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Number of rows that failed parsing. null at bronze — computed by silver layer. Bronze preserves ALL rows including corrupted ones."
+        }
+      }
+    },
+
+    "quality_hint": {
+      "type": "object",
+      "description": "Lightweight quality pre-checks. Bronze does NOT fully validate, but captures early signals that silver and ML layers consume. All fields are null at bronze.",
+      "required": ["basic_quality_score", "schema_valid", "time_continuity_suspected_gap", "notes"],
+      "additionalProperties": false,
+      "properties": {
+        "basic_quality_score": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Composite quality score 0.0–1.0. null at bronze — computed by silver layer after profiling."
+        },
+        "schema_valid": {
+          "type": ["boolean", "null"],
+          "description": "Whether the file passes schema validation. null at bronze — no schema is applied. Populated by silver."
+        },
+        "time_continuity_suspected_gap": {
+          "type": ["boolean", "null"],
+          "description": "Whether a temporal gap is suspected in the event_time range. null at bronze (event_time_start/end unknown). Populated by silver."
+        },
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Human-readable notes from the ingestion pipeline. Empty at bronze unless the pipeline detects an anomaly (e.g. file size unexpectedly small)."
+        }
+      }
+    },
+
+    "lineage": {
+      "type": "object",
+      "description": "Audit trail and ML feedback linkage. Enables rerun tracking, incident correlation, and training data lineage.",
+      "required": ["parent_dataset_version", "rerun_of", "related_incident_id"],
+      "additionalProperties": false,
+      "properties": {
+        "parent_dataset_version": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Version number of the previous ingestion of this dataset. null if this is the first ingestion (version == 1)."
+        },
+        "rerun_of": {
+          "type": ["string", "null"],
+          "description": "Identifier of the dataset version this is a rerun of (e.g. '9068_ac_power_v1'). null if trigger_type is 'scheduled'."
+        },
+        "related_incident_id": {
+          "type": ["string", "null"],
+          "description": "Incident or ticket ID that triggered a manual rerun. null for scheduled ingestions."
+        }
+      }
+    }
+
+  }
+}

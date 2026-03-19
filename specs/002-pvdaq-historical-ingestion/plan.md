@@ -1,41 +1,51 @@
 # Implementation Plan: PVDAQ Historical Dataset Ingestion
 
-**Branch**: `002-pvdaq-historical-ingestion` | **Date**: 2026-03-09 | **Spec**: [spec.md](spec.md)
+**Branch**: `002-pvdaq-historical-ingestion` | **Date**: 2026-03-19 | **Spec**: [spec.md](spec.md)
 **Input**: Feature specification from `/specs/002-pvdaq-historical-ingestion/spec.md`
-
-**Note**: Revised plan reflecting the architecture change from per-row processing to dataset-level ingestion (store in ADLS + emit dataset event).
 
 ## Summary
 
-Download historical CSV files from the OEDI S3 bucket for 4 PVDAQ sites, stream them to ADLS Gen2 raw container, register dataset metadata in the existing file tracking table, and emit a `solar.pvdaq.dataset.available` CloudEvent per file. Uses a fan-out pattern (timer dispatcher + queue worker) to process each file within Azure Function timeout limits. One-pass streaming (S3 → ADLS) with incremental SHA-256 hash keeps memory bounded at ~4 MiB regardless of file size.
+Ingest all historical PVDAQ photovoltaic CSV files (4 sites, up to 870 MB per file) from the OEDI
+public S3 bucket into ADLS Gen2 (bronze layer), register dataset metadata in Azure Table Storage,
+and emit a `solar.pvdaq.dataset.available` CloudEvent per file. Uses a fan-out pattern:
+timer-triggered dispatcher discovers and enqueues files; queue-triggered worker downloads, stores,
+and emits. Most modules are already implemented. The primary outstanding work is fixing the ADLS
+path (Constitution VIII gate failure), threading `last_modified` through the work item, adding
+work-item schema validation, and wiring local emulation switching.
 
 ## Technical Context
 
-**Language/Version**: Python 3.11+ (Azure Functions v4 Isolated Worker, v2 programming model)
-**Primary Dependencies**: azure-functions, azure-servicebus, azure-data-tables, azure-identity, azure-storage-file-datalake (NEW), httpx, aiohttp
-**Storage**: Azure Table Storage (file tracking + metadata), Azure Data Lake Storage Gen2 (raw CSV files)
-**Testing**: pytest + pytest-asyncio
-**Target Platform**: Azure Functions (Linux consumption/premium plan)
-**Project Type**: Single project (existing function app)
-**Performance Goals**: Stream 870 MB files with ~4 MiB memory footprint; complete per-file ingestion within function timeout (70 min)
-**Constraints**: Bounded memory via streaming; no full-file buffering; DefaultAzureCredential for all Azure services
-**Scale/Scope**: 4 sites, ~40 CSV files total (7 MB – 870 MB each), ~10 known categories
+**Language/Version**: Python 3.11+, Azure Functions v4 Isolated Worker (v2 programming model)
+**Primary Dependencies**: azure-functions, azure-servicebus, azure-data-tables, azure-identity,
+azure-storage-file-datalake, httpx, jsonschema — all present in `requirements.txt`
+**Storage**: Azure Table Storage (`PvdaqFileTracking`) + ADLS Gen2 bronze container (`raw`)
+**Testing**: pytest + pytest-asyncio; unit in `tests/unit/`, integration in `tests/integration/`,
+contract in `tests/contract/`
+**Target Platform**: Azure Functions v4 (Linux), Azurite for local development
+**Performance Goals**: Memory ≤ 4 MiB per file (streaming, chunked); no per-run throughput target
+**Constraints**: Function timeout 01:10:00 (host.json); each file processed independently within
+that window; S3 retries default 3 (MAX_RETRIES in http_retry.py)
+**Scale/Scope**: 4 sites × ~10 CSV files each = ~40 total files; files 7 MB–870 MB
 
 ## Constitution Check
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-| # | Principle | Status | Notes |
-| - | --------- | ------ | ----- |
-| I | Function Isolation | PASS | Dispatcher and worker are separate functions with independent triggers. Feature 001 unaffected. |
-| II | Schema Validation at Boundary | PASS (adjusted) | This feature stores raw files without row-level validation — that moves downstream. The dataset event contract (`dataset-event.json`) is validated at emission. |
-| III | Metadata Enrichment | PASS | Dataset events carry source_vendor, ingestion_timestamp, schema_version, mapping_version, correlation_id, traceparent. `mapping_version` set to `"unknown"` sentinel per constitution fallback (no field mapping at dataset level). |
-| IV | Managed Identity | PASS | DefaultAzureCredential for Table Storage, Service Bus, and ADLS Gen2. No secrets in config. |
-| V | Structured Observability | PASS | Structured logging with correlation_id, dataset-level metrics (discovered/downloaded/stored/emitted/failed). |
-| VI | Idempotency | PASS | File-level idempotency via file tracking store. Key: site_id + category + file_name. Simpler than per-row; write-before-emit pattern preserved (mark_queued before send). |
-| VII | Event Emission Rules | PASS | New event type `solar.pvdaq.dataset.available` registered in topics.md per domain-level lifecycle convention `{domain}.{vendor}.{entity}.{action}` (Constitution v1.2.0). CloudEvents v1.0 envelope with required extension attributes. |
+| Principle | Status | Notes |
+| --------- | ------ | ----- |
+| I — Function Isolation | ✅ PASS | `historical_dispatcher` and `historical_worker` are independent functions with own error handling. Failure in worker does not cascade to dispatcher. |
+| II — Schema Validation at Boundary | ⚠️ PARTIAL | Work-item queue message is not validated against `work-item-message.json` in `historical_worker`. All other inbound payloads (CloudEvents envelope) are validated via contract tests. **Must fix before merge.** |
+| III — Metadata Enrichment | ✅ PASS | `build_dataset_envelope` adds `source_vendor`, `ingestion_timestamp`, `schema_version`, `mapping_version` (sentinel "unknown"), `correlation_id`, `traceparent`. |
+| IV — Managed Identity | ✅ PASS | `DefaultAzureCredential` used for all Azure SDK clients. Local dev uses Azurite connection string via `AzureWebJobsStorage`. `ADLS_ACCOUNT_URL` local override required (see gap below). |
+| V — Structured Observability | ✅ PASS | `DatasetIngestionStats` + `emit_dataset_metrics` covers all FR-011 fields. JSON-structured logging via `create_logger`. |
+| VI — Idempotency | ✅ PASS | `FileTrackingStore.mark_queued` called before `send_queue_message` (write-before-emit). Worker marks processing → completed/failed. |
+| VII — Event Emission Rules | ✅ PASS | `solar.pvdaq.dataset.available` registered in `topics.md`. CloudEvents v1.0 envelope. Dead-letter routing on failure. |
+| VIII — Raw Dataset Storage | ❌ **GATE FAILURE** | `function_app.py:341` builds path `pvdaq/site_id={site_id}/category={category}/{file_name}`. Spec and Constitution VIII require `raw/pvdaq/site_id={site_id}/year={year}/month={month}/{file_name}`. Missing `raw/` prefix and `year/month` partitioning. **Blocks merge until fixed.** |
+| Constitution: host.json concurrency | ✅ PASS | `maxConcurrentCalls: 1` explicitly set for Service Bus queue trigger. `functionTimeout: 01:10:00` accommodates large file downloads. |
 
-**Post-design re-check**: All 7 principles pass. Constitution Principle II is satisfied at the dataset level — row-level validation is explicitly deferred to the processing layer per spec.
+### Complexity Tracking
+
+**Constitution VIII — ADLS path**: current path omits the `raw/` prefix and uses `category` instead of `year/month`. Fix requires adding `last_modified` to the work-item contract so the worker can derive UTC `year`/`month` without an extra S3 call. Keeping a category partition was rejected because it diverges from the standardised bronze path convention shared with feature 001.
 
 ## Project Structure
 
@@ -44,71 +54,237 @@ Download historical CSV files from the OEDI S3 bucket for 4 PVDAQ sites, stream 
 ```text
 specs/002-pvdaq-historical-ingestion/
 ├── plan.md              # This file
-├── spec.md              # Feature specification (revised 2026-03-09)
-├── research.md          # Phase 0 research (revised 2026-03-09)
-├── data-model.md        # Phase 1 data model (revised 2026-03-09)
-├── quickstart.md        # Phase 1 quickstart (revised 2026-03-09)
+├── research.md          # Phase 0 output
+├── data-model.md        # Phase 1 output
+├── quickstart.md        # Phase 1 output
 ├── contracts/
-│   ├── file-tracking-entity.json   # Extended with metadata fields
-│   ├── work-item-message.json      # Unchanged
-│   └── dataset-event.json          # NEW: dataset CloudEvent schema
-├── checklists/
-│   └── requirements.md
-└── tasks.md             # Phase 2 output (generated by /speckit.tasks)
+│   ├── dataset-event.json         # CloudEvents envelope schema ✅
+│   ├── file-tracking-entity.json  # Table Storage entity schema ✅
+│   └── work-item-message.json     # Queue message schema (needs last_modified field)
+└── tasks.md             # Phase 2 output (/speckit.tasks command)
 ```
 
-### Source Code (repository root)
+### Source Code
 
 ```text
+function_app.py              # Azure Functions entry point — dispatcher + worker
 src/
-├── adls_store.py            # NEW: ADLS Gen2 streaming upload + SHA-256 hash
-├── cloudevents_envelope.py  # MODIFIED: add dataset event builder
-├── config.py                # MODIFIED: add ADLS config fields
-├── file_tracking_store.py   # MODIFIED: add metadata fields to mark_completed
-├── observability.py         # MODIFIED: add DatasetIngestionStats
-├── oedi_historical_client.py  # UNCHANGED: list_csv_files reused
-├── service_bus_emitter.py   # UNCHANGED
-├── http_retry.py            # UNCHANGED
-├── csv_normalizer.py        # UNCHANGED (kept for feature 001)
-├── record_pipeline.py       # UNCHANGED (kept for feature 001)
-├── schema_validator.py      # UNCHANGED (kept for feature 001)
-└── idempotency_store.py     # UNCHANGED (kept for feature 001)
+├── config.py                # HistoricalConfig dataclass + load_historical_config()
+├── adls_store.py            # AdlsStore: streaming upload with SHA-256
+├── file_tracking_store.py   # FileTrackingStore: Azure Table Storage CRUD
+├── oedi_historical_client.py # OediHistoricalClient: S3 list + stream
+├── service_bus_emitter.py   # ServiceBusEmitter: topic/queue/dead-letter send
+├── cloudevents_envelope.py  # build_dataset_envelope()
+├── observability.py         # DatasetIngestionStats, emit_dataset_metrics
+├── http_retry.py            # get_with_retry: MAX_RETRIES=3, exponential backoff
+└── schema_validator.py      # JSON Schema validation (reuse for work-item validation)
 
 tests/
-├── unit/
-│   ├── test_adls_store.py           # NEW
-│   ├── test_file_tracking_store.py  # MODIFIED
-│   └── test_oedi_historical_client.py  # UNCHANGED
+├── contract/
+│   ├── test_cloudevents_envelope.py   # CloudEvents envelope shape
+│   └── test_historical_envelope.py    # dataset-event.json contract
 ├── integration/
-│   └── test_historical_pipeline.py  # MODIFIED (dataset-level tests)
-└── contract/
-    └── test_dataset_event.py        # NEW: validate against dataset-event.json
+│   ├── test_historical_pipeline.py    # Dispatcher + worker integration
+│   └── test_dead_letter.py            # Dead-letter routing
+└── unit/
+    ├── test_oedi_historical_client.py # list_csv_files pagination, extract_category
+    └── test_file_tracking_store.py    # CRUD, LastModified-only change detection
 ```
 
-**Structure Decision**: Single project layout (existing). New module `src/adls_store.py` added; existing modules modified minimally. Feature 001 code remains untouched.
+## Phase 0: Research Summary
 
-## Complexity Tracking
+See [research.md](research.md) for full findings.
 
-No constitution violations. No complexity justification needed.
+**All NEEDS CLARIFICATION items resolved:**
 
-## Key Architecture Decisions
+| Item | Decision |
+|------|----------|
+| ADLS path format | `raw/pvdaq/site_id={site_id}/year={year}/month={month}/{file_name}` — from spec FR-004 and Constitution VIII. `year`/`month` derived in UTC from S3 `LastModified`. |
+| Work-item contract gap | Add `last_modified` field to `work-item-message.json` so worker can derive year/month without a second S3 call. |
+| Local ADLS emulation | Azurite Blob (port 10000) using same `azure-storage-file-datalake` SDK. Switch via `ADLS_ACCOUNT_URL=http://127.0.0.1:10000/devstoreaccount1` when `STORAGE_EMULATOR=true`. |
+| Local Service Bus emulation | Azurite Queue (port 10001) via `azure-storage-queue`. Worker and dispatcher switch emitter type based on `STORAGE_EMULATOR=true`. |
+| File change detection | Compare S3 `LastModified` (from current listing) against `LastModified` stored in tracking entity. Size check is a secondary guard and can remain. |
+| Schema validation for queue messages | Reuse existing `SchemaValidator` from `schema_validator.py` with `work-item-message.json`. Validate at top of `historical_worker` before any processing. |
+| S3 listing pagination | Already implemented — `OediHistoricalClient.list_csv_files` loops on `IsTruncated` / `NextContinuationToken`. |
+| Retry default | `MAX_RETRIES = 3` already set in `http_retry.py`. |
+| Timezone | All year/month derivation uses UTC (`datetime.fromisoformat(last_modified).astimezone(timezone.utc)`). |
+| Concurrency | `maxConcurrentCalls: 1` in `host.json` — host-level only, no application-level semaphore. |
 
-### 1. One-Pass Streaming (S3 → ADLS)
+## Phase 1: Design
 
-Download from S3 and upload to ADLS in a single streaming pass using httpx `aiter_bytes()` + ADLS `append_data()`. SHA-256 hash computed incrementally on each chunk. Memory footprint: ~4 MiB regardless of file size.
+See [data-model.md](data-model.md) for entity schemas and state machine.
+See [contracts/](contracts/) for JSON Schema contracts.
+See [quickstart.md](quickstart.md) for local dev setup.
 
-### 2. File Tracking as Metadata Store
+### Key Design Decisions
 
-The existing `PvdaqFileTracking` Azure Table is extended with metadata columns (StoragePath, FileHash, IngestionId, SourceUrl, IngestionTime) rather than creating a separate store. This keeps file status and dataset metadata co-located.
+#### D-001: ADLS Path Construction (bronze layer convention)
 
-### 3. Dataset-Level CloudEvent
+The worker builds a versioned, append-only path following the bronze folder convention.
+`ingestion_date` is the UTC calendar date of ingestion (NOT the S3 LastModified date).
+`dataset` is `{site_id}_{category}` (e.g. `9068_ac_power`).
 
-One event per file instead of per row. Event type `solar.pvdaq.dataset.available` with file-level metadata in the data block. Reduces event volume from millions to tens.
+```python
+from datetime import datetime, timezone
 
-### 4. Worker Pipeline Change
+def _adls_path(site_id: int, category: str, ingestion_date: str, version: int) -> str:
+    dataset = f"{site_id}_{category}"
+    return (
+        f"source=pvdaq"
+        f"/dataset={dataset}"
+        f"/ingestion_date={ingestion_date}"
+        f"/{dataset}_v{version}.csv"
+    )
 
-The worker no longer parses CSV rows. New pipeline: download → stream to ADLS → compute hash → update tracking entity → emit dataset event → mark completed.
+def _metadata_path(site_id: int, category: str, ingestion_date: str) -> str:
+    dataset = f"{site_id}_{category}"
+    return (
+        f"source=pvdaq"
+        f"/dataset={dataset}"
+        f"/ingestion_date={ingestion_date}"
+        f"/metadata.json"
+    )
+```
 
-### 5. Modules Retained for Feature 001
+`last_modified` is still threaded through the work item for **change detection** (FR-012),
+not for path construction.
 
-`csv_normalizer.py`, `record_pipeline.py`, `schema_validator.py`, `idempotency_store.py` remain in the codebase for feature 001's per-row pipeline. They are not removed or modified.
+#### D-002: Work-Item Contract Extension
+
+`work-item-message.json` gains an optional `last_modified` field:
+
+- Type: `string`, format `date-time`
+- Populated by dispatcher from S3 listing `last_modified`
+- Used by worker for change detection; falls back gracefully if absent
+
+#### D-003: Work-Item Schema Validation
+
+At the top of `historical_worker`, before any state mutation:
+
+```python
+from src.schema_validator import SchemaValidator
+validator = SchemaValidator()
+errors = validator.validate(work_item, "work-item-message.json")
+if errors:
+    # dead-letter and return — do not mark_processing
+```
+
+Schema file location: `specs/002-pvdaq-historical-ingestion/contracts/work-item-message.json`.
+`SchemaValidator` must be extended to resolve schemas from this path.
+
+#### D-004: Local Emulation Switching
+
+When `STORAGE_EMULATOR=true` (or `AzureWebJobsStorage == "UseDevelopmentStorage=true"`):
+
+- ADLS: set `ADLS_ACCOUNT_URL=http://127.0.0.1:10000/devstoreaccount1` in `local.settings.json`
+  (no code change needed — `AdlsStore` already accepts `account_url` from config)
+- Service Bus → Azurite Queue: a thin `AzuriteQueueEmitter` wraps `azure-storage-queue` and
+  implements the same `emit_cloudevent` / `emit_dead_letter` / `send_queue_message` interface.
+  `function_app.py` selects the emitter type based on `STORAGE_EMULATOR` env var.
+
+#### D-005: Integration Test Path Assertion Update
+
+`tests/integration/test_historical_pipeline.py` must be updated to assert the new versioned
+bronze path `source=pvdaq/dataset=9068_ac_power/ingestion_date=YYYY-MM-DD/9068_ac_power_v1.csv`
+and verify that `metadata.json` is written alongside it.
+
+#### D-006: Versioning Strategy (append-only, never overwrite)
+
+Before writing, the worker determines the next version number by querying `PvdaqFileTracking`
+for all entities with the same `PartitionKey` (site_id) and `S3Key`, then computing
+`max(Version) + 1`. The result is used in both the ADLS path and the RowKey
+(`SHA256(s3_key)_v{version}`). This means re-ingestion creates a new entity, leaving previous
+entities untouched — fully append-only.
+
+```python
+async def _next_version(tracker, site_id: int, s3_key: str) -> int:
+    """Query tracking table for max version of this dataset, return next version."""
+    existing = await tracker.get_versions(site_id, s3_key)
+    return max(existing, default=0) + 1
+```
+
+`FileTrackingStore` gains a `get_versions(site_id, s3_key) -> list[int]` method that queries
+all entities matching the partition key and S3 key, returning their `Version` values.
+
+#### D-007: Metadata File Writing
+
+After the CSV stream upload completes, the worker constructs a `metadata.json` conforming to
+`contracts/metadata-file.json` and writes it via `AdlsStore.write_json(path, data)` — a simple
+single-chunk write (no streaming needed since metadata is always small, < 2 KB).
+
+The file is structured in 7 blocks. Bronze populates what it can **without opening the CSV**:
+
+```python
+metadata = {
+    "dataset": {
+        "dataset_id": f"{site_id}_{category}",
+        "dataset_type": "time_series",
+        "version": version,
+        "schema_version": "unknown",
+        "tags": ["pvdaq", "solar"],
+    },
+    "source": {
+        "source": "pvdaq",
+        "source_type": "s3_public",
+        "endpoint": f"pvdaq/2023-solar-data-prize/{site_id}_OEDI/data/",
+        "provider": "NREL",
+        "region": "us-east-1",
+    },
+    "ingestion": {
+        "ingestion_time": ingestion_time,
+        "ingestion_id": ingestion_id,
+        "batch_id": correlation_id,          # from dispatcher
+        "pipeline": "energy-ingestion-boundary-v1",
+        "trigger_type": "rerun" if version > 1 else "scheduled",
+        "retry_count": 0,
+        "source_file_name": file_name,
+        "file_size_bytes": file_size,        # from S3 listing
+        "checksum": file_hash,              # SHA-256 from stream_upload
+        "ingestion_latency_seconds": round(elapsed, 1),
+        "status": "success",
+    },
+    "event_time": {
+        "event_time_start": None,           # null — silver layer fills
+        "event_time_end": None,             # null — silver layer fills
+        "expected_frequency_seconds": 300,  # PVDAQ 5-min intervals
+        "expected_records": None,           # null — depends on event_time
+    },
+    "data_profile": {
+        "row_count": row_count,             # newline count from stream_upload
+        "null_percentage": None,
+        "duplicate_rows": None,
+        "min_timestamp": None,
+        "max_timestamp": None,
+        "schema_detected": None,
+        "corrupted_rows": None,
+    },
+    "quality_hint": {
+        "basic_quality_score": None,
+        "schema_valid": None,
+        "time_continuity_suspected_gap": None,
+        "notes": [],
+    },
+    "lineage": {
+        "parent_dataset_version": version - 1 if version > 1 else None,
+        "rerun_of": f"{site_id}_{category}_v{version - 1}" if version > 1 else None,
+        "related_incident_id": None,
+    },
+}
+```
+
+`row_count` is computed by counting `\n` bytes in the same chunking loop that uploads to ADLS —
+zero extra I/O, no CSV column parsing. `stream_upload` returns a 3-tuple
+`(bytes_written, sha256_hex, newline_count)` after this change.
+
+### Re-evaluation of Constitution Check (post-design)
+
+| Principle | Status |
+|-----------|--------|
+| I — Function Isolation | ✅ |
+| II — Schema Validation | ✅ D-003 adds work-item validation |
+| III — Metadata Enrichment | ✅ |
+| IV — Managed Identity | ✅ D-004 clarifies local URL override |
+| V — Structured Observability | ✅ |
+| VI — Idempotency | ✅ |
+| VII — Event Emission Rules | ✅ |
+| VIII — Raw Dataset Storage | ✅ D-001 fixes path to `raw/pvdaq/site_id=.../year=.../month=.../{file}` |

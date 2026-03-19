@@ -24,7 +24,8 @@
     "PVDAQ_HISTORICAL_QUEUE_NAME": "pvdaq-historical-work",
     "FILE_TRACKING_TABLE_NAME": "PvdaqFileTracking",
     "OEDI_HISTORICAL_PREFIX": "pvdaq/2023-solar-data-prize",
-    "ADLS_ACCOUNT_URL": "https://csb1003bffd999ff1d0.dfs.core.windows.net",
-    "ADLS_CONTAINER_NAME": "raw"
+    "ADLS_ACCOUNT_URL": "http://127.0.0.1:10000/devstoreaccount1",
+    "ADLS_CONTAINER_NAME": "bronze",
+    "STORAGE_EMULATOR": "true"
   }
 }

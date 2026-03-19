@@ -11,14 +11,17 @@ Data source: OEDI Data Lake (public S3 bucket).
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 import azure.functions as func
+from jsonschema import Draft202012Validator, ValidationError
 
 from src.adls_store import AdlsStore, AdlsUploadError
+from src.azurite_queue_emitter import AzuriteQueueEmitter
 from src.cloudevents_envelope import build_dataset_envelope
 from src.config import load_config, load_historical_config
 from src.file_tracking_store import FileTrackingStore
@@ -41,6 +44,73 @@ from src.record_pipeline import process_record
 from src.service_bus_emitter import ServiceBusEmitter
 
 app = func.FunctionApp()
+
+# ---------------------------------------------------------------------------
+# Feature 002: Module-level helpers
+# ---------------------------------------------------------------------------
+
+_WORK_ITEM_VALIDATOR: Draft202012Validator | None = None
+
+
+def _get_work_item_validator() -> Draft202012Validator:
+    """Return a cached JSON Schema validator for historical work-item messages."""
+    global _WORK_ITEM_VALIDATOR
+    if _WORK_ITEM_VALIDATOR is None:
+        schema_path = (
+            Path(__file__).parent
+            / "specs/002-pvdaq-historical-ingestion/contracts/work-item-message.json"
+        )
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        _WORK_ITEM_VALIDATOR = Draft202012Validator(schema)
+    return _WORK_ITEM_VALIDATOR
+
+
+def _adls_path(site_id: int, category: str, ingestion_date: str, version: int) -> str:
+    """Build the bronze-layer ADLS path for a versioned CSV ingestion.
+
+    Path format (Constitution VIII + bronze folder convention):
+    ``source=pvdaq/dataset={site_id}_{category}/ingestion_date={YYYY-MM-DD}/{dataset}_v{n}.csv``
+
+    Args:
+        site_id: PVDAQ site identifier.
+        category: Measurement category (e.g. ``"ac_power"``).
+        ingestion_date: UTC calendar date of ingestion in ``YYYY-MM-DD`` format.
+        version: Ingestion version number (1 = first, increments on re-ingestion).
+    """
+    dataset = f"{site_id}_{category}"
+    return (
+        f"source=pvdaq"
+        f"/dataset={dataset}"
+        f"/ingestion_date={ingestion_date}"
+        f"/{dataset}_v{version}.csv"
+    )
+
+
+def _metadata_path(site_id: int, category: str, ingestion_date: str) -> str:
+    """Build the ADLS path for the ``metadata.json`` sidecar file.
+
+    Written alongside the CSV at:
+    ``source=pvdaq/dataset={site_id}_{category}/ingestion_date={YYYY-MM-DD}/metadata.json``
+    """
+    dataset = f"{site_id}_{category}"
+    return (
+        f"source=pvdaq"
+        f"/dataset={dataset}"
+        f"/ingestion_date={ingestion_date}"
+        f"/metadata.json"
+    )
+
+
+def _make_emitter(config):
+    """Return the appropriate emitter based on STORAGE_EMULATOR env var.
+
+    Returns an AzuriteQueueEmitter when ``STORAGE_EMULATOR=true``
+    (local development), otherwise a ServiceBusEmitter (production).
+    """
+    if os.environ.get("STORAGE_EMULATOR", "").lower() == "true":
+        conn_str = os.environ.get("AzureWebJobsStorage", "UseDevelopmentStorage=true")
+        return AzuriteQueueEmitter(connection_string=conn_str)
+    return ServiceBusEmitter(config.service_bus_fully_qualified_namespace)
 
 
 def _date_range(lookback_hours: int) -> list[tuple[int, int, int]]:
@@ -236,9 +306,7 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
     ) as oedi_client, FileTrackingStore(
         table_name=config.file_tracking_table_name,
         table_service_uri=config.table_storage_uri,
-    ) as tracker, ServiceBusEmitter(
-        fully_qualified_namespace=config.service_bus_fully_qualified_namespace,
-    ) as emitter:
+    ) as tracker, _make_emitter(config) as emitter:
 
         for site_id in config.pvdaq_historical_site_ids:
             try:
@@ -272,6 +340,7 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
                     file_size=file_info["size"],
                     last_modified=file_info.get("last_modified", ""),
                     correlation_id=correlation_id,
+                    category=category,
                 )
                 work_item = {
                     "site_id": site_id,
@@ -280,6 +349,7 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
                     "category": category,
                     "correlation_id": correlation_id,
                     "enqueued_at": datetime.now(timezone.utc).isoformat(),
+                    "last_modified": file_info.get("last_modified", ""),
                 }
                 await emitter.send_queue_message(
                     queue_name=config.pvdaq_historical_queue_name,
@@ -317,13 +387,35 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
     raw_body = msg.get_body().decode("utf-8")
     work_item = json.loads(raw_body)
 
+    correlation_id: str = work_item.get("correlation_id", "unknown")
+    logger = create_logger(correlation_id, vendor="PVDAQ", function_name="historical_worker")
+
+    config = load_historical_config()
+
+    # Validate work item schema — Constitution II: every inbound payload must be
+    # validated against a versioned JSON Schema before processing begins.
+    try:
+        _get_work_item_validator().validate(work_item)
+    except ValidationError as exc:
+        logger.error("Work item schema validation failed: %s", exc.message)
+        async with _make_emitter(config) as dl_emitter:
+            await dl_emitter.emit_dead_letter(
+                queue_name=config.dead_letter_queue_name,
+                message_body={
+                    "file_reference": raw_body,
+                    "failure_reason": exc.message,
+                    "error_type": "validation_failure",
+                    "correlation_id": correlation_id,
+                },
+                subject="validation_failure",
+            )
+        return
+
     site_id: int = work_item["site_id"]
     s3_key: str = work_item["s3_key"]
     file_name: str = work_item["file_name"]
     category: str = work_item.get("category") or extract_category(file_name, site_id)
-    correlation_id: str = work_item["correlation_id"]
 
-    logger = create_logger(correlation_id, vendor="PVDAQ", function_name="historical_worker")
     start_time = time.monotonic()
 
     # Generate traceparent for this worker invocation
@@ -331,17 +423,12 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
     span_id = uuid4().hex[:16]
     traceparent = f"00-{trace_id}-{span_id}-01"
 
-    config = load_historical_config()
     stats = DatasetIngestionStats(source="PVDAQ-historical-worker", correlation_id=correlation_id)
     ingestion_id = str(uuid4())
 
     logger.info("Historical worker started — site=%d, file=%s", site_id, file_name)
 
-    # Deterministic ADLS destination path (T012)
-    adls_path = f"pvdaq/site_id={site_id}/category={category}/{file_name}"
-    source_url = (
-        f"{config.oedi_bucket_url.rstrip('/')}/{s3_key}"
-    )
+    source_url = f"{config.oedi_bucket_url.rstrip('/')}/{s3_key}"
 
     async with FileTrackingStore(
         table_name=config.file_tracking_table_name,
@@ -349,15 +436,21 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
     ) as tracker, AdlsStore(
         account_url=config.adls_account_url,
         container_name=config.adls_container_name,
-    ) as adls, ServiceBusEmitter(
-        fully_qualified_namespace=config.service_bus_fully_qualified_namespace,
-    ) as emitter:
+    ) as adls, _make_emitter(config) as emitter:
 
-        await tracker.mark_processing(site_id, s3_key)
+        # Version resolution — determines append-only version before any writes
+        existing_versions = await tracker.get_versions(site_id, s3_key)
+        version = max(existing_versions, default=0) + 1
+
+        ingestion_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        adls_path = _adls_path(site_id, category, ingestion_date, version)
+        meta_path = _metadata_path(site_id, category, ingestion_date)
+
+        await tracker.mark_processing(site_id, s3_key, version)
 
         try:
-            # Stream S3 → ADLS with incremental SHA-256 (one-pass, bounded memory)
-            bytes_written, file_hash = await adls.stream_upload(
+            # Stream S3 → ADLS: one-pass, ~4 MiB memory, returns (bytes, sha256, newlines)
+            bytes_written, file_hash, row_count = await adls.stream_upload(
                 source_url=source_url,
                 file_path=adls_path,
             )
@@ -365,16 +458,80 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
             stats.datasets_stored = 1
 
             ingestion_time = datetime.now(timezone.utc).isoformat()
+            elapsed = time.monotonic() - start_time
+
+            # Build metadata.json conforming to contracts/metadata-file.json
+            dataset_id = f"{site_id}_{category}"
+            metadata_dict = {
+                "dataset": {
+                    "dataset_id": dataset_id,
+                    "dataset_type": "time_series",
+                    "version": version,
+                    "schema_version": "unknown",
+                    "tags": ["pvdaq", "solar"],
+                },
+                "source": {
+                    "source": "pvdaq",
+                    "source_type": "s3_public",
+                    "endpoint": f"pvdaq/2023-solar-data-prize/{site_id}_OEDI/data/",
+                    "provider": "NREL",
+                    "region": "us-east-1",
+                },
+                "ingestion": {
+                    "ingestion_time": ingestion_time,
+                    "ingestion_id": ingestion_id,
+                    "batch_id": correlation_id,
+                    "pipeline": "energy-ingestion-boundary-v1",
+                    "trigger_type": "rerun" if version > 1 else "scheduled",
+                    "retry_count": 0,
+                    "source_file_name": file_name,
+                    "file_size_bytes": bytes_written,
+                    "checksum": file_hash,
+                    "ingestion_latency_seconds": round(elapsed, 1),
+                    "status": "success",
+                },
+                "event_time": {
+                    "event_time_start": None,
+                    "event_time_end": None,
+                    "expected_frequency_seconds": 300,
+                    "expected_records": None,
+                },
+                "data_profile": {
+                    "row_count": row_count,
+                    "null_percentage": None,
+                    "duplicate_rows": None,
+                    "min_timestamp": None,
+                    "max_timestamp": None,
+                    "schema_detected": None,
+                    "corrupted_rows": None,
+                },
+                "quality_hint": {
+                    "basic_quality_score": None,
+                    "schema_valid": None,
+                    "time_continuity_suspected_gap": None,
+                    "notes": [],
+                },
+                "lineage": {
+                    "parent_dataset_version": version - 1 if version > 1 else None,
+                    "rerun_of": f"{dataset_id}_v{version - 1}" if version > 1 else None,
+                    "related_incident_id": None,
+                },
+            }
+            await adls.write_json(meta_path, metadata_dict)
 
             # Register metadata in tracking table (US2)
             await tracker.mark_completed(
                 site_id=site_id,
                 s3_key=s3_key,
+                version=version,
+                category=category,
                 storage_path=adls_path,
                 file_hash=file_hash,
                 ingestion_id=ingestion_id,
                 source_url=source_url,
                 ingestion_time=ingestion_time,
+                row_count=row_count,
+                metadata_path=meta_path,
             )
 
             # Emit dataset-available CloudEvent (US3)
@@ -384,6 +541,7 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
                     "category": category,
                     "file_format": "csv",
                     "storage_path": adls_path,
+                    "version": version,
                     "ingestion_id": ingestion_id,
                     "source_url": source_url,
                     "file_size": bytes_written,
@@ -406,7 +564,7 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
                 "Historical worker failed — site=%d, file=%s: %s",
                 site_id, file_name, exc, exc_info=True,
             )
-            await tracker.mark_failed(site_id, s3_key)
+            await tracker.mark_failed(site_id, s3_key, version)
             await emitter.emit_dead_letter(
                 queue_name=config.dead_letter_queue_name,
                 message_body={

@@ -38,13 +38,28 @@
    }
    ```
 
-3. **Start Azurite** (for Table Storage):
+3. **Start Azurite** (for Table Storage, Blob/ADLS, and Queue):
 
    ```bash
    azurite --silent --location ./AzuriteConfig --debug ./AzuriteConfig/debug.log
    ```
 
-4. **Run the function app locally**:
+   This starts three endpoints:
+   - Blob / ADLS DFS: `http://127.0.0.1:10000` (bronze container)
+   - Queue: `http://127.0.0.1:10001` (work items + events)
+   - Table: `http://127.0.0.1:10002` (file tracking)
+
+4. **Set `ADLS_ACCOUNT_URL` for Azurite** in `local.settings.json`:
+
+   ```json
+   "ADLS_ACCOUNT_URL": "http://127.0.0.1:10000/devstoreaccount1",
+   "STORAGE_EMULATOR": "true"
+   ```
+
+   When `STORAGE_EMULATOR=true`, the function app routes event emission to Azurite Queue
+   (port 10001) instead of Azure Service Bus. Same CloudEvents envelope, different transport.
+
+5. **Run the function app locally**:
 
    ```bash
    func start
@@ -110,9 +125,11 @@ pytest --cov=src --cov-report=term-missing
 
 ## Modules No Longer Used by Feature 002
 
-| Module                          | Reason                                        |
-| ------------------------------- | --------------------------------------------- |
-| `src/csv_normalizer.py`        | Row parsing moved to downstream processing    |
-| `src/record_pipeline.py`       | Per-row pipeline moved downstream             |
-| `src/schema_validator.py`      | Row validation moved downstream               |
-| `src/idempotency_store.py`     | Per-row idempotency replaced by file tracking |
+| Module | Reason |
+| --- | --- |
+| `src/csv_normalizer.py` | Row parsing moved to downstream processing |
+| `src/record_pipeline.py` | Per-row pipeline moved downstream |
+| `src/idempotency_store.py` | Per-row idempotency replaced by file tracking |
+
+**Note**: `src/schema_validator.py` is now used by feature 002 for work-item message validation
+(Constitution II compliance, added 2026-03-19). It is no longer listed as unused.
