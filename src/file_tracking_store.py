@@ -36,21 +36,33 @@ class FileTrackingStore:
         table_name: str,
         table_service_uri: str,
         table_client: TableClient | None = None,
+        connection_string: str | None = None,
     ) -> None:
         self._table_name = table_name
         self._table_service_uri = table_service_uri
         self._table_client = table_client
+        self._connection_string = connection_string
         self._credential: DefaultAzureCredential | None = None
         self._owns_client = table_client is None
 
     async def _get_client(self) -> TableClient:
         if self._table_client is None:
-            self._credential = DefaultAzureCredential()
-            self._table_client = TableClient(
-                endpoint=self._table_service_uri,
-                table_name=self._table_name,
-                credential=self._credential,
-            )
+            if self._connection_string:
+                self._table_client = TableClient.from_connection_string(
+                    conn_str=self._connection_string,
+                    table_name=self._table_name,
+                )
+            else:
+                self._credential = DefaultAzureCredential()
+                self._table_client = TableClient(
+                    endpoint=self._table_service_uri,
+                    table_name=self._table_name,
+                    credential=self._credential,
+                )
+            try:
+                await self._table_client.create_table()
+            except ResourceExistsError:
+                pass
         return self._table_client
 
     @staticmethod
@@ -124,7 +136,7 @@ class FileTrackingStore:
         versions: list[int] = []
         async for entity in client.query_entities(query_filter=query):
             v = entity.get("Version")
-            if v is not None:
+            if v is not None and entity.get("Status") == "completed":
                 versions.append(int(v))
         return versions
 

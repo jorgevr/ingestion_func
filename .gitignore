@@ -7,6 +7,16 @@ dist/
 .venv/
 venv/
 
+# Azurite emulator runtime data
+__blobstorage__/
+__queuestorage__/
+__azurite_db_blob__.json
+__azurite_db_blob_extent__.json
+__azurite_db_queue__.json
+__azurite_db_queue_extent__.json
+__azurite_db_table__.json
+__azurite_db_table_extent__.json
+
 # Azure Functions
 local.settings.json
 .python_packages/

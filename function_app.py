@@ -101,6 +101,13 @@ def _metadata_path(site_id: int, category: str, ingestion_date: str) -> str:
     )
 
 
+def _storage_connection_string() -> str | None:
+    """Return the storage connection string when running against the local emulator."""
+    if os.environ.get("STORAGE_EMULATOR", "").lower() == "true":
+        return "UseDevelopmentStorage=true"
+    return None
+
+
 def _make_emitter(config):
     """Return the appropriate emitter based on STORAGE_EMULATOR env var.
 
@@ -306,6 +313,7 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
     ) as oedi_client, FileTrackingStore(
         table_name=config.file_tracking_table_name,
         table_service_uri=config.table_storage_uri,
+        connection_string=_storage_connection_string(),
     ) as tracker, _make_emitter(config) as emitter:
 
         for site_id in config.pvdaq_historical_site_ids:
@@ -433,9 +441,11 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
     async with FileTrackingStore(
         table_name=config.file_tracking_table_name,
         table_service_uri=config.table_storage_uri,
+        connection_string=_storage_connection_string(),
     ) as tracker, AdlsStore(
         account_url=config.adls_account_url,
         container_name=config.adls_container_name,
+        connection_string=_storage_connection_string(),
     ) as adls, _make_emitter(config) as emitter:
 
         # Version resolution — determines append-only version before any writes

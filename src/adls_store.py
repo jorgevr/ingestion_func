@@ -4,6 +4,10 @@ Provides ``AdlsStore`` — uploads a file from a source URL directly to
 ADLS Gen2 in a single streaming pass using the manual
 create → append → flush pattern.  Memory footprint is bounded to
 ~4 MiB regardless of file size.
+
+Local emulator path: when ``connection_string`` is provided the Blob API
+(azure-storage-blob) is used instead of the filedatalake DFS API, which
+has a Python 3.14 incompatibility in its response deserialisation.
 """
 
 from __future__ import annotations
@@ -13,7 +17,9 @@ import logging
 from typing import Any
 
 import httpx
+from azure.core.exceptions import ResourceExistsError
 from azure.identity.aio import DefaultAzureCredential
+from azure.storage.blob.aio import BlobServiceClient
 from azure.storage.filedatalake.aio import DataLakeServiceClient
 
 logger = logging.getLogger(__name__)
@@ -37,6 +43,8 @@ class AdlsStore:
         container_name: File-system / container name (e.g. ``"raw"``).
         service_client: Optional pre-built ``DataLakeServiceClient`` for
             testability.
+        connection_string: When set, the Blob API is used instead of the DFS
+            API (required for Azurite due to a Python 3.14 SDK incompatibility).
     """
 
     def __init__(
@@ -44,12 +52,30 @@ class AdlsStore:
         account_url: str,
         container_name: str,
         service_client: DataLakeServiceClient | None = None,
+        connection_string: str | None = None,
     ) -> None:
         self._account_url = account_url
         self._container_name = container_name
         self._service_client = service_client
+        self._connection_string = connection_string
+        self._blob_service_client: BlobServiceClient | None = None
         self._credential: DefaultAzureCredential | None = None
         self._owns_client = service_client is None
+
+    async def _get_blob_client(self) -> BlobServiceClient:
+        """Return a cached BlobServiceClient for the emulator path."""
+        if self._blob_service_client is None:
+            self._blob_service_client = BlobServiceClient.from_connection_string(
+                self._connection_string
+            )
+        return self._blob_service_client
+
+    async def _ensure_blob_container(self, blob_client: BlobServiceClient) -> None:
+        container = blob_client.get_container_client(self._container_name)
+        try:
+            await container.create_container()
+        except ResourceExistsError:
+            pass
 
     async def _get_service_client(self) -> DataLakeServiceClient:
         if self._service_client is None:
@@ -87,8 +113,15 @@ class AdlsStore:
         Raises:
             AdlsUploadError: If the download or upload fails.
         """
+        if self._connection_string:
+            return await self._stream_upload_blob(source_url, file_path, http_client)
+
         service = await self._get_service_client()
         fs_client = service.get_file_system_client(self._container_name)
+        try:
+            await fs_client.create_file_system()
+        except ResourceExistsError:
+            pass
         file_client = fs_client.get_file_client(file_path)
 
         owns_http = http_client is None
@@ -138,6 +171,61 @@ class AdlsStore:
             if owns_http:
                 await http_client.aclose()
 
+    async def _stream_upload_blob(
+        self,
+        source_url: str,
+        file_path: str,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> tuple[int, str, int]:
+        """Emulator path: stream upload using AppendBlobClient (Blob API)."""
+        blob_svc = await self._get_blob_client()
+        await self._ensure_blob_container(blob_svc)
+        blob_client = blob_svc.get_blob_client(
+            container=self._container_name, blob=file_path
+        )
+
+        owns_http = http_client is None
+        if http_client is None:
+            http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(10.0, connect=10.0, read=300.0),
+                follow_redirects=True,
+            )
+
+        try:
+            await blob_client.create_append_blob()
+
+            hasher = hashlib.sha256()
+            offset = 0
+            newline_count = 0
+
+            async with http_client.stream("GET", source_url) as response:
+                if response.status_code == 404:
+                    raise AdlsUploadError(f"Source not found: {source_url}")
+                response.raise_for_status()
+
+                async for chunk in response.aiter_bytes(chunk_size=CHUNK_SIZE):
+                    hasher.update(chunk)
+                    newline_count += chunk.count(b"\n")
+                    await blob_client.append_block(chunk)
+                    offset += len(chunk)
+
+            file_hash = hasher.hexdigest()
+            logger.debug(
+                "Uploaded %d bytes to %s/%s (sha256=%s, rows~=%d)",
+                offset, self._container_name, file_path, file_hash[:16], newline_count,
+            )
+            return offset, file_hash, newline_count
+
+        except AdlsUploadError:
+            raise
+        except Exception as exc:
+            raise AdlsUploadError(
+                f"Failed to upload {source_url} → {file_path}: {exc}"
+            ) from exc
+        finally:
+            if owns_http:
+                await http_client.aclose()
+
     async def write_json(self, file_path: str, data: dict) -> None:
         """Write a JSON-serialisable dict as a single file in ADLS Gen2.
 
@@ -155,15 +243,27 @@ class AdlsStore:
         """
         import json as _json
 
-        try:
-            service = await self._get_service_client()
-            fs_client = service.get_file_system_client(self._container_name)
-            file_client = fs_client.get_file_client(file_path)
+        payload = _json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
 
-            payload = _json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
-            await file_client.create_file()
-            await file_client.append_data(data=payload, offset=0, length=len(payload))
-            await file_client.flush_data(len(payload))
+        try:
+            if self._connection_string:
+                blob_svc = await self._get_blob_client()
+                await self._ensure_blob_container(blob_svc)
+                blob_client = blob_svc.get_blob_client(
+                    container=self._container_name, blob=file_path
+                )
+                await blob_client.upload_blob(payload, overwrite=True)
+            else:
+                service = await self._get_service_client()
+                fs_client = service.get_file_system_client(self._container_name)
+                try:
+                    await fs_client.create_file_system()
+                except ResourceExistsError:
+                    pass
+                file_client = fs_client.get_file_client(file_path)
+                await file_client.create_file()
+                await file_client.append_data(data=payload, offset=0, length=len(payload))
+                await file_client.flush_data(len(payload))
 
             logger.debug(
                 "Wrote %d bytes of JSON to %s/%s",
@@ -178,6 +278,8 @@ class AdlsStore:
         """Close the service client and credential if owned by this instance."""
         if self._service_client is not None and self._owns_client:
             await self._service_client.close()
+        if self._blob_service_client is not None:
+            await self._blob_service_client.close()
         if self._credential is not None:
             await self._credential.close()
 

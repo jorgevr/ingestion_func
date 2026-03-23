@@ -4,7 +4,7 @@
   "title": "Historical CSV Work Item Message",
   "description": "Message dispatched by the historical-dispatcher function to the historical-worker queue. Each message represents one CSV file to download and process.",
   "type": "object",
-  "required": ["site_id", "s3_key", "file_name", "category", "correlation_id", "enqueued_at"],
+  "required": ["site_id", "s3_key", "file_name", "correlation_id", "enqueued_at"],
   "properties": {
     "site_id": {
       "type": "integer",

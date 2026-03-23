@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from azure.core.exceptions import ResourceExistsError
 from azure.storage.queue.aio import QueueServiceClient
 
 
@@ -42,6 +43,10 @@ class AzuriteQueueEmitter:
         """Send a JSON message to an Azure Storage Queue."""
         client = await self._get_client()
         queue_client = client.get_queue_client(queue_name)
+        try:
+            await queue_client.create_queue()
+        except ResourceExistsError:
+            pass
         await queue_client.send_message(json.dumps(message_body))
 
     async def emit_dead_letter(
@@ -62,6 +67,10 @@ class AzuriteQueueEmitter:
         """Send a CloudEvents envelope to an Azure Storage Queue."""
         client = await self._get_client()
         queue_client = client.get_queue_client(topic_name)
+        try:
+            await queue_client.create_queue()
+        except ResourceExistsError:
+            pass
         await queue_client.send_message(json.dumps(envelope))
 
     async def close(self) -> None:
