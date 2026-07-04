@@ -43,7 +43,7 @@ def mock_config() -> Config:
         pvdaq_site_count=30,
         pvdaq_lookback_hours=24,
         pvdaq_cron_schedule="0 */15 * * * *",
-        service_bus_topic_name="energy-telemetry-ingested",
+        service_bus_queue_name="energy-telemetry-ingested",
         dead_letter_queue_name="pvdaq-dead-letter",
         service_bus_fully_qualified_namespace="test-sb.servicebus.windows.net",
         idempotency_table_name="PvdaqIdempotency",

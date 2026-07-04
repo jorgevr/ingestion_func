@@ -79,7 +79,7 @@
 
 **Goal**: Emit a `solar.pvdaq.dataset.available` CloudEvent per successfully stored dataset.
 
-**Independent Test**: Ingest a file, verify a CloudEvent with correct type, source, and data block (site_id, category, file_format, storage_path, ingestion_id, source_url, file_size, file_hash) appears on the configured topic.
+**Independent Test**: Ingest a file, verify a CloudEvent with correct type, source, and data block (site_id, category, file_format, storage_path, ingestion_id, source_url, file_size, file_hash) appears on the `raw-energy-events` queue on the Service Bus emulator.
 
 ### Implementation for User Story 3
 
@@ -99,7 +99,7 @@
 ### Implementation for User Story 4
 
 - [x] T020 [US4] Verify incremental detection in dispatcher — confirm `FileTrackingStore.get_unprocessed_files()` correctly filters out completed files (Status == "completed" AND LastModified unchanged). No code change expected — the existing S3 LastModified comparison is correct.
-- [x] T021 [US4] Handle re-ingestion in worker — when a file is re-ingested (status was previously completed), `stream_upload` overwrites the ADLS file and `mark_completed` updates the existing entity with new file_hash and ingestion_time via `upsert_entity`. Verify this works correctly.
+- [x] T021 [US4] Handle re-ingestion in worker — when a file is re-ingested (S3 `LastModified` changed), `get_versions()` returns the existing max version and the worker computes `version + 1`. A new versioned path is constructed via `_adls_path(…, version=N+1)` — no existing file is overwritten (append-only, FR-018). `mark_completed` creates a new tracking entity with the new version as part of the RowKey. Verify via integration test: mock `get_versions` returning `[1]`, assert ADLS path contains `_v2.csv` and the first version path is not touched.
 
 **Checkpoint**: User Story 4 complete — incremental runs are efficient
 
@@ -123,17 +123,19 @@
 
 ## Phase 8: Local Emulation (Cross-Cutting — Constitution Local Emulation Contract)
 
-**Goal**: Full local development flow using Azurite for ADLS, Queue, and Table — no real Azure resources needed.
+**Goal**: Full local development flow — Azurite for ADLS and Table, Service Bus emulator (Docker) for queues — no real Azure resources needed.
 
-**Independent Test**: Start Azurite, set `STORAGE_EMULATOR=true`, run `func start`, trigger dispatcher manually — verify files land in Azurite Blob container `bronze` and CloudEvent messages appear in Azurite Queue.
+**Independent Test**: Run `docker compose up`, set `STORAGE_EMULATOR=true`, run `func start`, trigger dispatcher manually — verify files land in Azurite Blob container `bronze` and CloudEvent messages appear in the `raw-energy-events` queue on the Service Bus emulator.
 
 ### Implementation for Local Emulation
 
-- [x] T025 [P] Create src/azurite_queue_emitter.py — implement `AzuriteQueueEmitter` class wrapping `azure-storage-queue` SDK. Expose the same interface as `ServiceBusEmitter`: `async emit_cloudevent(queue_name, envelope)`, `async emit_dead_letter(queue_name, message_body, ...)`, `async send_queue_message(queue_name, message_body, ...)`. Accept `connection_string` constructor arg (Azurite devstoreaccount1 connection string). Implement async context manager.
-- [x] T026 Add emitter factory `_make_emitter(config: HistoricalConfig) -> ServiceBusEmitter | AzuriteQueueEmitter` in function_app.py — returns `AzuriteQueueEmitter(os.environ["AzureWebJobsStorage"])` when `os.environ.get("STORAGE_EMULATOR", "").lower() == "true"`, else `ServiceBusEmitter(config.service_bus_fully_qualified_namespace)`. Update `historical_dispatcher` and `historical_worker` to use `_make_emitter(config)` instead of constructing `ServiceBusEmitter` directly.
-- [x] T027 [P] Update local.settings.json — set `"ADLS_ACCOUNT_URL": "http://127.0.0.1:10000/devstoreaccount1"` and `"STORAGE_EMULATOR": "true"` for local development. These override the current production ADLS URL when running locally.
+- [x] T025 [P] ~~Create src/azurite_queue_emitter.py~~ — **SUPERSEDED by T039**. `AzuriteQueueEmitter` was implemented under the old Azurite Queue approach; it is now dead code. See T039.
+- [x] T026 ~~Add emitter factory switching to `AzuriteQueueEmitter` when `STORAGE_EMULATOR=true`~~ — **SUPERSEDED by T040**. See T040.
+- [x] T027 [P] Update local.settings.json — set `"ADLS_ACCOUNT_URL": "http://127.0.0.1:10000/devstoreaccount1"` and `"STORAGE_EMULATOR": "true"` for local development. `STORAGE_EMULATOR` controls ADLS and Table emulation only (not Service Bus).
+- [x] T039 Remove `src/azurite_queue_emitter.py` — delete the file and remove all imports. The Service Bus emulator (Docker, `UseDevelopmentEmulator=true`) replaces Azurite Queue for Service Bus emulation; the same `ServiceBusEmitter` class is used in both local and production environments.
+- [x] T040 Simplify emitter factory in function_app.py — replace the `STORAGE_EMULATOR` conditional that returned `AzuriteQueueEmitter` with a single path: always construct `ServiceBusEmitter` using `os.environ["ServiceBusConnection"]`. Remove the `AzuriteQueueEmitter` import. The Service Bus connection string already differs between local (`UseDevelopmentEmulator=true`) and production (`ServiceBusConnection__fullyQualifiedNamespace`).
 
-**Checkpoint**: Local development works end-to-end with Azurite only
+**Checkpoint**: Local development works end-to-end — Azurite (ADLS + Table) + Service Bus emulator (queues)
 
 ---
 
@@ -198,70 +200,21 @@
 - **US4 (P2)**: Can verify after US1 correction — incremental detection independent
 - **US5 (P3)**: Independent of path correction — metrics already integrated
 
-### Remaining Open Tasks
-
-| Task | Phase | Priority | Blocks |
-| --- | --- | --- | --- |
-| T012 — Fix ADLS path | US1 | P0 (gate) | T013, T014, US2, US3 |
-| T013 — Add `last_modified` to work item | US1 | P0 (gate) | T012 |
-| T014 — Fix integration test assertion | US1 | P0 (gate) | T030 |
-| T017 — Work-item schema validation | US2 | P1 | — |
-| T025 — AzuriteQueueEmitter | Local emulation | P1 | T026 |
-| T026 — Emitter factory | Local emulation | P1 | T025 |
-| T027 — local.settings.json Azurite URL | Local emulation | P1 | — |
-| T028–T031 — Polish | Polish | P2 | all above |
-
 ### Parallel Opportunities
 
-- T012 + T025 can run in parallel (different files)
-- T013 depends on T012 being started (same function, same code block)
-- T014 + T027 can run in parallel (different files)
-- T025 + T027 can run in parallel (different files)
-- T028 + T029 can run in parallel (different docs)
-
----
-
-## Parallel Example: Correction Phase (Highest Priority)
-
-```text
-# P0 gate tasks — run sequentially (T013 depends on T012):
-T012: Fix adls_path in function_app.py (historical_worker) → _adls_path() helper
-T013: Add last_modified to work-item dict in historical_dispatcher (function_app.py)
-T014: Fix test_worker_deterministic_adls_path in tests/integration/test_historical_pipeline.py
-
-# Run in parallel alongside P0 fixes:
-T025: Create src/azurite_queue_emitter.py
-T027: Update local.settings.json
-```
+- T039 + T040 completed sequentially (T040 removed the import that T039 deleted)
+- T039/T040 ran in parallel with documentation tasks (T028, T029)
 
 ---
 
 ## Implementation Strategy
 
-### Immediate Priority (P0 — Gate Failure Resolution)
-
-1. Fix T012 — correct ADLS path in `historical_worker`
-2. Fix T013 — add `last_modified` to dispatcher work item
-3. Fix T014 — update integration test assertion
-4. **Validate**: Run `pytest tests/integration/test_historical_pipeline.py::TestWorkerIntegration::test_worker_deterministic_adls_path` — must pass
-
-### Secondary Priority (P1 — Hardening)
-
-1. T017 — work-item schema validation (Constitution II)
-2. T025 + T026 + T027 — local emulation (Constitution Local Emulation Contract)
-
-### Final (P2 — Polish)
-
-1. T028–T031 — docs + linting + full test pass
+All phases complete. Final validation: 197/197 tests pass, ruff clean.
 
 ---
 
 ## Notes
 
-- `[x]` = completed in previous implementation sessions
-- `[ ]` = open — requires implementation
-- T012 was previously marked `[x]` with wrong path; re-opened as a gate failure (Constitution VIII)
+- All 40 tasks complete. Final validation: 197/197 tests pass, ruff clean (2026-04-16).
 - Feature 001 code (csv_normalizer, record_pipeline, schema_validator, idempotency_store) is NOT modified — it remains for feature 001's per-row pipeline
-- `schema_validator.py` IS used by feature 002 for work-item validation (T017) — contrary to the original quickstart.md which listed it as unused
-- Total tasks: 31 (5 setup + 4 foundational + 6 US1 + 3 US2 + 2 US3 + 2 US4 + 3 US5 + 3 local emulation + 4 polish)
-- Open tasks: 10 (T012–T014, T017, T025–T031)
+- `schema_validator.py` IS used by feature 002 for work-item validation (T017)

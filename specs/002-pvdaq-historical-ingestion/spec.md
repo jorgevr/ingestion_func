@@ -46,7 +46,7 @@
 ### Session 2026-03-18 — Local Emulation
 
 - Q: How should ADLS Gen2 be emulated locally? → A: Azurite Blob Storage (port 10000) using the same `azure-storage-blob` SDK code path. Container `bronze`, same path structure. Switched via `STORAGE_EMULATOR=true`.
-- Q: How should Service Bus be emulated locally? → A: Azurite Queue (port 10001) using `azure-storage-queue`. Same CloudEvents envelope, different transport. Switched via same `STORAGE_EMULATOR=true` flag.
+- Q: How should Service Bus be emulated locally? → A: Azure Service Bus emulator running as a Docker container (same emulator used by processing-func). Same CloudEvents envelope, same queue name (`raw-energy-events`). Connection string uses `UseDevelopmentEmulator=true`. Azurite Queue is NOT used for Service Bus emulation — it is only used for Azure Storage Queues (AzureWebJobsStorage). The `STORAGE_EMULATOR` flag controls ADLS/Table storage emulation via Azurite, not Service Bus.
 - Q: Storage path — does it include category? → A: Path follows the constitution's partition convention: `raw/pvdaq/site_id={site_id}/year={year}/month={month}/{file_name}.csv`. Category is encoded in the filename (`{site_id}_{category}_data.csv`) and in the metadata record, not as a separate path segment.
 
 ## User Scenarios & Testing *(mandatory)*
@@ -96,7 +96,7 @@ As a data engineer, I want a dataset-level CloudEvent emitted for each successfu
 
 1. **Given** a CSV file has been stored and metadata registered, **When** the worker completes, **Then** a CloudEvent of type `solar.pvdaq.dataset.available` is emitted containing site_id, category, file_format, storage_path, and ingestion_id.
 2. **Given** the message bus is temporarily unavailable, **When** event emission fails, **Then** the system retries before marking the dataset as failed.
-3. **Given** `STORAGE_EMULATOR=true`, **When** the event is emitted, **Then** it is sent to an Azurite Queue (port 10001) instead of Service Bus, using the same CloudEvents envelope.
+3. **Given** running locally with the Service Bus emulator, **When** the event is emitted, **Then** it is sent to the `raw-energy-events` queue on the Service Bus emulator using the same CloudEvents envelope.
 
 ---
 
@@ -149,7 +149,7 @@ As an operations engineer, I want structured logs and summary metrics emitted af
 - **FR-003**: System MUST download each CSV file using streaming/chunked reads to keep memory usage bounded regardless of file size.
 - **FR-004**: System MUST store each downloaded CSV file in the bronze container (`bronze`) at the deterministic path `source=pvdaq/dataset={site_id}_{category}/ingestion_date={YYYY-MM-DD}/{site_id}_{category}_v{version}.csv`. `ingestion_date` is the UTC calendar date at the moment of ingestion (not the S3 LastModified date). `version` is an incrementing integer starting at 1. Each ingestion of the same logical dataset creates a new version file; existing files are never overwritten or deleted (append-only). In production the container is an ADLS Gen2 filesystem named `bronze`; in local development (`STORAGE_EMULATOR=true`) the target is Azurite Blob Storage container `bronze` (port 10000), configured via `ADLS_CONTAINER_NAME=bronze`.
 - **FR-005**: System MUST register metadata for each ingested dataset by extending the `PvdaqFileTracking` table entity with: source_url, storage_path, file_size, ingestion_time, file_hash (SHA-256), ingestion_id, and version (integer).
-- **FR-006**: System MUST emit a dataset-level CloudEvent of type `solar.pvdaq.dataset.available` indicating that a new dataset is available. The event data block includes: site_id, category, file_format, storage_path, ingestion_id, source_url, file_size, and file_hash (per `contracts/dataset-event.json`). In local development (`STORAGE_EMULATOR=true`), the event MUST be sent to an Azurite Queue instead of Service Bus.
+- **FR-006**: System MUST emit a dataset-level CloudEvent of type `solar.pvdaq.dataset.available` indicating that a new dataset is available. The event data block includes: site_id, category, file_format, storage_path, ingestion_id, source_url, file_size, and file_hash (per `contracts/dataset-event.json`). The event MUST be sent to the Service Bus queue named `SERVICE_BUS_QUEUE_NAME` (`raw-energy-events` by default). In production, the Service Bus namespace is identified by `ServiceBusConnection__fullyQualifiedNamespace`; in local development, the same queue is hosted on the Azure Service Bus emulator (Docker). Azure Service Bus Basic tier is used — topics and subscriptions are not available; all communication uses queues.
 - **FR-007**: System MUST dead-letter dataset-level failures (download failed, file corrupt, storage write failed) to a dead-letter queue with the file reference, failure reason, and correlation ID.
 - **FR-008**: System MUST check each file against a file tracking store before processing and skip files that have already been successfully ingested. The idempotency key is composed of `site_id + category + file_name`.
 - **FR-009**: System MUST retry failed HTTP requests to S3 (5xx errors and timeouts) with exponential backoff, up to a configurable maximum number of retries (default: 3).
@@ -231,12 +231,16 @@ Fields null at bronze (`event_time_start/end`, `data_profile.*` except `row_coun
 
 ## Local vs Production Behaviour
 
-| Concern        | Local (`STORAGE_EMULATOR=true`)      | Production                                |
-| -------------- | ------------------------------------ | ----------------------------------------- |
-| Bronze storage | Azurite Blob port 10000 (`bronze`)   | ADLS Gen2 raw container                   |
-| Event emission | Azurite Queue port 10001             | Service Bus topic                         |
-| Table storage  | Azurite Table port 10002             | Azure Table Storage                       |
-| Auth           | Connection string (devstoreaccount1) | DefaultAzureCredential (managed identity) |
+| Concern        | Local                                                         | Production                                                                 |
+| -------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| Bronze storage | Azurite Blob port 10000 (`bronze`)                            | ADLS Gen2 bronze container                                                 |
+| Event emission | Service Bus emulator (Docker) — queue `raw-energy-events`     | Service Bus queue `raw-energy-events` (`jorgevr.servicebus.windows.net`)   |
+| Work queue     | Service Bus emulator (Docker) — queue `pvdaq-historical-work` | Service Bus queue `pvdaq-historical-work`                                  |
+| Dead letter    | Service Bus emulator (Docker) — queue `pvdaq-dead-letter`     | Service Bus queue `pvdaq-dead-letter`                                      |
+| Table storage  | Azurite Table port 10002                                      | Azure Table Storage                                                        |
+| Auth           | Connection string (devstoreaccount1) / emulator connection    | `ServiceBusConnection__fullyQualifiedNamespace` + `DefaultAzureCredential` |
+
+> **Note**: Azure Service Bus Basic tier is in use. Topics and subscriptions are not available. All inter-service communication uses queues.
 
 ## Success Criteria *(mandatory)*
 

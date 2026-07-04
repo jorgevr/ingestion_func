@@ -58,7 +58,7 @@ class TestValidPayloadEndToEnd:
         mock_sender.__aexit__ = AsyncMock(return_value=False)
 
         mock_client = MagicMock()
-        mock_client.get_topic_sender = MagicMock(return_value=mock_sender)
+        mock_client.get_queue_sender = MagicMock(return_value=mock_sender)
         mock_client.close = AsyncMock()
 
         emitter = ServiceBusEmitter(
@@ -67,7 +67,7 @@ class TestValidPayloadEndToEnd:
         )
 
         await emitter.emit_cloudevent(
-            topic_name=mock_config.service_bus_topic_name,
+            topic_name=mock_config.service_bus_queue_name,
             envelope=envelope,
         )
 

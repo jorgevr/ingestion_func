@@ -28,6 +28,7 @@ cd src; pytest; ruff check .
 Python 3.11+ (Azure Functions v4 Isolated Worker, v2 programming model): Follow standard conventions
 
 ## Recent Changes
+
 - 002-pvdaq-historical-ingestion: Added Python 3.11+, Azure Functions v4 Isolated Worker (v2 programming model) + azure-functions, azure-servicebus, azure-data-tables, azure-identity,
 - 002-pvdaq-historical-ingestion: Added Python 3.11+ (Azure Functions v4 Isolated Worker, v2 programming model) + azure-functions, azure-servicebus, azure-data-tables, azure-identity, azure-storage-file-datalake (NEW), httpx, aiohttp
 - 002-pvdaq-historical-ingestion: Added Python 3.11+ (Azure Functions v4 Isolated Worker, v2 programming model) + azure-functions, azure-servicebus, azure-data-tables, azure-identity, httpx, jsonschema (all already in requirements.txt)
@@ -38,6 +39,5 @@ Python 3.11+ (Azure Functions v4 Isolated Worker, v2 programming model): Follow 
 
 Read all skill files in `.claude/skills/` before making any changes.
 Apply these standards to all code in this project.
-
 
 <!-- MANUAL ADDITIONS END -->

@@ -7,6 +7,12 @@ dist/
 .venv/
 venv/
 
+# Azurite emulator runtime data (VS Code extension)
+AzuriteConfig
+
+# Azurite Docker volume data
+azurite-data/
+
 # Azurite emulator runtime data
 __blobstorage__/
 __queuestorage__/

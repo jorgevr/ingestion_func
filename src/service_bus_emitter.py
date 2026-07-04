@@ -51,57 +51,36 @@ class ServiceBusEmitter:
 
     Args:
         fully_qualified_namespace: The ``<name>.servicebus.windows.net`` namespace.
+            Used with ``DefaultAzureCredential`` when ``connection_string`` is not set.
+        connection_string: Full Service Bus connection string (e.g. for the local emulator).
+            Takes precedence over ``fully_qualified_namespace`` when provided.
         client: Optional pre-built ``ServiceBusClient`` for dependency injection
-            and testability.  When *None*, a client is created using
-            ``DefaultAzureCredential``.
+            and testability.  When *None*, a client is created automatically.
     """
 
     def __init__(
         self,
-        fully_qualified_namespace: str,
+        fully_qualified_namespace: str | None = None,
         client: ServiceBusClient | None = None,
+        connection_string: str | None = None,
     ) -> None:
         self._namespace = fully_qualified_namespace
+        self._connection_string = connection_string
         self._client = client
         self._credential: DefaultAzureCredential | None = None
         self._owns_client = client is None
 
     async def _get_client(self) -> ServiceBusClient:
         if self._client is None:
-            self._credential = DefaultAzureCredential()
-            self._client = ServiceBusClient(
-                fully_qualified_namespace=self._namespace,
-                credential=self._credential,
-            )
+            if self._connection_string:
+                self._client = ServiceBusClient.from_connection_string(self._connection_string)
+            else:
+                self._credential = DefaultAzureCredential()
+                self._client = ServiceBusClient(
+                    fully_qualified_namespace=self._namespace,
+                    credential=self._credential,
+                )
         return self._client
-
-    async def emit_event(
-        self,
-        topic_name: str,
-        message_body: dict[str, Any],
-        content_type: str,
-        subject: str,
-        application_properties: dict[str, Any] | None = None,
-    ) -> None:
-        """Send a single message to a Service Bus topic.
-
-        Args:
-            topic_name: Target topic name.
-            message_body: Message payload (will be JSON-serialised).
-            content_type: MIME content type for the message.
-            subject: Message subject / label.
-            application_properties: Optional custom properties attached to the message.
-        """
-        client = await self._get_client()
-        sender: ServiceBusSender
-        async with client.get_topic_sender(topic_name=topic_name) as sender:
-            message = ServiceBusMessage(
-                body=json.dumps(message_body),
-                content_type=content_type,
-                subject=subject,
-                application_properties=application_properties,
-            )
-            await sender.send_messages(message)
 
     async def send_queue_message(
         self,
@@ -150,15 +129,16 @@ class ServiceBusEmitter:
         topic_name: str,
         envelope: dict,
     ) -> None:
-        """Send a CloudEvents envelope to a Service Bus topic.
+        """Send a CloudEvents envelope to a Service Bus queue.
 
         Args:
-            topic_name: Target topic name.
+            topic_name: Target queue name (parameter kept as ``topic_name`` for
+                interface compatibility; always routes to a queue — Basic tier only).
             envelope: A CloudEvents envelope dict (will be JSON-serialised).
         """
         client = await self._get_client()
         sender: ServiceBusSender
-        async with client.get_topic_sender(topic_name=topic_name) as sender:
+        async with client.get_queue_sender(queue_name=topic_name) as sender:
             message = ServiceBusMessage(
                 body=json.dumps(envelope),
                 content_type="application/cloudevents+json",

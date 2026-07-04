@@ -95,7 +95,7 @@ async def process_record(
         source=source,
     )
     await emitter.emit_cloudevent(
-        topic_name=config.service_bus_topic_name,
+        topic_name=config.service_bus_queue_name,
         envelope=envelope,
     )
     stats.number_emitted += 1

@@ -23,7 +23,7 @@ def _base_env() -> dict[str, str]:
         "PVDAQ_SITE_IDS": "2",
         "PVDAQ_LOOKBACK_HOURS": "24",
         "PVDAQ_CRON_SCHEDULE": "0 */15 * * * *",
-        "SERVICE_BUS_TOPIC_NAME": "energy-telemetry-ingested",
+        "SERVICE_BUS_QUEUE_NAME": "energy-telemetry-ingested",
         "DEAD_LETTER_QUEUE_NAME": "pvdaq-dead-letter",
         "ServiceBusConnection__fullyQualifiedNamespace": "test-sb.servicebus.windows.net",
         "IDEMPOTENCY_TABLE_NAME": "PvdaqIdempotency",
@@ -43,7 +43,7 @@ class TestLoadConfigValid:
         assert cfg.pvdaq_site_ids == [2]
         assert cfg.pvdaq_lookback_hours == 24
         assert cfg.pvdaq_cron_schedule == "0 */15 * * * *"
-        assert cfg.service_bus_topic_name == "energy-telemetry-ingested"
+        assert cfg.service_bus_queue_name == "energy-telemetry-ingested"
         assert cfg.dead_letter_queue_name == "pvdaq-dead-letter"
         assert cfg.service_bus_fully_qualified_namespace == "test-sb.servicebus.windows.net"
         assert cfg.idempotency_table_name == "PvdaqIdempotency"
@@ -188,9 +188,9 @@ class TestMissingRequired:
 
     def test_missing_service_bus_topic_raises(self) -> None:
         env = _base_env()
-        del env["SERVICE_BUS_TOPIC_NAME"]
+        del env["SERVICE_BUS_QUEUE_NAME"]
         with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ConfigurationError, match="SERVICE_BUS_TOPIC_NAME"):
+            with pytest.raises(ConfigurationError, match="SERVICE_BUS_QUEUE_NAME"):
                 load_config()
 
     def test_missing_lookback_hours_raises(self) -> None:
@@ -202,24 +202,24 @@ class TestMissingRequired:
 
     def test_missing_multiple_settings_lists_all(self) -> None:
         env = _base_env()
-        del env["SERVICE_BUS_TOPIC_NAME"]
+        del env["SERVICE_BUS_QUEUE_NAME"]
         del env["DEAD_LETTER_QUEUE_NAME"]
         with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ConfigurationError, match="SERVICE_BUS_TOPIC_NAME"):
+            with pytest.raises(ConfigurationError, match="SERVICE_BUS_QUEUE_NAME"):
                 load_config()
 
     def test_empty_string_treated_as_missing(self) -> None:
         env = _base_env()
-        env["SERVICE_BUS_TOPIC_NAME"] = ""
+        env["SERVICE_BUS_QUEUE_NAME"] = ""
         with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ConfigurationError, match="SERVICE_BUS_TOPIC_NAME"):
+            with pytest.raises(ConfigurationError, match="SERVICE_BUS_QUEUE_NAME"):
                 load_config()
 
     def test_whitespace_only_treated_as_missing(self) -> None:
         env = _base_env()
-        env["SERVICE_BUS_TOPIC_NAME"] = "   "
+        env["SERVICE_BUS_QUEUE_NAME"] = "   "
         with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ConfigurationError, match="SERVICE_BUS_TOPIC_NAME"):
+            with pytest.raises(ConfigurationError, match="SERVICE_BUS_QUEUE_NAME"):
                 load_config()
 
     def test_invalid_site_ids_raises(self) -> None:
@@ -261,7 +261,7 @@ def _historical_env() -> dict[str, str]:
         "PVDAQ_HISTORICAL_SITE_IDS": "9068,9069,2107,7333",
         "PVDAQ_HISTORICAL_CRON_SCHEDULE": "0 0 */6 * * *",
         "PVDAQ_HISTORICAL_QUEUE_NAME": "pvdaq-historical-work",
-        "SERVICE_BUS_TOPIC_NAME": "raw-energy-events",
+        "SERVICE_BUS_QUEUE_NAME": "raw-energy-events",
         "DEAD_LETTER_QUEUE_NAME": "pvdaq-dead-letter",
         "ServiceBusConnection__fullyQualifiedNamespace": "test-sb.servicebus.windows.net",
         "FILE_TRACKING_TABLE_NAME": "PvdaqFileTracking",
@@ -284,7 +284,7 @@ class TestLoadHistoricalConfigValid:
         assert cfg.pvdaq_historical_cron_schedule == "0 0 */6 * * *"
         assert cfg.pvdaq_historical_queue_name == "pvdaq-historical-work"
         assert cfg.file_tracking_table_name == "PvdaqFileTracking"
-        assert cfg.service_bus_topic_name == "raw-energy-events"
+        assert cfg.service_bus_queue_name == "raw-energy-events"
         assert cfg.dead_letter_queue_name == "pvdaq-dead-letter"
         assert cfg.adls_account_url == "https://testaccount.dfs.core.windows.net"
         assert cfg.adls_container_name == "raw"

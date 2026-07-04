@@ -30,7 +30,7 @@ def _historical_config() -> HistoricalConfig:
         pvdaq_historical_site_ids=[9068, 9069, 2107, 7333],
         pvdaq_historical_cron_schedule="0 0 */6 * * *",
         pvdaq_historical_queue_name="pvdaq-historical-work",
-        service_bus_topic_name="raw-energy-events",
+        service_bus_queue_name="raw-energy-events",
         dead_letter_queue_name="pvdaq-dead-letter",
         service_bus_fully_qualified_namespace="test-sb.servicebus.windows.net",
         file_tracking_table_name="PvdaqFileTracking",

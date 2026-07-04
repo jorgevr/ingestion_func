@@ -1,22 +1,24 @@
 <!--
   Sync Impact Report
   ==================
-  Version change: 1.2.0 → 1.3.0
+  Version change: 1.3.0 → 1.4.0
   Modified principles:
-    - VII (Event Emission Rules): clarified that dataset-level
-      ({domain}.{vendor}.{entity}.{action}) is the canonical pattern for
-      all ingestion paths; per-row emission is explicitly downstream
-  Added sections / clauses:
-    - Principle VIII (Raw Dataset Storage — Bronze Layer): mandates ADLS
-      Gen2 (or Azurite Blob locally) as the raw storage tier; defines
-      deterministic path convention, streaming write requirement, and
-      file-hash integrity requirement
-    - Development Workflow: Local Emulation Contract — Azurite Blob must
-      stand in for ADLS Gen2, Azurite Queue must stand in for Service Bus
-      in local development; same SDK code path, different endpoints
-    - Ownership Boundaries: added ADLS bronze writes and blob client
-      management to "This Service Owns"; added row-level parsing and
-      downstream event routing to "This Service Does NOT Own"
+    - VIII (Raw Dataset Storage — Bronze Layer): updated deterministic
+      path convention to the ratified bronze layer folder structure:
+      `source=pvdaq/dataset={site_id}_{category}/ingestion_date=YYYY-MM-DD/{dataset}_v{version}.csv`.
+      Added append-only versioning requirement. Supersedes the
+      `raw/{vendor}/site_id=…/year=…/month=…` path from v1.3.0.
+  Modified sections:
+    - Development Workflow / Local Emulation Contract: replaced
+      "Azurite Queue (port 10001) / azure-storage-queue" row with
+      "Azure Service Bus emulator (Docker) / azure-servicebus".
+      Rationale: Azure Service Bus Basic tier does not support topics
+      or subscriptions; the official Microsoft Service Bus emulator
+      provides queue semantics identical to production. Azurite Queue
+      is no longer an acceptable substitute for Service Bus.
+    - Ownership Boundaries: updated "Emission to…" bullet to remove
+      "Azurite Queue (local)" and replace with "Service Bus emulator
+      (Docker) (local)".
   Removed sections: None
   Templates requiring updates:
     - .specify/templates/plan-template.md — ✅ no update needed
@@ -211,9 +213,15 @@ container (bronze layer) before any event is emitted.
 
 - Files MUST be written using streaming/chunked uploads so that memory
   usage remains bounded regardless of file size.
-- Files MUST be stored at a deterministic, partition-friendly path:
-  `raw/{vendor}/site_id={site_id}/year={year}/month={month}/{file_name}`
-  (e.g., `raw/pvdaq/site_id=9068/year=2024/month=01/9068_ac_power_data.csv`).
+- Files MUST be stored at a deterministic, partition-friendly path following
+  the bronze layer folder convention:
+  `source={vendor}/dataset={site_id}_{category}/ingestion_date={YYYY-MM-DD}/{dataset}_v{version}.csv`
+  (e.g., `source=pvdaq/dataset=9068_ac_power/ingestion_date=2024-01-15/9068_ac_power_v1.csv`).
+  `ingestion_date` is the UTC calendar date of ingestion, NOT the source
+  file's last-modified date. `version` is an incrementing integer starting
+  at 1; each ingestion of the same logical dataset creates a new version.
+- Storage MUST be append-only. Files MUST NOT be overwritten or deleted;
+  re-ingestion of a changed source file creates a new version.
 - A SHA-256 file hash MUST be computed during streaming upload and
   stored in dataset metadata for downstream integrity verification.
 - Event emission MUST NOT occur until the file write has been confirmed
@@ -238,7 +246,7 @@ replay source if downstream failures occur.
 - Dataset metadata registration (file tracking store)
 - File-level idempotency — skip files already successfully ingested
 - Dataset-level CloudEvent emission (`solar.pvdaq.dataset.available`)
-- Emission to Event Grid / Service Bus (prod) or Azurite Queue (local)
+- Emission to Service Bus queue (prod) or Service Bus emulator queue (local)
 - Observability at the ingestion boundary
 
 ### This Service Does NOT Own
@@ -280,11 +288,19 @@ All local development MUST emulate Azure cloud services using Azurite
 so that no real Azure resources are required to run or test the service
 locally. The contract is:
 
-| Production service      | Local emulator                    | SDK used               |
-| ----------------------- | --------------------------------- | ---------------------- |
-| ADLS Gen2 (bronze)      | Azurite Blob (port 10000)         | `azure-storage-blob`   |
-| Service Bus topic/queue | Azurite Queue (port 10001)        | `azure-storage-queue`  |
-| Azure Table Storage     | Azurite Table (port 10002)        | `azure-data-tables`    |
+| Production service      | Local emulator                            | SDK used               |
+| ----------------------- | ----------------------------------------- | ---------------------- |
+| ADLS Gen2 (bronze)      | Azurite Blob (port 10000)                 | `azure-storage-blob`   |
+| Service Bus (queue)     | Azure Service Bus emulator (Docker)       | `azure-servicebus`     |
+| Azure Table Storage     | Azurite Table (port 10002)                | `azure-data-tables`    |
+
+> **Note**: Azure Service Bus Basic tier is in use — topics and subscriptions
+> are not available. All inter-service communication uses queues. Azurite Queue
+> (`azure-storage-queue`) is **not** a substitute for Service Bus; the official
+> Microsoft Service Bus emulator MUST be used for local development. A
+> `docker-compose.yml` at the service root MUST define the Service Bus emulator
+> container alongside Azurite so that `docker compose up` provides a complete
+> local dev environment with no cloud dependency.
 
 - Code MUST use the same Azure SDK interfaces for both environments.
   Environment selection MUST be controlled by a single environment
@@ -317,4 +333,4 @@ energy-ingestion-boundary repository. Amendments require:
 All pull requests and code reviews MUST verify compliance with these
 principles. Violations MUST be resolved before merge.
 
-**Version**: 1.3.0 | **Ratified**: 2026-02-19 | **Last Amended**: 2026-03-18
+**Version**: 1.4.0 | **Ratified**: 2026-02-19 | **Last Amended**: 2026-04-15

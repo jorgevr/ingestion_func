@@ -34,7 +34,7 @@ class Config:
     pvdaq_cron_schedule: str
 
     # Service Bus
-    service_bus_topic_name: str
+    service_bus_queue_name: str
     dead_letter_queue_name: str
     service_bus_fully_qualified_namespace: str
 
@@ -62,7 +62,7 @@ class HistoricalConfig:
 
     # Service Bus
     pvdaq_historical_queue_name: str
-    service_bus_topic_name: str
+    service_bus_queue_name: str
     dead_letter_queue_name: str
     service_bus_fully_qualified_namespace: str
 
@@ -83,11 +83,15 @@ class HistoricalConfig:
 _REQUIRED_SETTINGS: list[str] = [
     "PVDAQ_LOOKBACK_HOURS",
     "PVDAQ_CRON_SCHEDULE",
-    "SERVICE_BUS_TOPIC_NAME",
+    "SERVICE_BUS_QUEUE_NAME",
     "DEAD_LETTER_QUEUE_NAME",
-    "ServiceBusConnection__fullyQualifiedNamespace",
     "IDEMPOTENCY_TABLE_NAME",
     "TableStorageConnection__tableServiceUri",
+]
+
+# Required only when ServiceBusConnection (connection string) is not set
+_REQUIRED_WHEN_NO_CONN_STR: list[str] = [
+    "ServiceBusConnection__fullyQualifiedNamespace",
 ]
 
 
@@ -119,6 +123,8 @@ def load_config() -> Config:
         ConfigurationError: If any required setting is missing or invalid.
     """
     missing = [name for name in _REQUIRED_SETTINGS if not os.environ.get(name, "").strip()]
+    if not os.environ.get("ServiceBusConnection", "").strip():
+        missing += [n for n in _REQUIRED_WHEN_NO_CONN_STR if not os.environ.get(n, "").strip()]
     if missing:
         raise ConfigurationError(
             f"Missing required configuration setting(s): {', '.join(missing)}"
@@ -142,7 +148,7 @@ def load_config() -> Config:
         pvdaq_site_count=int(os.environ.get("PVDAQ_SITE_COUNT", "30").strip()),
         pvdaq_lookback_hours=int(_require("PVDAQ_LOOKBACK_HOURS")),
         pvdaq_cron_schedule=_require("PVDAQ_CRON_SCHEDULE"),
-        service_bus_topic_name=_require("SERVICE_BUS_TOPIC_NAME"),
+        service_bus_queue_name=_require("SERVICE_BUS_QUEUE_NAME"),
         dead_letter_queue_name=_require("DEAD_LETTER_QUEUE_NAME"),
         service_bus_fully_qualified_namespace=_require(
             "ServiceBusConnection__fullyQualifiedNamespace"
@@ -159,9 +165,8 @@ _HISTORICAL_REQUIRED_SETTINGS: list[str] = [
     "PVDAQ_HISTORICAL_SITE_IDS",
     "PVDAQ_HISTORICAL_CRON_SCHEDULE",
     "PVDAQ_HISTORICAL_QUEUE_NAME",
-    "SERVICE_BUS_TOPIC_NAME",
+    "SERVICE_BUS_QUEUE_NAME",
     "DEAD_LETTER_QUEUE_NAME",
-    "ServiceBusConnection__fullyQualifiedNamespace",
     "FILE_TRACKING_TABLE_NAME",
     "TableStorageConnection__tableServiceUri",
     "ADLS_ACCOUNT_URL",
@@ -182,6 +187,8 @@ def load_historical_config() -> HistoricalConfig:
         name for name in _HISTORICAL_REQUIRED_SETTINGS
         if not os.environ.get(name, "").strip()
     ]
+    if not os.environ.get("ServiceBusConnection", "").strip():
+        missing += [n for n in _REQUIRED_WHEN_NO_CONN_STR if not os.environ.get(n, "").strip()]
     if missing:
         raise ConfigurationError(
             f"Missing required configuration setting(s): {', '.join(missing)}"
@@ -200,7 +207,7 @@ def load_historical_config() -> HistoricalConfig:
         pvdaq_historical_site_ids=site_ids,
         pvdaq_historical_cron_schedule=_require("PVDAQ_HISTORICAL_CRON_SCHEDULE"),
         pvdaq_historical_queue_name=_require("PVDAQ_HISTORICAL_QUEUE_NAME"),
-        service_bus_topic_name=_require("SERVICE_BUS_TOPIC_NAME"),
+        service_bus_queue_name=_require("SERVICE_BUS_QUEUE_NAME"),
         dead_letter_queue_name=_require("DEAD_LETTER_QUEUE_NAME"),
         service_bus_fully_qualified_namespace=_require(
             "ServiceBusConnection__fullyQualifiedNamespace"

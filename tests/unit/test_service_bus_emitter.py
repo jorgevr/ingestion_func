@@ -1,6 +1,6 @@
 """Unit tests for src.service_bus_emitter — Service Bus SDK sender.
 
-Tests cover: emit_event method, emit_cloudevent method, emit_dead_letter method,
+Tests cover: emit_cloudevent method, emit_dead_letter method, send_queue_message,
 _get_client real-credential creation path, close/context manager lifecycle.
 
 Mocked: Azure Service Bus SDK requires real Azure credentials and a
@@ -35,43 +35,13 @@ def _mock_client(topic_sender: AsyncMock | None = None, queue_sender: AsyncMock 
     return client
 
 
-class TestEmitEvent:
-    """emit_event sends a JSON message to a Service Bus topic."""
-
-    @pytest.mark.asyncio
-    async def test_sends_message_to_topic(self) -> None:
-        sender = _mock_sender()
-        client = _mock_client(topic_sender=sender)
-        emitter = ServiceBusEmitter(
-            fully_qualified_namespace="test.servicebus.windows.net",
-            client=client,
-        )
-
-        await emitter.emit_event(
-            topic_name="test-topic",
-            message_body={"key": "value"},
-            content_type="application/json",
-            subject="test-subject",
-            application_properties={"custom": "prop"},
-        )
-
-        client.get_topic_sender.assert_called_once_with(topic_name="test-topic")
-        sender.send_messages.assert_awaited_once()
-
-        # Verify message content
-        sent_message = sender.send_messages.call_args[0][0]
-        raw_body = b"".join(sent_message.body)
-        body = json.loads(raw_body)
-        assert body == {"key": "value"}
-
-
 class TestEmitCloudevent:
-    """emit_cloudevent sends a CloudEvents envelope to a Service Bus topic."""
+    """emit_cloudevent sends a CloudEvents envelope to a Service Bus queue (Basic tier)."""
 
     @pytest.mark.asyncio
     async def test_sends_cloudevent_with_properties(self) -> None:
         sender = _mock_sender()
-        client = _mock_client(topic_sender=sender)
+        client = _mock_client(queue_sender=sender)
         emitter = ServiceBusEmitter(
             fully_qualified_namespace="test.servicebus.windows.net",
             client=client,
@@ -79,19 +49,20 @@ class TestEmitCloudevent:
 
         envelope = {
             "specversion": "1.0",
-            "type": "raw.pvdaq.generation.v1",
+            "type": "solar.pvdaq.dataset.available",
             "source_vendor": "PVDAQ",
             "schema_version": "v1",
-            "data": {"SiteID": 2},
+            "data": {"site_id": 9068},
         }
 
-        await emitter.emit_cloudevent(topic_name="test-topic", envelope=envelope)
+        await emitter.emit_cloudevent(topic_name="raw-energy-events", envelope=envelope)
 
+        client.get_queue_sender.assert_called_once_with(queue_name="raw-energy-events")
         sender.send_messages.assert_awaited_once()
         sent_message = sender.send_messages.call_args[0][0]
         raw_body = b"".join(sent_message.body)
         body = json.loads(raw_body)
-        assert body["type"] == "raw.pvdaq.generation.v1"
+        assert body["type"] == "solar.pvdaq.dataset.available"
 
 
 class TestGetClientCreatesCredential:

@@ -20,7 +20,7 @@ def _env_vars() -> dict[str, str]:
         "PVDAQ_SITE_IDS": "2,34",
         "PVDAQ_LOOKBACK_HOURS": "1",
         "PVDAQ_CRON_SCHEDULE": "0 */15 * * * *",
-        "SERVICE_BUS_TOPIC_NAME": "raw-energy-events",
+        "SERVICE_BUS_QUEUE_NAME": "raw-energy-events",
         "DEAD_LETTER_QUEUE_NAME": "pvdaq-dead-letter",
         "ServiceBusConnection__fullyQualifiedNamespace": "test.servicebus.windows.net",
         "IDEMPOTENCY_TABLE_NAME": "PvdaqIdempotency",

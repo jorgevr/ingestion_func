@@ -21,7 +21,6 @@ import azure.functions as func
 from jsonschema import Draft202012Validator, ValidationError
 
 from src.adls_store import AdlsStore, AdlsUploadError
-from src.azurite_queue_emitter import AzuriteQueueEmitter
 from src.cloudevents_envelope import build_dataset_envelope
 from src.config import load_config, load_historical_config
 from src.file_tracking_store import FileTrackingStore
@@ -50,6 +49,21 @@ app = func.FunctionApp()
 # ---------------------------------------------------------------------------
 
 _WORK_ITEM_VALIDATOR: Draft202012Validator | None = None
+
+
+def _adls_uri(account_url: str, container: str, path: str) -> str:
+    """Build a full ADLS URI from account URL, container, and relative path.
+
+    For Azurite (HTTP), returns ``http://host/account/container/path``.
+    For production (HTTPS DFS endpoint), returns ``abfss://container@account.dfs.core.windows.net/path``.
+    """
+    from urllib.parse import urlparse
+    parsed = urlparse(account_url)
+    if parsed.scheme == "http":
+        return f"{account_url.rstrip('/')}/{container}/{path}"
+    # Production: https://account.dfs.core.windows.net → abfss://container@account.dfs.core.windows.net/path
+    account_name = parsed.hostname.split(".")[0]
+    return f"abfss://{container}@{account_name}.dfs.core.windows.net/{path}"
 
 
 def _get_work_item_validator() -> Draft202012Validator:
@@ -109,15 +123,19 @@ def _storage_connection_string() -> str | None:
 
 
 def _make_emitter(config):
-    """Return the appropriate emitter based on STORAGE_EMULATOR env var.
+    """Return a ServiceBusEmitter for the current environment.
 
-    Returns an AzuriteQueueEmitter when ``STORAGE_EMULATOR=true``
-    (local development), otherwise a ServiceBusEmitter (production).
+    Local development: ``ServiceBusConnection`` env var contains the emulator
+    connection string (``UseDevelopmentEmulator=true``).
+    Production: ``ServiceBusConnection__fullyQualifiedNamespace`` is used with
+    ``DefaultAzureCredential`` (Managed Identity).
     """
-    if os.environ.get("STORAGE_EMULATOR", "").lower() == "true":
-        conn_str = os.environ.get("AzureWebJobsStorage", "UseDevelopmentStorage=true")
-        return AzuriteQueueEmitter(connection_string=conn_str)
-    return ServiceBusEmitter(config.service_bus_fully_qualified_namespace)
+    sb_conn_str = os.environ.get("ServiceBusConnection", "").strip()
+    if sb_conn_str:
+        return ServiceBusEmitter(connection_string=sb_conn_str)
+    return ServiceBusEmitter(
+        fully_qualified_namespace=config.service_bus_fully_qualified_namespace,
+    )
 
 
 def _date_range(lookback_hours: int) -> list[tuple[int, int, int]]:
@@ -185,9 +203,7 @@ async def pvdaq_ingestion(timer: func.TimerRequest) -> None:
         bucket_url=config.oedi_bucket_url,
         systems_key=config.oedi_systems_key,
         data_prefix=config.oedi_data_prefix,
-    ) as oedi_client, ServiceBusEmitter(
-        fully_qualified_namespace=config.service_bus_fully_qualified_namespace,
-    ) as emitter, IdempotencyStore(
+    ) as oedi_client, _make_emitter(config) as emitter, IdempotencyStore(
         table_name=config.idempotency_table_name,
         table_service_uri=config.table_storage_uri,
     ) as idem_store:
@@ -550,7 +566,7 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
                     "site_id": site_id,
                     "category": category,
                     "file_format": "csv",
-                    "storage_path": adls_path,
+                    "storage_path": _adls_uri(config.adls_account_url, config.adls_container_name, adls_path),
                     "version": version,
                     "ingestion_id": ingestion_id,
                     "source_url": source_url,
@@ -563,7 +579,7 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
                 ingestion_timestamp=ingestion_time,
             )
             await emitter.emit_cloudevent(
-                topic_name=config.service_bus_topic_name,
+                topic_name=config.service_bus_queue_name,
                 envelope=envelope,
             )
             stats.datasets_emitted = 1

@@ -102,7 +102,7 @@ See [research.md](research.md) for full findings.
 | ADLS path format | `raw/pvdaq/site_id={site_id}/year={year}/month={month}/{file_name}` — from spec FR-004 and Constitution VIII. `year`/`month` derived in UTC from S3 `LastModified`. |
 | Work-item contract gap | Add `last_modified` field to `work-item-message.json` so worker can derive year/month without a second S3 call. |
 | Local ADLS emulation | Azurite Blob (port 10000) using same `azure-storage-file-datalake` SDK. Switch via `ADLS_ACCOUNT_URL=http://127.0.0.1:10000/devstoreaccount1` when `STORAGE_EMULATOR=true`. |
-| Local Service Bus emulation | Azurite Queue (port 10001) via `azure-storage-queue`. Worker and dispatcher switch emitter type based on `STORAGE_EMULATOR=true`. |
+| Local Service Bus emulation | Azure Service Bus emulator (Docker). Same queue names (`raw-energy-events`, `pvdaq-historical-work`, `pvdaq-dead-letter`) as production. `ServiceBusConnection` uses `UseDevelopmentEmulator=true`. Azurite Queue is NOT used for Service Bus. |
 | File change detection | Compare S3 `LastModified` (from current listing) against `LastModified` stored in tracking entity. Size check is a secondary guard and can remain. |
 | Schema validation for queue messages | Reuse existing `SchemaValidator` from `schema_validator.py` with `work-item-message.json`. Validate at top of `historical_worker` before any processing. |
 | S3 listing pagination | Already implemented — `OediHistoricalClient.list_csv_files` loops on `IsTruncated` / `NextContinuationToken`. |
@@ -178,9 +178,10 @@ When `STORAGE_EMULATOR=true` (or `AzureWebJobsStorage == "UseDevelopmentStorage=
 
 - ADLS: set `ADLS_ACCOUNT_URL=http://127.0.0.1:10000/devstoreaccount1` in `local.settings.json`
   (no code change needed — `AdlsStore` already accepts `account_url` from config)
-- Service Bus → Azurite Queue: a thin `AzuriteQueueEmitter` wraps `azure-storage-queue` and
-  implements the same `emit_cloudevent` / `emit_dead_letter` / `send_queue_message` interface.
-  `function_app.py` selects the emitter type based on `STORAGE_EMULATOR` env var.
+- Service Bus (local + prod): `ServiceBusEmitter` uses `azure-servicebus` for all environments.
+  Locally the Service Bus emulator (Docker, `UseDevelopmentEmulator=true`) is used; in production
+  `ServiceBusConnection__fullyQualifiedNamespace` points to `jorgevr.servicebus.windows.net`.
+  Azurite Queue (`azure-storage-queue`) is NOT used. `STORAGE_EMULATOR` controls only ADLS/Table emulation.
 
 #### D-005: Integration Test Path Assertion Update
 
