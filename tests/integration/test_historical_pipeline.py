@@ -61,13 +61,17 @@ class TestDispatcherIntegration:
         ]
 
         mock_oedi = AsyncMock()
-        mock_oedi.list_csv_files = AsyncMock(side_effect=[site_9068_files, site_9069_files])
+        mock_oedi.list_csv_files = AsyncMock(
+            side_effect=[site_9068_files, site_9069_files]
+        )
         mock_oedi.__aenter__ = AsyncMock(return_value=mock_oedi)
         mock_oedi.__aexit__ = AsyncMock(return_value=False)
 
         mock_tracker = AsyncMock()
         # All files are unprocessed
-        mock_tracker.get_unprocessed_files = AsyncMock(side_effect=[site_9068_files, site_9069_files])
+        mock_tracker.get_unprocessed_files = AsyncMock(
+            side_effect=[site_9068_files, site_9069_files]
+        )
         mock_tracker.mark_queued = AsyncMock()
         mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
         mock_tracker.__aexit__ = AsyncMock(return_value=False)
@@ -78,7 +82,9 @@ class TestDispatcherIntegration:
         mock_emitter.__aexit__ = AsyncMock(return_value=False)
 
         with (
-            patch("function_app.load_historical_config", return_value=_historical_config()),
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
             patch("function_app.OediHistoricalClient", return_value=mock_oedi),
             patch("function_app.FileTrackingStore", return_value=mock_tracker),
             patch("function_app.ServiceBusEmitter", return_value=mock_emitter),
@@ -123,7 +129,9 @@ class TestDispatcherIntegration:
         mock_emitter.__aexit__ = AsyncMock(return_value=False)
 
         with (
-            patch("function_app.load_historical_config", return_value=_historical_config()),
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
             patch("function_app.OediHistoricalClient", return_value=mock_oedi),
             patch("function_app.FileTrackingStore", return_value=mock_tracker),
             patch("function_app.ServiceBusEmitter", return_value=mock_emitter),
@@ -153,7 +161,9 @@ def _mock_work_item_msg(work_item: dict) -> MagicMock:
     return mock_msg
 
 
-def _default_work_item(site_id: int = 9068, file_name: str = "9068_ac_power_data.csv") -> dict:
+def _default_work_item(
+    site_id: int = 9068, file_name: str = "9068_ac_power_data.csv"
+) -> dict:
     return {
         "site_id": site_id,
         "s3_key": f"{_PREFIX}/{site_id}_OEDI/data/{file_name}",
@@ -175,7 +185,9 @@ class TestWorkerIntegration:
         mock_msg = _mock_work_item_msg(work_item)
 
         mock_adls = AsyncMock()
-        mock_adls.stream_upload = AsyncMock(return_value=(65000000, "abc123hash", 105121))
+        mock_adls.stream_upload = AsyncMock(
+            return_value=(65000000, "abc123hash", 105121)
+        )
         mock_adls.write_json = AsyncMock()
         mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
         mock_adls.__aexit__ = AsyncMock(return_value=False)
@@ -190,7 +202,9 @@ class TestWorkerIntegration:
         emitter = _mock_emitter()
 
         with (
-            patch("function_app.load_historical_config", return_value=_historical_config()),
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
             patch("function_app.AdlsStore", return_value=mock_adls),
             patch("function_app.FileTrackingStore", return_value=mock_tracker),
             patch("function_app.ServiceBusEmitter", return_value=emitter),
@@ -200,7 +214,9 @@ class TestWorkerIntegration:
 
             await historical_worker(mock_msg)
 
-        mock_tracker.mark_processing.assert_called_once_with(9068, work_item["s3_key"], 1)
+        mock_tracker.mark_processing.assert_called_once_with(
+            9068, work_item["s3_key"], 1
+        )
         # stream_upload called with source_url and adls path
         mock_adls.stream_upload.assert_called_once()
         call_kwargs = mock_adls.stream_upload.call_args
@@ -219,7 +235,9 @@ class TestWorkerIntegration:
         mock_msg = _mock_work_item_msg(work_item)
 
         mock_adls = AsyncMock()
-        mock_adls.stream_upload = AsyncMock(return_value=(65000000, "abc123hash", 105121))
+        mock_adls.stream_upload = AsyncMock(
+            return_value=(65000000, "abc123hash", 105121)
+        )
         mock_adls.write_json = AsyncMock()
         mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
         mock_adls.__aexit__ = AsyncMock(return_value=False)
@@ -232,7 +250,9 @@ class TestWorkerIntegration:
         emitter = _mock_emitter()
 
         with (
-            patch("function_app.load_historical_config", return_value=_historical_config()),
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
             patch("function_app.AdlsStore", return_value=mock_adls),
             patch("function_app.FileTrackingStore", return_value=mock_tracker),
             patch("function_app.ServiceBusEmitter", return_value=emitter),
@@ -253,7 +273,9 @@ class TestWorkerIntegration:
         mock_msg = _mock_work_item_msg(work_item)
 
         mock_adls = AsyncMock()
-        mock_adls.stream_upload = AsyncMock(return_value=(65000000, "abc123hash", 105121))
+        mock_adls.stream_upload = AsyncMock(
+            return_value=(65000000, "abc123hash", 105121)
+        )
         mock_adls.write_json = AsyncMock()
         mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
         mock_adls.__aexit__ = AsyncMock(return_value=False)
@@ -266,7 +288,9 @@ class TestWorkerIntegration:
         emitter = _mock_emitter()
 
         with (
-            patch("function_app.load_historical_config", return_value=_historical_config()),
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
             patch("function_app.AdlsStore", return_value=mock_adls),
             patch("function_app.FileTrackingStore", return_value=mock_tracker),
             patch("function_app.ServiceBusEmitter", return_value=emitter),
@@ -312,7 +336,9 @@ class TestWorkerIntegration:
         emitter = _mock_emitter()
 
         with (
-            patch("function_app.load_historical_config", return_value=_historical_config()),
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
             patch("function_app.AdlsStore", return_value=mock_adls),
             patch("function_app.FileTrackingStore", return_value=mock_tracker),
             patch("function_app.ServiceBusEmitter", return_value=emitter),
@@ -340,7 +366,9 @@ class TestWorkerIntegration:
 
         captured_paths: list[str] = []
 
-        async def capture_upload(source_url: str, file_path: str) -> tuple[int, str, int]:
+        async def capture_upload(
+            source_url: str, file_path: str
+        ) -> tuple[int, str, int]:
             captured_paths.append(file_path)
             return (1000, "deadbeef" * 8, 500)
 
@@ -364,7 +392,9 @@ class TestWorkerIntegration:
         )
 
         with (
-            patch("function_app.load_historical_config", return_value=_historical_config()),
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
             patch("function_app.AdlsStore", return_value=mock_adls),
             patch("function_app.FileTrackingStore", return_value=mock_tracker),
             patch("function_app.ServiceBusEmitter", return_value=emitter),
@@ -405,7 +435,9 @@ class TestWorkerIntegration:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         with (
-            patch("function_app.load_historical_config", return_value=_historical_config()),
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
             patch("function_app.AdlsStore", return_value=mock_adls),
             patch("function_app.FileTrackingStore", return_value=mock_tracker),
             patch("function_app.ServiceBusEmitter", return_value=emitter),
@@ -448,7 +480,9 @@ class TestIncrementalDetection:
         new_file = _file_info(9068, "9068_tracker_data.csv", 870000000)
 
         mock_oedi = AsyncMock()
-        mock_oedi.list_csv_files = AsyncMock(side_effect=[[existing_file, new_file], []])
+        mock_oedi.list_csv_files = AsyncMock(
+            side_effect=[[existing_file, new_file], []]
+        )
         mock_oedi.__aenter__ = AsyncMock(return_value=mock_oedi)
         mock_oedi.__aexit__ = AsyncMock(return_value=False)
 
@@ -465,7 +499,9 @@ class TestIncrementalDetection:
         mock_emitter.__aexit__ = AsyncMock(return_value=False)
 
         with (
-            patch("function_app.load_historical_config", return_value=_historical_config()),
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
             patch("function_app.OediHistoricalClient", return_value=mock_oedi),
             patch("function_app.FileTrackingStore", return_value=mock_tracker),
             patch("function_app.ServiceBusEmitter", return_value=mock_emitter),
@@ -506,7 +542,9 @@ class TestIncrementalDetection:
         mock_emitter.__aexit__ = AsyncMock(return_value=False)
 
         with (
-            patch("function_app.load_historical_config", return_value=_historical_config()),
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
             patch("function_app.OediHistoricalClient", return_value=mock_oedi),
             patch("function_app.FileTrackingStore", return_value=mock_tracker),
             patch("function_app.ServiceBusEmitter", return_value=mock_emitter),

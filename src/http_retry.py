@@ -53,7 +53,11 @@ async def get_with_retry(
                 backoff = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
                 logger.warning(
                     "HTTP %d for %s, retrying in %.1fs (attempt %d/%d)",
-                    response.status_code, url, backoff, attempt, MAX_RETRIES,
+                    response.status_code,
+                    url,
+                    backoff,
+                    attempt,
+                    MAX_RETRIES,
                 )
                 last_error = error_class(f"HTTP {response.status_code} from {url}")
                 if attempt < MAX_RETRIES:
@@ -67,7 +71,11 @@ async def get_with_retry(
             backoff = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
             logger.warning(
                 "Connection error for %s: %s, retrying in %.1fs (attempt %d/%d)",
-                url, exc, backoff, attempt, MAX_RETRIES,
+                url,
+                exc,
+                backoff,
+                attempt,
+                MAX_RETRIES,
             )
             last_error = exc
             if attempt < MAX_RETRIES:

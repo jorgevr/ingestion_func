@@ -25,10 +25,20 @@ class TestEnvelopeRequiredFields:
         )
 
         required = [
-            "specversion", "type", "source", "id", "time",
-            "datacontenttype", "tenant_id", "source_vendor",
-            "schema_version", "mapping_version", "correlation_id",
-            "ingestion_timestamp", "traceparent", "data",
+            "specversion",
+            "type",
+            "source",
+            "id",
+            "time",
+            "datacontenttype",
+            "tenant_id",
+            "source_vendor",
+            "schema_version",
+            "mapping_version",
+            "correlation_id",
+            "ingestion_timestamp",
+            "traceparent",
+            "data",
         ]
         for field in required:
             assert field in envelope, f"Missing required field: {field}"

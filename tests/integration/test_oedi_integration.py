@@ -57,7 +57,10 @@ class TestMultiSitePolling:
         all_records: list[dict] = []
         for site_id in [2, 34]:
             records = await client.fetch_daily_site_data(
-                system_id=site_id, year=2026, month=1, day=15,
+                system_id=site_id,
+                year=2026,
+                month=1,
+                day=15,
             )
             all_records.extend(records)
 
@@ -82,7 +85,10 @@ class TestMultiDateIteration:
         all_records: list[dict] = []
         for year, month, day in [(2026, 1, 14), (2026, 1, 15)]:
             records = await client.fetch_daily_site_data(
-                system_id=2, year=year, month=month, day=day,
+                system_id=2,
+                year=year,
+                month=month,
+                day=day,
             )
             all_records.extend(records)
 
@@ -112,7 +118,10 @@ class TestPartialSiteFailure:
         for site_id in [2, 34]:
             try:
                 records = await client.fetch_daily_site_data(
-                    system_id=site_id, year=2026, month=1, day=15,
+                    system_id=site_id,
+                    year=2026,
+                    month=1,
+                    day=15,
                 )
                 all_records.extend(records)
             except OediAccessError:

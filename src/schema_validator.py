@@ -29,7 +29,11 @@ def validate_record(record: dict) -> tuple[bool, list[dict]]:
     """
     errors: list[dict] = []
     for error in _VALIDATOR.iter_errors(record):
-        path = ".".join(str(p) for p in error.absolute_path) if error.absolute_path else "$"
+        path = (
+            ".".join(str(p) for p in error.absolute_path)
+            if error.absolute_path
+            else "$"
+        )
         errors.append(
             {
                 "message": error.message,

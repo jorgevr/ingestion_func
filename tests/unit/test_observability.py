@@ -43,7 +43,6 @@ class TestInvocationStats:
         assert stats.number_of_records_retrieved == 10
         assert stats.number_emitted == 8
 
-
     def test_historical_source(self) -> None:
         stats = InvocationStats(source="PVDAQ-historical", correlation_id="hist-corr")
         assert stats.source == "PVDAQ-historical"
@@ -106,6 +105,7 @@ class TestExceptionFormatting:
     def test_exception_included_in_json_output(self) -> None:
         """When a log record has exc_info, the JSON output includes 'exception'."""
         import sys
+
         from src.observability import _JsonFormatter
 
         formatter = _JsonFormatter()

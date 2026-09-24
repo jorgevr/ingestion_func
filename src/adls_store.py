@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Any
+from types import TracebackType
+from typing import Self
 
 import httpx
 from azure.core.exceptions import ResourceExistsError
@@ -148,7 +149,9 @@ class AdlsStore:
                     newline_count += chunk.count(b"\n")
                     length = len(chunk)
                     await file_client.append_data(
-                        data=chunk, offset=offset, length=length,
+                        data=chunk,
+                        offset=offset,
+                        length=length,
                     )
                     offset += length
 
@@ -157,7 +160,11 @@ class AdlsStore:
 
             logger.debug(
                 "Uploaded %d bytes to %s/%s (sha256=%s, rows~=%d)",
-                offset, self._container_name, file_path, file_hash[:16], newline_count,
+                offset,
+                self._container_name,
+                file_path,
+                file_hash[:16],
+                newline_count,
             )
             return offset, file_hash, newline_count
 
@@ -212,7 +219,11 @@ class AdlsStore:
             file_hash = hasher.hexdigest()
             logger.debug(
                 "Uploaded %d bytes to %s/%s (sha256=%s, rows~=%d)",
-                offset, self._container_name, file_path, file_hash[:16], newline_count,
+                offset,
+                self._container_name,
+                file_path,
+                file_hash[:16],
+                newline_count,
             )
             return offset, file_hash, newline_count
 
@@ -262,12 +273,16 @@ class AdlsStore:
                     pass
                 file_client = fs_client.get_file_client(file_path)
                 await file_client.create_file()
-                await file_client.append_data(data=payload, offset=0, length=len(payload))
+                await file_client.append_data(
+                    data=payload, offset=0, length=len(payload)
+                )
                 await file_client.flush_data(len(payload))
 
             logger.debug(
                 "Wrote %d bytes of JSON to %s/%s",
-                len(payload), self._container_name, file_path,
+                len(payload),
+                self._container_name,
+                file_path,
             )
         except Exception as exc:
             raise AdlsUploadError(
@@ -283,8 +298,13 @@ class AdlsStore:
         if self._credential is not None:
             await self._credential.close()
 
-    async def __aenter__(self) -> AdlsStore:
+    async def __aenter__(self) -> Self:
         return self
 
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         await self.close()

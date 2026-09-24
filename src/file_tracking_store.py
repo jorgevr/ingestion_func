@@ -13,7 +13,8 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
-from typing import Any
+from types import TracebackType
+from typing import Any, Self
 
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.data.tables.aio import TableClient
@@ -107,7 +108,8 @@ class FileTrackingStore:
                 if (
                     existing.get("Status") == "completed"
                     and existing.get("Size") == file_info["size"]
-                    and existing.get("LastModified") == file_info.get("last_modified", "")
+                    and existing.get("LastModified")
+                    == file_info.get("last_modified", "")
                 ):
                     continue
                 # Changed or not completed — reprocess
@@ -312,8 +314,13 @@ class FileTrackingStore:
         if self._credential is not None:
             await self._credential.close()
 
-    async def __aenter__(self) -> FileTrackingStore:
+    async def __aenter__(self) -> Self:
         return self
 
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         await self.close()

@@ -64,11 +64,13 @@ class TestGetUnprocessedFiles:
     @pytest.mark.asyncio
     async def test_completed_same_size_filtered_out(self) -> None:
         table_client = AsyncMock()
-        table_client.get_entity = AsyncMock(return_value={
-            "Status": "completed",
-            "Size": 65000000,
-            "LastModified": "2024-01-15T12:00:00Z",
-        })
+        table_client.get_entity = AsyncMock(
+            return_value={
+                "Status": "completed",
+                "Size": 65000000,
+                "LastModified": "2024-01-15T12:00:00Z",
+            }
+        )
         store = _make_store(table_client)
 
         result = await store.get_unprocessed_files(SITE_ID, [FILE_INFO])
@@ -77,11 +79,13 @@ class TestGetUnprocessedFiles:
     @pytest.mark.asyncio
     async def test_changed_size_returned(self) -> None:
         table_client = AsyncMock()
-        table_client.get_entity = AsyncMock(return_value={
-            "Status": "completed",
-            "Size": 50000000,  # different size
-            "LastModified": "2024-01-15T12:00:00Z",
-        })
+        table_client.get_entity = AsyncMock(
+            return_value={
+                "Status": "completed",
+                "Size": 50000000,  # different size
+                "LastModified": "2024-01-15T12:00:00Z",
+            }
+        )
         store = _make_store(table_client)
 
         result = await store.get_unprocessed_files(SITE_ID, [FILE_INFO])
@@ -90,11 +94,13 @@ class TestGetUnprocessedFiles:
     @pytest.mark.asyncio
     async def test_changed_last_modified_returned(self) -> None:
         table_client = AsyncMock()
-        table_client.get_entity = AsyncMock(return_value={
-            "Status": "completed",
-            "Size": 65000000,
-            "LastModified": "2024-02-01T00:00:00Z",  # different date
-        })
+        table_client.get_entity = AsyncMock(
+            return_value={
+                "Status": "completed",
+                "Size": 65000000,
+                "LastModified": "2024-02-01T00:00:00Z",  # different date
+            }
+        )
         store = _make_store(table_client)
 
         result = await store.get_unprocessed_files(SITE_ID, [FILE_INFO])
@@ -103,11 +109,13 @@ class TestGetUnprocessedFiles:
     @pytest.mark.asyncio
     async def test_failed_status_returned(self) -> None:
         table_client = AsyncMock()
-        table_client.get_entity = AsyncMock(return_value={
-            "Status": "failed",
-            "Size": 65000000,
-            "LastModified": "2024-01-15T12:00:00Z",
-        })
+        table_client.get_entity = AsyncMock(
+            return_value={
+                "Status": "failed",
+                "Size": 65000000,
+                "LastModified": "2024-01-15T12:00:00Z",
+            }
+        )
         store = _make_store(table_client)
 
         result = await store.get_unprocessed_files(SITE_ID, [FILE_INFO])
@@ -116,7 +124,11 @@ class TestGetUnprocessedFiles:
     @pytest.mark.asyncio
     async def test_multiple_files_mixed(self) -> None:
         """Two files: one already completed, one new."""
-        new_file = {"key": "path/to/new.csv", "size": 100, "last_modified": "2024-06-01T00:00:00Z"}
+        new_file = {
+            "key": "path/to/new.csv",
+            "size": 100,
+            "last_modified": "2024-06-01T00:00:00Z",
+        }
         completed_file = FILE_INFO
 
         def mock_get_entity(partition_key: str, row_key: str) -> dict:
@@ -146,8 +158,10 @@ class TestMarkQueued:
         store = _make_store(table_client)
 
         await store.mark_queued(
-            site_id=SITE_ID, s3_key=S3_KEY,
-            file_size=65000000, last_modified="2024-01-15T12:00:00Z",
+            site_id=SITE_ID,
+            s3_key=S3_KEY,
+            file_size=65000000,
+            last_modified="2024-01-15T12:00:00Z",
             correlation_id="test-corr",
         )
 
@@ -167,8 +181,10 @@ class TestMarkQueued:
         store = _make_store(table_client)
 
         await store.mark_queued(
-            site_id=SITE_ID, s3_key=S3_KEY,
-            file_size=65000000, last_modified="2024-01-15T12:00:00Z",
+            site_id=SITE_ID,
+            s3_key=S3_KEY,
+            file_size=65000000,
+            last_modified="2024-01-15T12:00:00Z",
             correlation_id="test-corr",
         )
 
@@ -226,10 +242,16 @@ class TestMarkCompleted:
         assert versioned_entity["Status"] == "completed"
         assert versioned_entity["Version"] == 1
         assert versioned_entity["Category"] == "ac_power"
-        assert versioned_entity["StoragePath"] == "source=pvdaq/dataset=9068_ac_power/ingestion_date=2024-01-15/9068_ac_power_v1.csv"
+        assert (
+            versioned_entity["StoragePath"]
+            == "source=pvdaq/dataset=9068_ac_power/ingestion_date=2024-01-15/9068_ac_power_v1.csv"
+        )
         assert versioned_entity["FileHash"] == "abc123"
         assert versioned_entity["IngestionId"] == "ingest-uuid"
-        assert versioned_entity["SourceUrl"] == "https://oedi.s3.amazonaws.com/pvdaq/file.csv"
+        assert (
+            versioned_entity["SourceUrl"]
+            == "https://oedi.s3.amazonaws.com/pvdaq/file.csv"
+        )
         assert versioned_entity["IngestionTime"] == "2024-01-15T12:00:00+00:00"
         assert versioned_entity["RowCount"] == 1000
         assert "CompletedAt" in versioned_entity

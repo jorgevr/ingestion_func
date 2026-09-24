@@ -16,11 +16,12 @@ import csv
 import logging
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator
-from typing import Any
+from types import TracebackType
+from typing import Any, Self
 
 import httpx
 
-from src.http_retry import MAX_RETRIES, BASE_BACKOFF_SECONDS, get_with_retry
+from src.http_retry import BASE_BACKOFF_SECONDS, MAX_RETRIES, get_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +61,7 @@ def extract_category(file_name: str, site_id: int) -> str:
 
     stem = file_name.removesuffix(".csv")
     prefix = f"{site_id}_"
-    if stem.startswith(prefix):
-        stem = stem[len(prefix):]
+    stem = stem.removeprefix(prefix)
 
     # Strip trailing _data or _data_{start}_{end} suffix
     stem = re.sub(r"_data(?:_\d{4}-\d{2}-\d{2}_\d{4}-\d{2}-\d{2})?$", "", stem)
@@ -106,7 +106,10 @@ class OediHistoricalClient:
         """GET with exponential backoff on 5xx/timeout errors."""
         client = await self._get_client()
         return await get_with_retry(
-            client, url, error_class=OediHistoricalAccessError, **kwargs,
+            client,
+            url,
+            error_class=OediHistoricalAccessError,
+            **kwargs,
         )
 
     async def list_csv_files(self, site_id: int) -> list[dict[str, Any]]:
@@ -138,7 +141,9 @@ class OediHistoricalClient:
             response = await self._get_with_retry(url, params=params)
 
             if response.status_code == 404:
-                logger.warning("Site %d data folder not found at prefix %s", site_id, prefix)
+                logger.warning(
+                    "Site %d data folder not found at prefix %s", site_id, prefix
+                )
                 return []
 
             root = ET.fromstring(response.text)
@@ -155,11 +160,17 @@ class OediHistoricalClient:
                 if not key.endswith(".csv"):
                     continue
 
-                files.append({
-                    "key": key,
-                    "size": int(size_el.text) if size_el is not None and size_el.text else 0,
-                    "last_modified": modified_el.text if modified_el is not None else "",
-                })
+                files.append(
+                    {
+                        "key": key,
+                        "size": int(size_el.text)
+                        if size_el is not None and size_el.text
+                        else 0,
+                        "last_modified": modified_el.text
+                        if modified_el is not None
+                        else "",
+                    }
+                )
 
             # Check for pagination
             is_truncated_el = root.find(f"{{{_S3_NS}}}IsTruncated")
@@ -247,7 +258,11 @@ class OediHistoricalClient:
                     backoff = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))
                     logger.warning(
                         "Stream error for %s: %s, retrying in %.1fs (attempt %d/%d)",
-                        url, exc, backoff, attempt, MAX_RETRIES,
+                        url,
+                        exc,
+                        backoff,
+                        attempt,
+                        MAX_RETRIES,
                     )
                     await asyncio.sleep(backoff)
 
@@ -260,8 +275,13 @@ class OediHistoricalClient:
         if self._http_client is not None and self._owns_client:
             await self._http_client.aclose()
 
-    async def __aenter__(self) -> OediHistoricalClient:
+    async def __aenter__(self) -> Self:
         return self
 
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         await self.close()

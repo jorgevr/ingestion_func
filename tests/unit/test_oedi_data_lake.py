@@ -56,9 +56,7 @@ class TestFetchSystemsList:
     @respx.mock
     @pytest.mark.asyncio
     async def test_404_raises_error(self, client: OediDataLakeClient) -> None:
-        respx.get(f"{BUCKET_URL}/{SYSTEMS_KEY}").mock(
-            return_value=httpx.Response(404)
-        )
+        respx.get(f"{BUCKET_URL}/{SYSTEMS_KEY}").mock(return_value=httpx.Response(404))
 
         with pytest.raises(OediAccessError, match="not found"):
             await client.fetch_systems_list()
@@ -73,7 +71,9 @@ class TestFetchDailySiteData:
         url = f"{BUCKET_URL}/{DATA_PREFIX}/system_id=2/year=2026/month=1/day=15/system_2__date_2026_01_15.csv"
         respx.get(url).mock(return_value=httpx.Response(200, text=DAILY_CSV))
 
-        records = await client.fetch_daily_site_data(system_id=2, year=2026, month=1, day=15)
+        records = await client.fetch_daily_site_data(
+            system_id=2, year=2026, month=1, day=15
+        )
 
         assert len(records) == 2
         assert records[0]["SiteID"] == 2
@@ -89,7 +89,9 @@ class TestFetchDailySiteData:
         url = f"{BUCKET_URL}/{DATA_PREFIX}/system_id=2/year=2026/month=1/day=15/system_2__date_2026_01_15.csv"
         respx.get(url).mock(return_value=httpx.Response(404))
 
-        records = await client.fetch_daily_site_data(system_id=2, year=2026, month=1, day=15)
+        records = await client.fetch_daily_site_data(
+            system_id=2, year=2026, month=1, day=15
+        )
 
         assert records == []
 
@@ -107,7 +109,9 @@ class TestRetryBehavior:
             httpx.Response(200, text=DAILY_CSV),
         ]
 
-        records = await client.fetch_daily_site_data(system_id=2, year=2026, month=1, day=15)
+        records = await client.fetch_daily_site_data(
+            system_id=2, year=2026, month=1, day=15
+        )
 
         assert len(records) == 2
         assert route.call_count == 2
@@ -145,7 +149,11 @@ class TestNormalizeRecord:
     """Record normalization: field mapping, suffix stripping, numeric casting."""
 
     def test_maps_system_id_and_measured_on(self) -> None:
-        row = {"system_id": "2", "measured_on": "2026-01-15 12:00:00", "dc_power__346": "4800.5"}
+        row = {
+            "system_id": "2",
+            "measured_on": "2026-01-15 12:00:00",
+            "dc_power__346": "4800.5",
+        }
         result = _normalize_record(row)
 
         assert result is not None
@@ -169,7 +177,11 @@ class TestNormalizeRecord:
         assert "dc_power__346" not in result
 
     def test_casts_numeric_values(self) -> None:
-        row = {"system_id": "2", "measured_on": "2026-01-15 12:00:00", "dc_power__346": "4800.5"}
+        row = {
+            "system_id": "2",
+            "measured_on": "2026-01-15 12:00:00",
+            "dc_power__346": "4800.5",
+        }
         result = _normalize_record(row)
 
         assert result is not None
@@ -187,7 +199,11 @@ class TestNormalizeRecord:
         assert result is None
 
     def test_empty_values_skipped(self) -> None:
-        row = {"system_id": "2", "measured_on": "2026-01-15 12:00:00", "dc_power__346": ""}
+        row = {
+            "system_id": "2",
+            "measured_on": "2026-01-15 12:00:00",
+            "dc_power__346": "",
+        }
         result = _normalize_record(row)
 
         assert result is not None
@@ -195,7 +211,11 @@ class TestNormalizeRecord:
 
     def test_non_numeric_system_id_returns_none(self) -> None:
         """system_id that can't be cast to int returns None."""
-        row = {"system_id": "abc", "measured_on": "2026-01-15 12:00:00", "dc_power__346": "4800.5"}
+        row = {
+            "system_id": "abc",
+            "measured_on": "2026-01-15 12:00:00",
+            "dc_power__346": "4800.5",
+        }
         result = _normalize_record(row)
         assert result is None
 
@@ -217,13 +237,12 @@ class TestFetchSystemsListEdgeCases:
 
     @respx.mock
     @pytest.mark.asyncio
-    async def test_non_integer_system_ids_skipped(self, client: OediDataLakeClient) -> None:
+    async def test_non_integer_system_ids_skipped(
+        self, client: OediDataLakeClient
+    ) -> None:
         """Non-integer system_id rows are skipped with a warning."""
         csv_with_bad_id = (
-            "system_id,system_name\n"
-            "2,Good Site\n"
-            "abc,Bad Site\n"
-            "34,Another Good\n"
+            "system_id,system_name\n2,Good Site\nabc,Bad Site\n34,Another Good\n"
         )
         respx.get(f"{BUCKET_URL}/{SYSTEMS_KEY}").mock(
             return_value=httpx.Response(200, text=csv_with_bad_id)
@@ -251,6 +270,7 @@ class TestAsyncContextManager:
     async def test_close_with_injected_client_does_not_close(self) -> None:
         """When an external httpx client is injected, close() does NOT close it."""
         import httpx as _httpx
+
         external = _httpx.AsyncClient()
         client = OediDataLakeClient(
             bucket_url=BUCKET_URL,

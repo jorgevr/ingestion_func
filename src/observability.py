@@ -11,9 +11,10 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from collections.abc import MutableMapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, MutableMapping
+from typing import Any
 
 
 class _JsonFormatter(logging.Formatter):
@@ -21,7 +22,9 @@ class _JsonFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         log_entry: dict[str, Any] = {
-            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "timestamp": datetime.fromtimestamp(
+                record.created, tz=timezone.utc
+            ).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -58,7 +61,7 @@ _handler_installed = False
 
 def _ensure_handler() -> None:
     """Install the JSON handler on the root logger exactly once."""
-    global _handler_installed  # noqa: PLW0603
+    global _handler_installed
     if _handler_installed:
         return
 

@@ -122,9 +122,13 @@ def load_config() -> Config:
     Raises:
         ConfigurationError: If any required setting is missing or invalid.
     """
-    missing = [name for name in _REQUIRED_SETTINGS if not os.environ.get(name, "").strip()]
+    missing = [
+        name for name in _REQUIRED_SETTINGS if not os.environ.get(name, "").strip()
+    ]
     if not os.environ.get("ServiceBusConnection", "").strip():
-        missing += [n for n in _REQUIRED_WHEN_NO_CONN_STR if not os.environ.get(n, "").strip()]
+        missing += [
+            n for n in _REQUIRED_WHEN_NO_CONN_STR if not os.environ.get(n, "").strip()
+        ]
     if missing:
         raise ConfigurationError(
             f"Missing required configuration setting(s): {', '.join(missing)}"
@@ -141,9 +145,7 @@ def load_config() -> Config:
         oedi_systems_key=os.environ.get(
             "OEDI_SYSTEMS_KEY", "pvdaq/csv/systems_20250729.csv"
         ).strip(),
-        oedi_data_prefix=os.environ.get(
-            "OEDI_DATA_PREFIX", "pvdaq/csv/pvdata"
-        ).strip(),
+        oedi_data_prefix=os.environ.get("OEDI_DATA_PREFIX", "pvdaq/csv/pvdata").strip(),
         pvdaq_site_ids=site_ids,
         pvdaq_site_count=int(os.environ.get("PVDAQ_SITE_COUNT", "30").strip()),
         pvdaq_lookback_hours=int(_require("PVDAQ_LOOKBACK_HOURS")),
@@ -156,7 +158,9 @@ def load_config() -> Config:
         idempotency_table_name=_require("IDEMPOTENCY_TABLE_NAME"),
         table_storage_uri=_require("TableStorageConnection__tableServiceUri"),
         tenant_id=os.environ.get("TENANT_ID", "research").strip(),
-        mapping_version_pvdaq=os.environ.get("MAPPING_VERSION_PVDAQ", "unknown").strip(),
+        mapping_version_pvdaq=os.environ.get(
+            "MAPPING_VERSION_PVDAQ", "unknown"
+        ).strip(),
         schema_version_pvdaq=os.environ.get("SCHEMA_VERSION_PVDAQ", "v1").strip(),
     )
 
@@ -184,11 +188,14 @@ def load_historical_config() -> HistoricalConfig:
         ConfigurationError: If any required setting is missing or invalid.
     """
     missing = [
-        name for name in _HISTORICAL_REQUIRED_SETTINGS
+        name
+        for name in _HISTORICAL_REQUIRED_SETTINGS
         if not os.environ.get(name, "").strip()
     ]
     if not os.environ.get("ServiceBusConnection", "").strip():
-        missing += [n for n in _REQUIRED_WHEN_NO_CONN_STR if not os.environ.get(n, "").strip()]
+        missing += [
+            n for n in _REQUIRED_WHEN_NO_CONN_STR if not os.environ.get(n, "").strip()
+        ]
     if missing:
         raise ConfigurationError(
             f"Missing required configuration setting(s): {', '.join(missing)}"
@@ -217,6 +224,8 @@ def load_historical_config() -> HistoricalConfig:
         adls_account_url=_require("ADLS_ACCOUNT_URL"),
         adls_container_name=_require("ADLS_CONTAINER_NAME"),
         tenant_id=os.environ.get("TENANT_ID", "default").strip(),
-        mapping_version_pvdaq=os.environ.get("MAPPING_VERSION_PVDAQ", "unknown").strip(),
+        mapping_version_pvdaq=os.environ.get(
+            "MAPPING_VERSION_PVDAQ", "unknown"
+        ).strip(),
         schema_version_pvdaq=os.environ.get("SCHEMA_VERSION_PVDAQ", "v1").strip(),
     )

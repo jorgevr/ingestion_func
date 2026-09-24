@@ -39,16 +39,24 @@ class TestSensorSuffixPattern:
     """SENSOR_SUFFIX_PATTERN strips _o_\\d+ and _\\d+ suffixes."""
 
     def test_strip_o_digits(self) -> None:
-        assert SENSOR_SUFFIX_PATTERN.sub("", "ambient_temperature_o_149575") == "ambient_temperature"
+        assert (
+            SENSOR_SUFFIX_PATTERN.sub("", "ambient_temperature_o_149575")
+            == "ambient_temperature"
+        )
 
     def test_strip_plain_digits(self) -> None:
-        assert SENSOR_SUFFIX_PATTERN.sub("", "meter_revenue_grade_ac_output_meter_149578") == "meter_revenue_grade_ac_output_meter"
+        assert (
+            SENSOR_SUFFIX_PATTERN.sub("", "meter_revenue_grade_ac_output_meter_149578")
+            == "meter_revenue_grade_ac_output_meter"
+        )
 
     def test_no_suffix_unchanged(self) -> None:
         assert SENSOR_SUFFIX_PATTERN.sub("", "ac_power") == "ac_power"
 
     def test_only_digits_suffix(self) -> None:
-        assert SENSOR_SUFFIX_PATTERN.sub("", "poa_irradiance_o_149574") == "poa_irradiance"
+        assert (
+            SENSOR_SUFFIX_PATTERN.sub("", "poa_irradiance_o_149574") == "poa_irradiance"
+        )
 
     def test_complex_name_with_suffix(self) -> None:
         result = SENSOR_SUFFIX_PATTERN.sub(
@@ -66,7 +74,9 @@ class TestNormalizeHistoricalRecord:
             "ambient_temperature_o_149575": "25.3",
             "wind_speed_o_149576": "3.2",
         }
-        result = normalize_historical_record(row, site_id=2107, file_name="2107_env.csv")
+        result = normalize_historical_record(
+            row, site_id=2107, file_name="2107_env.csv"
+        )
 
         assert result is not None
         assert result["SiteID"] == 2107

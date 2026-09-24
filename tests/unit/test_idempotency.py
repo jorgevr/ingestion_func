@@ -60,7 +60,9 @@ class TestDuplicateDetection:
         from azure.core.exceptions import ResourceExistsError
 
         table_client = AsyncMock()
-        table_client.create_entity = AsyncMock(side_effect=ResourceExistsError("Entity already exists"))
+        table_client.create_entity = AsyncMock(
+            side_effect=ResourceExistsError("Entity already exists")
+        )
         table_client.get_entity = AsyncMock(return_value={"Status": "completed"})
         store = _make_store(table_client)
 
@@ -81,7 +83,9 @@ class TestPendingRetry:
         from azure.core.exceptions import ResourceExistsError
 
         table_client = AsyncMock()
-        table_client.create_entity = AsyncMock(side_effect=ResourceExistsError("Entity already exists"))
+        table_client.create_entity = AsyncMock(
+            side_effect=ResourceExistsError("Entity already exists")
+        )
         table_client.get_entity = AsyncMock(return_value={"Status": "pending"})
         store = _make_store(table_client)
 
@@ -165,7 +169,9 @@ class TestCleanupExpired:
 
         table_client = AsyncMock()
         # query_entities returns an async iterable directly (not a coroutine)
-        table_client.query_entities = MagicMock(return_value=_AsyncIter(expired_entities))
+        table_client.query_entities = MagicMock(
+            return_value=_AsyncIter(expired_entities)
+        )
         table_client.delete_entity = AsyncMock(return_value=None)
         store = _make_store(table_client)
 
@@ -215,8 +221,12 @@ class TestIdempotencyContextManager:
         mock_cred = MagicMock()
         mock_table_client = MagicMock()
 
-        with patch("src.idempotency_store.DefaultAzureCredential", return_value=mock_cred), \
-             patch("src.idempotency_store.TableClient", return_value=mock_table_client):
+        with (
+            patch(
+                "src.idempotency_store.DefaultAzureCredential", return_value=mock_cred
+            ),
+            patch("src.idempotency_store.TableClient", return_value=mock_table_client),
+        ):
             store = IdempotencyStore(
                 table_name="PvdaqIdempotency",
                 table_service_uri="https://test.table.core.windows.net",
@@ -250,16 +260,24 @@ class TestHistoricalRowKey:
     """_row_key_historical includes file stem as category discriminator."""
 
     def test_includes_file_stem(self) -> None:
-        rk = IdempotencyStore._row_key_historical(9068, "9068_ac_power_data.csv", "2023-01-01T00:00:00")
+        rk = IdempotencyStore._row_key_historical(
+            9068, "9068_ac_power_data.csv", "2023-01-01T00:00:00"
+        )
         assert rk == "9068_9068_ac_power_data_2023-01-01T00:00:00"
 
     def test_different_files_different_keys(self) -> None:
-        rk1 = IdempotencyStore._row_key_historical(9068, "9068_ac_power_data.csv", "2023-01-01T00:00:00")
-        rk2 = IdempotencyStore._row_key_historical(9068, "9068_environment_data.csv", "2023-01-01T00:00:00")
+        rk1 = IdempotencyStore._row_key_historical(
+            9068, "9068_ac_power_data.csv", "2023-01-01T00:00:00"
+        )
+        rk2 = IdempotencyStore._row_key_historical(
+            9068, "9068_environment_data.csv", "2023-01-01T00:00:00"
+        )
         assert rk1 != rk2
 
     def test_strips_csv_extension(self) -> None:
-        rk = IdempotencyStore._row_key_historical(9068, "9068_ac_power_data.csv", "2023-01-01T00:00:00")
+        rk = IdempotencyStore._row_key_historical(
+            9068, "9068_ac_power_data.csv", "2023-01-01T00:00:00"
+        )
         assert ".csv" not in rk
 
 
@@ -288,7 +306,9 @@ class TestCheckAndReserveHistorical:
         from azure.core.exceptions import ResourceExistsError
 
         table_client = AsyncMock()
-        table_client.create_entity = AsyncMock(side_effect=ResourceExistsError("exists"))
+        table_client.create_entity = AsyncMock(
+            side_effect=ResourceExistsError("exists")
+        )
         table_client.get_entity = AsyncMock(return_value={"Status": "completed"})
         store = _make_store(table_client)
 
@@ -306,7 +326,9 @@ class TestCheckAndReserveHistorical:
         from azure.core.exceptions import ResourceExistsError
 
         table_client = AsyncMock()
-        table_client.create_entity = AsyncMock(side_effect=ResourceExistsError("exists"))
+        table_client.create_entity = AsyncMock(
+            side_effect=ResourceExistsError("exists")
+        )
         table_client.get_entity = AsyncMock(return_value={"Status": "pending"})
         store = _make_store(table_client)
 

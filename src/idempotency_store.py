@@ -10,7 +10,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import PurePosixPath
-from typing import Any
+from types import TracebackType
+from typing import Self
 
 from azure.core.exceptions import ResourceExistsError
 from azure.data.tables.aio import TableClient
@@ -222,7 +223,9 @@ class IdempotencyStore:
             to a follow-on task.
         """
         client = await self._get_client()
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=ttl_days)).strftime("%Y-%m-%d")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=ttl_days)).strftime(
+            "%Y-%m-%d"
+        )
         deleted = 0
 
         query = f"PartitionKey lt '{cutoff}'"
@@ -233,7 +236,11 @@ class IdempotencyStore:
             )
             deleted += 1
 
-        logger.info("Idempotency cleanup: deleted %d expired entities (cutoff=%s)", deleted, cutoff)
+        logger.info(
+            "Idempotency cleanup: deleted %d expired entities (cutoff=%s)",
+            deleted,
+            cutoff,
+        )
         return deleted
 
     async def close(self) -> None:
@@ -243,8 +250,13 @@ class IdempotencyStore:
         if self._credential is not None:
             await self._credential.close()
 
-    async def __aenter__(self) -> IdempotencyStore:
+    async def __aenter__(self) -> Self:
         return self
 
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         await self.close()

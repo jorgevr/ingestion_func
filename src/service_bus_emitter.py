@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any
+from types import TracebackType
+from typing import Any, Self
 
 from azure.identity.aio import DefaultAzureCredential
-from azure.servicebus.aio import ServiceBusClient, ServiceBusSender
 from azure.servicebus import ServiceBusMessage
+from azure.servicebus.aio import ServiceBusClient, ServiceBusSender
 
 
 def build_dead_letter_message(
@@ -73,7 +74,9 @@ class ServiceBusEmitter:
     async def _get_client(self) -> ServiceBusClient:
         if self._client is None:
             if self._connection_string:
-                self._client = ServiceBusClient.from_connection_string(self._connection_string)
+                self._client = ServiceBusClient.from_connection_string(
+                    self._connection_string
+                )
             else:
                 self._credential = DefaultAzureCredential()
                 self._client = ServiceBusClient(
@@ -157,8 +160,13 @@ class ServiceBusEmitter:
         if self._credential is not None:
             await self._credential.close()
 
-    async def __aenter__(self) -> ServiceBusEmitter:
+    async def __aenter__(self) -> Self:
         return self
 
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         await self.close()

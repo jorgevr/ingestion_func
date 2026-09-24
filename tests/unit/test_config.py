@@ -45,7 +45,10 @@ class TestLoadConfigValid:
         assert cfg.pvdaq_cron_schedule == "0 */15 * * * *"
         assert cfg.service_bus_queue_name == "energy-telemetry-ingested"
         assert cfg.dead_letter_queue_name == "pvdaq-dead-letter"
-        assert cfg.service_bus_fully_qualified_namespace == "test-sb.servicebus.windows.net"
+        assert (
+            cfg.service_bus_fully_qualified_namespace
+            == "test-sb.servicebus.windows.net"
+        )
         assert cfg.idempotency_table_name == "PvdaqIdempotency"
         assert cfg.table_storage_uri == "https://teststorage.table.core.windows.net"
 
@@ -189,46 +192,58 @@ class TestMissingRequired:
     def test_missing_service_bus_topic_raises(self) -> None:
         env = _base_env()
         del env["SERVICE_BUS_QUEUE_NAME"]
-        with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ConfigurationError, match="SERVICE_BUS_QUEUE_NAME"):
-                load_config()
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ConfigurationError, match="SERVICE_BUS_QUEUE_NAME"),
+        ):
+            load_config()
 
     def test_missing_lookback_hours_raises(self) -> None:
         env = _base_env()
         del env["PVDAQ_LOOKBACK_HOURS"]
-        with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ConfigurationError, match="PVDAQ_LOOKBACK_HOURS"):
-                load_config()
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ConfigurationError, match="PVDAQ_LOOKBACK_HOURS"),
+        ):
+            load_config()
 
     def test_missing_multiple_settings_lists_all(self) -> None:
         env = _base_env()
         del env["SERVICE_BUS_QUEUE_NAME"]
         del env["DEAD_LETTER_QUEUE_NAME"]
-        with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ConfigurationError, match="SERVICE_BUS_QUEUE_NAME"):
-                load_config()
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ConfigurationError, match="SERVICE_BUS_QUEUE_NAME"),
+        ):
+            load_config()
 
     def test_empty_string_treated_as_missing(self) -> None:
         env = _base_env()
         env["SERVICE_BUS_QUEUE_NAME"] = ""
-        with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ConfigurationError, match="SERVICE_BUS_QUEUE_NAME"):
-                load_config()
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ConfigurationError, match="SERVICE_BUS_QUEUE_NAME"),
+        ):
+            load_config()
 
     def test_whitespace_only_treated_as_missing(self) -> None:
         env = _base_env()
         env["SERVICE_BUS_QUEUE_NAME"] = "   "
-        with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ConfigurationError, match="SERVICE_BUS_QUEUE_NAME"):
-                load_config()
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ConfigurationError, match="SERVICE_BUS_QUEUE_NAME"),
+        ):
+            load_config()
 
     def test_invalid_site_ids_raises(self) -> None:
         """Non-integer values in PVDAQ_SITE_IDS raise ConfigurationError."""
         env = _base_env()
         env["PVDAQ_SITE_IDS"] = "2,abc,34"
-        with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ConfigurationError, match="comma-separated list of integers"):
-                load_config()
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ConfigurationError, match="comma-separated list of integers"),
+        ):
+            load_config()
 
 
 class TestRequireDirectly:
@@ -236,14 +251,21 @@ class TestRequireDirectly:
 
     def test_require_raises_on_missing_var(self) -> None:
         """_require raises ConfigurationError when the env var is not set."""
-        with patch.dict(os.environ, {}, clear=True):
-            with pytest.raises(ConfigurationError, match="Missing required configuration setting: NONEXISTENT"):
-                _require("NONEXISTENT")
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            pytest.raises(
+                ConfigurationError,
+                match="Missing required configuration setting: NONEXISTENT",
+            ),
+        ):
+            _require("NONEXISTENT")
 
     def test_require_raises_on_empty_string(self) -> None:
-        with patch.dict(os.environ, {"EMPTY_VAR": ""}, clear=True):
-            with pytest.raises(ConfigurationError, match="EMPTY_VAR"):
-                _require("EMPTY_VAR")
+        with (
+            patch.dict(os.environ, {"EMPTY_VAR": ""}, clear=True),
+            pytest.raises(ConfigurationError, match="EMPTY_VAR"),
+        ):
+            _require("EMPTY_VAR")
 
     def test_require_returns_stripped_value(self) -> None:
         with patch.dict(os.environ, {"MY_VAR": "  hello  "}, clear=True):
@@ -343,9 +365,11 @@ class TestHistoricalSiteIdsParsing:
     def test_invalid_site_ids_raises(self) -> None:
         env = _historical_env()
         env["PVDAQ_HISTORICAL_SITE_IDS"] = "9068,bad,2107"
-        with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ConfigurationError, match="comma-separated list of integers"):
-                load_historical_config()
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ConfigurationError, match="comma-separated list of integers"),
+        ):
+            load_historical_config()
 
 
 class TestHistoricalMissingRequired:
@@ -354,27 +378,35 @@ class TestHistoricalMissingRequired:
     def test_missing_site_ids_raises(self) -> None:
         env = _historical_env()
         del env["PVDAQ_HISTORICAL_SITE_IDS"]
-        with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ConfigurationError, match="PVDAQ_HISTORICAL_SITE_IDS"):
-                load_historical_config()
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ConfigurationError, match="PVDAQ_HISTORICAL_SITE_IDS"),
+        ):
+            load_historical_config()
 
     def test_missing_queue_name_raises(self) -> None:
         env = _historical_env()
         del env["PVDAQ_HISTORICAL_QUEUE_NAME"]
-        with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ConfigurationError, match="PVDAQ_HISTORICAL_QUEUE_NAME"):
-                load_historical_config()
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ConfigurationError, match="PVDAQ_HISTORICAL_QUEUE_NAME"),
+        ):
+            load_historical_config()
 
     def test_missing_file_tracking_table_raises(self) -> None:
         env = _historical_env()
         del env["FILE_TRACKING_TABLE_NAME"]
-        with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ConfigurationError, match="FILE_TRACKING_TABLE_NAME"):
-                load_historical_config()
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ConfigurationError, match="FILE_TRACKING_TABLE_NAME"),
+        ):
+            load_historical_config()
 
     def test_missing_cron_schedule_raises(self) -> None:
         env = _historical_env()
         del env["PVDAQ_HISTORICAL_CRON_SCHEDULE"]
-        with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ConfigurationError, match="PVDAQ_HISTORICAL_CRON_SCHEDULE"):
-                load_historical_config()
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ConfigurationError, match="PVDAQ_HISTORICAL_CRON_SCHEDULE"),
+        ):
+            load_historical_config()

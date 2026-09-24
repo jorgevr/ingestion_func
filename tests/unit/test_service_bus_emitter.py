@@ -26,7 +26,9 @@ def _mock_sender() -> AsyncMock:
     return sender
 
 
-def _mock_client(topic_sender: AsyncMock | None = None, queue_sender: AsyncMock | None = None) -> MagicMock:
+def _mock_client(
+    topic_sender: AsyncMock | None = None, queue_sender: AsyncMock | None = None
+) -> MagicMock:
     """Create a mock ServiceBusClient."""
     client = MagicMock()
     client.get_topic_sender = MagicMock(return_value=topic_sender or _mock_sender())
@@ -74,8 +76,14 @@ class TestGetClientCreatesCredential:
         mock_cred = MagicMock()
         mock_sb_client = MagicMock()
 
-        with patch("src.service_bus_emitter.DefaultAzureCredential", return_value=mock_cred), \
-             patch("src.service_bus_emitter.ServiceBusClient", return_value=mock_sb_client):
+        with (
+            patch(
+                "src.service_bus_emitter.DefaultAzureCredential", return_value=mock_cred
+            ),
+            patch(
+                "src.service_bus_emitter.ServiceBusClient", return_value=mock_sb_client
+            ),
+        ):
             emitter = ServiceBusEmitter(
                 fully_qualified_namespace="test.servicebus.windows.net",
             )
@@ -140,7 +148,9 @@ class TestBuildDeadLetterMessage:
     def test_all_fields_present(self) -> None:
         msg = build_dead_letter_message(
             original_payload={"SiteID": 2, "measdatetime": "2026-01-15T12:00:00"},
-            error_details=[{"message": "missing field", "path": "/SiteID", "validator": "required"}],
+            error_details=[
+                {"message": "missing field", "path": "/SiteID", "validator": "required"}
+            ],
             correlation_id="test-corr",
             site_id=2,
             schema_version="v1",

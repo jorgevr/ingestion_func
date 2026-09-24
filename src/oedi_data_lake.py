@@ -11,7 +11,8 @@ import csv
 import io
 import logging
 import re
-from typing import Any
+from types import TracebackType
+from typing import Any, Self
 
 import httpx
 
@@ -126,7 +127,13 @@ class OediDataLakeClient:
         response = await self._get_with_retry(url)
 
         if response.status_code == 404:
-            logger.info("No data for system %d on %04d-%02d-%02d (404)", system_id, year, month, day)
+            logger.info(
+                "No data for system %d on %04d-%02d-%02d (404)",
+                system_id,
+                year,
+                month,
+                day,
+            )
             return []
 
         reader = csv.DictReader(io.StringIO(response.text))
@@ -144,10 +151,15 @@ class OediDataLakeClient:
         if self._http_client is not None and self._owns_client:
             await self._http_client.aclose()
 
-    async def __aenter__(self) -> OediDataLakeClient:
+    async def __aenter__(self) -> Self:
         return self
 
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         await self.close()
 
 

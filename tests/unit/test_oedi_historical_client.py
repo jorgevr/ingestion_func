@@ -15,7 +15,11 @@ PREFIX = "pvdaq/2023-solar-data-prize"
 _NS = "http://s3.amazonaws.com/doc/2006-03-01/"
 
 
-def _s3_xml_response(contents: list[tuple[str, int, str]], is_truncated: bool = False, next_token: str = "") -> str:
+def _s3_xml_response(
+    contents: list[tuple[str, int, str]],
+    is_truncated: bool = False,
+    next_token: str = "",
+) -> str:
     """Build a mock S3 ListObjectsV2 XML response."""
     items = ""
     for key, size, last_modified in contents:
@@ -27,7 +31,11 @@ def _s3_xml_response(contents: list[tuple[str, int, str]], is_truncated: bool = 
     </Contents>"""
 
     truncated = "true" if is_truncated else "false"
-    token_el = f"<NextContinuationToken>{next_token}</NextContinuationToken>" if next_token else ""
+    token_el = (
+        f"<NextContinuationToken>{next_token}</NextContinuationToken>"
+        if next_token
+        else ""
+    )
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="{_NS}">
@@ -52,8 +60,16 @@ class TestListCsvFiles:
     @pytest.mark.asyncio
     async def test_single_page_listing(self, client: OediHistoricalClient) -> None:
         files = [
-            (f"{PREFIX}/9068_OEDI/data/9068_ac_power_data.csv", 65000000, "2024-01-15T12:00:00Z"),
-            (f"{PREFIX}/9068_OEDI/data/9068_environment_data.csv", 288000000, "2024-01-15T12:00:00Z"),
+            (
+                f"{PREFIX}/9068_OEDI/data/9068_ac_power_data.csv",
+                65000000,
+                "2024-01-15T12:00:00Z",
+            ),
+            (
+                f"{PREFIX}/9068_OEDI/data/9068_environment_data.csv",
+                288000000,
+                "2024-01-15T12:00:00Z",
+            ),
         ]
         xml = _s3_xml_response(files)
         respx.get(BUCKET_URL).mock(return_value=httpx.Response(200, text=xml))
@@ -69,10 +85,18 @@ class TestListCsvFiles:
     @pytest.mark.asyncio
     async def test_paginated_listing(self, client: OediHistoricalClient) -> None:
         page1_files = [
-            (f"{PREFIX}/9068_OEDI/data/9068_ac_power_data.csv", 65000000, "2024-01-15T12:00:00Z"),
+            (
+                f"{PREFIX}/9068_OEDI/data/9068_ac_power_data.csv",
+                65000000,
+                "2024-01-15T12:00:00Z",
+            ),
         ]
         page2_files = [
-            (f"{PREFIX}/9068_OEDI/data/9068_environment_data.csv", 288000000, "2024-01-15T12:00:00Z"),
+            (
+                f"{PREFIX}/9068_OEDI/data/9068_environment_data.csv",
+                288000000,
+                "2024-01-15T12:00:00Z",
+            ),
         ]
         xml1 = _s3_xml_response(page1_files, is_truncated=True, next_token="token123")
         xml2 = _s3_xml_response(page2_files)
@@ -94,9 +118,15 @@ class TestListCsvFiles:
 
     @respx.mock
     @pytest.mark.asyncio
-    async def test_non_csv_files_filtered_out(self, client: OediHistoricalClient) -> None:
+    async def test_non_csv_files_filtered_out(
+        self, client: OediHistoricalClient
+    ) -> None:
         files = [
-            (f"{PREFIX}/9068_OEDI/data/9068_ac_power_data.csv", 100, "2024-01-15T12:00:00Z"),
+            (
+                f"{PREFIX}/9068_OEDI/data/9068_ac_power_data.csv",
+                100,
+                "2024-01-15T12:00:00Z",
+            ),
             (f"{PREFIX}/9068_OEDI/data/readme.txt", 50, "2024-01-15T12:00:00Z"),
         ]
         xml = _s3_xml_response(files)
@@ -109,7 +139,13 @@ class TestListCsvFiles:
     @respx.mock
     @pytest.mark.asyncio
     async def test_5xx_retry_then_success(self, client: OediHistoricalClient) -> None:
-        files = [(f"{PREFIX}/9068_OEDI/data/9068_ac_power_data.csv", 100, "2024-01-15T12:00:00Z")]
+        files = [
+            (
+                f"{PREFIX}/9068_OEDI/data/9068_ac_power_data.csv",
+                100,
+                "2024-01-15T12:00:00Z",
+            )
+        ]
         xml = _s3_xml_response(files)
 
         respx.get(BUCKET_URL).side_effect = [
@@ -152,7 +188,9 @@ class TestStreamCsvRows:
         s3_key = f"{PREFIX}/9068_OEDI/data/9068_ac_power_data.csv"
         url = f"{BUCKET_URL}/{s3_key}"
 
-        respx.get(url).mock(return_value=httpx.Response(200, content=csv_content.encode()))
+        respx.get(url).mock(
+            return_value=httpx.Response(200, content=csv_content.encode())
+        )
 
         rows = []
         async for row in client.stream_csv_rows(s3_key):
@@ -178,12 +216,16 @@ class TestStreamCsvRows:
 
     @respx.mock
     @pytest.mark.asyncio
-    async def test_header_only_csv_yields_nothing(self, client: OediHistoricalClient) -> None:
+    async def test_header_only_csv_yields_nothing(
+        self, client: OediHistoricalClient
+    ) -> None:
         csv_content = "measured_on,dc_power\n"
         s3_key = f"{PREFIX}/9068_OEDI/data/9068_empty.csv"
         url = f"{BUCKET_URL}/{s3_key}"
 
-        respx.get(url).mock(return_value=httpx.Response(200, content=csv_content.encode()))
+        respx.get(url).mock(
+            return_value=httpx.Response(200, content=csv_content.encode())
+        )
 
         rows = []
         async for row in client.stream_csv_rows(s3_key):

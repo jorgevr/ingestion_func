@@ -70,11 +70,23 @@ class TestEndToEndEmission:
         """Valid records from 2 sites produce correct emit_cloudevent calls."""
         site_records = {
             2: [
-                {"SiteID": 2, "measdatetime": "2026-01-15 12:00:00", "dc_power": 4800.0},
-                {"SiteID": 2, "measdatetime": "2026-01-15 12:05:00", "dc_power": 4810.0},
+                {
+                    "SiteID": 2,
+                    "measdatetime": "2026-01-15 12:00:00",
+                    "dc_power": 4800.0,
+                },
+                {
+                    "SiteID": 2,
+                    "measdatetime": "2026-01-15 12:05:00",
+                    "dc_power": 4810.0,
+                },
             ],
             34: [
-                {"SiteID": 34, "measdatetime": "2026-01-15 12:00:00", "dc_power": 3200.0},
+                {
+                    "SiteID": 34,
+                    "measdatetime": "2026-01-15 12:00:00",
+                    "dc_power": 3200.0,
+                },
             ],
         }
 
@@ -82,10 +94,12 @@ class TestEndToEndEmission:
         emitter = _mock_emitter()
         idem_store = _mock_idem_store()
 
-        with patch.dict(os.environ, _env_vars(), clear=True), \
-             patch("function_app.OediDataLakeClient", return_value=oedi_client), \
-             patch("function_app.ServiceBusEmitter", return_value=emitter), \
-             patch("function_app.IdempotencyStore", return_value=idem_store):
+        with (
+            patch.dict(os.environ, _env_vars(), clear=True),
+            patch("function_app.OediDataLakeClient", return_value=oedi_client),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.IdempotencyStore", return_value=idem_store),
+        ):
             from function_app import pvdaq_ingestion
 
             timer = MagicMock()
@@ -102,8 +116,15 @@ class TestEndToEndEmission:
         """Invalid records are dead-lettered, valid ones are emitted."""
         site_records = {
             2: [
-                {"SiteID": 2, "measdatetime": "2026-01-15 12:00:00", "dc_power": 4800.0},
-                {"measdatetime": "2026-01-15 12:05:00", "dc_power": 4810.0},  # Missing SiteID
+                {
+                    "SiteID": 2,
+                    "measdatetime": "2026-01-15 12:00:00",
+                    "dc_power": 4800.0,
+                },
+                {
+                    "measdatetime": "2026-01-15 12:05:00",
+                    "dc_power": 4810.0,
+                },  # Missing SiteID
             ],
             34: [],
         }
@@ -112,10 +133,12 @@ class TestEndToEndEmission:
         emitter = _mock_emitter()
         idem_store = _mock_idem_store()
 
-        with patch.dict(os.environ, _env_vars(), clear=True), \
-             patch("function_app.OediDataLakeClient", return_value=oedi_client), \
-             patch("function_app.ServiceBusEmitter", return_value=emitter), \
-             patch("function_app.IdempotencyStore", return_value=idem_store):
+        with (
+            patch.dict(os.environ, _env_vars(), clear=True),
+            patch("function_app.OediDataLakeClient", return_value=oedi_client),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.IdempotencyStore", return_value=idem_store),
+        ):
             from function_app import pvdaq_ingestion
 
             timer = MagicMock()
@@ -132,10 +155,12 @@ class TestEndToEndEmission:
         emitter = _mock_emitter()
         idem_store = _mock_idem_store()
 
-        with patch.dict(os.environ, _env_vars(), clear=True), \
-             patch("function_app.OediDataLakeClient", return_value=oedi_client), \
-             patch("function_app.ServiceBusEmitter", return_value=emitter), \
-             patch("function_app.IdempotencyStore", return_value=idem_store):
+        with (
+            patch.dict(os.environ, _env_vars(), clear=True),
+            patch("function_app.OediDataLakeClient", return_value=oedi_client),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.IdempotencyStore", return_value=idem_store),
+        ):
             from function_app import pvdaq_ingestion
 
             timer = MagicMock()
@@ -149,8 +174,16 @@ class TestEndToEndEmission:
     async def test_site_discovery_from_oedi(self) -> None:
         """When PVDAQ_SITE_IDS is empty, sites are discovered from OEDI systems CSV."""
         site_records = {
-            2: [{"SiteID": 2, "measdatetime": "2026-01-15 12:00:00", "dc_power": 4800.0}],
-            34: [{"SiteID": 34, "measdatetime": "2026-01-15 12:00:00", "dc_power": 3200.0}],
+            2: [
+                {"SiteID": 2, "measdatetime": "2026-01-15 12:00:00", "dc_power": 4800.0}
+            ],
+            34: [
+                {
+                    "SiteID": 34,
+                    "measdatetime": "2026-01-15 12:00:00",
+                    "dc_power": 3200.0,
+                }
+            ],
         }
 
         oedi_client = _mock_oedi_client(site_records)
@@ -162,10 +195,12 @@ class TestEndToEndEmission:
         env["PVDAQ_SITE_IDS"] = ""  # Empty — triggers discovery
         env["PVDAQ_SITE_COUNT"] = "2"
 
-        with patch.dict(os.environ, env, clear=True), \
-             patch("function_app.OediDataLakeClient", return_value=oedi_client), \
-             patch("function_app.ServiceBusEmitter", return_value=emitter), \
-             patch("function_app.IdempotencyStore", return_value=idem_store):
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("function_app.OediDataLakeClient", return_value=oedi_client),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.IdempotencyStore", return_value=idem_store),
+        ):
             from function_app import pvdaq_ingestion
 
             timer = MagicMock()
@@ -188,16 +223,24 @@ class TestEndToEndEmission:
         async def _fetch(system_id: int, year: int, month: int, day: int) -> list[dict]:
             if system_id == 2:
                 raise OediAccessError("S3 timeout for site 2")
-            return [{"SiteID": 34, "measdatetime": "2026-01-15 12:00:00", "dc_power": 3200.0}]
+            return [
+                {
+                    "SiteID": 34,
+                    "measdatetime": "2026-01-15 12:00:00",
+                    "dc_power": 3200.0,
+                }
+            ]
 
         oedi_client.fetch_daily_site_data = AsyncMock(side_effect=_fetch)
         emitter = _mock_emitter()
         idem_store = _mock_idem_store()
 
-        with patch.dict(os.environ, _env_vars(), clear=True), \
-             patch("function_app.OediDataLakeClient", return_value=oedi_client), \
-             patch("function_app.ServiceBusEmitter", return_value=emitter), \
-             patch("function_app.IdempotencyStore", return_value=idem_store):
+        with (
+            patch.dict(os.environ, _env_vars(), clear=True),
+            patch("function_app.OediDataLakeClient", return_value=oedi_client),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.IdempotencyStore", return_value=idem_store),
+        ):
             from function_app import pvdaq_ingestion
 
             timer = MagicMock()
@@ -212,8 +255,16 @@ class TestEndToEndEmission:
         """Duplicate records (per idempotency store) are skipped, not emitted."""
         site_records = {
             2: [
-                {"SiteID": 2, "measdatetime": "2026-01-15 12:00:00", "dc_power": 4800.0},
-                {"SiteID": 2, "measdatetime": "2026-01-15 12:05:00", "dc_power": 4810.0},
+                {
+                    "SiteID": 2,
+                    "measdatetime": "2026-01-15 12:00:00",
+                    "dc_power": 4800.0,
+                },
+                {
+                    "SiteID": 2,
+                    "measdatetime": "2026-01-15 12:05:00",
+                    "dc_power": 4810.0,
+                },
             ],
             34: [],
         }
@@ -226,10 +277,12 @@ class TestEndToEndEmission:
             side_effect=[IdempotencyResult.NEW, IdempotencyResult.DUPLICATE]
         )
 
-        with patch.dict(os.environ, _env_vars(), clear=True), \
-             patch("function_app.OediDataLakeClient", return_value=oedi_client), \
-             patch("function_app.ServiceBusEmitter", return_value=emitter), \
-             patch("function_app.IdempotencyStore", return_value=idem_store):
+        with (
+            patch.dict(os.environ, _env_vars(), clear=True),
+            patch("function_app.OediDataLakeClient", return_value=oedi_client),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.IdempotencyStore", return_value=idem_store),
+        ):
             from function_app import pvdaq_ingestion
 
             timer = MagicMock()
@@ -244,7 +297,9 @@ class TestEndToEndEmission:
     async def test_generic_exception_in_record_processing(self) -> None:
         """Unexpected exception during record processing is caught and logged."""
         site_records = {
-            2: [{"SiteID": 2, "measdatetime": "2026-01-15 12:00:00", "dc_power": 4800.0}],
+            2: [
+                {"SiteID": 2, "measdatetime": "2026-01-15 12:00:00", "dc_power": 4800.0}
+            ],
             34: [],
         }
 
@@ -253,10 +308,12 @@ class TestEndToEndEmission:
         emitter.emit_cloudevent = AsyncMock(side_effect=RuntimeError("unexpected boom"))
         idem_store = _mock_idem_store()
 
-        with patch.dict(os.environ, _env_vars(), clear=True), \
-             patch("function_app.OediDataLakeClient", return_value=oedi_client), \
-             patch("function_app.ServiceBusEmitter", return_value=emitter), \
-             patch("function_app.IdempotencyStore", return_value=idem_store):
+        with (
+            patch.dict(os.environ, _env_vars(), clear=True),
+            patch("function_app.OediDataLakeClient", return_value=oedi_client),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.IdempotencyStore", return_value=idem_store),
+        ):
             from function_app import pvdaq_ingestion
 
             timer = MagicMock()

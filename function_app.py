@@ -1,4 +1,3 @@
-
 """Azure Functions entry point for PVDAQ ingestion.
 
 Registers:
@@ -58,6 +57,7 @@ def _adls_uri(account_url: str, container: str, path: str) -> str:
     For production (HTTPS DFS endpoint), returns ``abfss://container@account.dfs.core.windows.net/path``.
     """
     from urllib.parse import urlparse
+
     parsed = urlparse(account_url)
     if parsed.scheme == "http":
         return f"{account_url.rstrip('/')}/{container}/{path}"
@@ -108,10 +108,7 @@ def _metadata_path(site_id: int, category: str, ingestion_date: str) -> str:
     """
     dataset = f"{site_id}_{category}"
     return (
-        f"source=pvdaq"
-        f"/dataset={dataset}"
-        f"/ingestion_date={ingestion_date}"
-        f"/metadata.json"
+        f"source=pvdaq/dataset={dataset}/ingestion_date={ingestion_date}/metadata.json"
     )
 
 
@@ -188,7 +185,10 @@ async def pvdaq_ingestion(timer: func.TimerRequest) -> None:
     if config.mapping_version_pvdaq == "unknown":
         emit_warning_metric(
             metric_name="mapping_version_unknown",
-            details={"mapping_version": config.mapping_version_pvdaq, "vendor": "PVDAQ"},
+            details={
+                "mapping_version": config.mapping_version_pvdaq,
+                "vendor": "PVDAQ",
+            },
         )
 
     logger.info(
@@ -199,15 +199,18 @@ async def pvdaq_ingestion(timer: func.TimerRequest) -> None:
     dates = _date_range(config.pvdaq_lookback_hours)
     failed_sites: list[int] = []
 
-    async with OediDataLakeClient(
-        bucket_url=config.oedi_bucket_url,
-        systems_key=config.oedi_systems_key,
-        data_prefix=config.oedi_data_prefix,
-    ) as oedi_client, _make_emitter(config) as emitter, IdempotencyStore(
-        table_name=config.idempotency_table_name,
-        table_service_uri=config.table_storage_uri,
-    ) as idem_store:
-
+    async with (
+        OediDataLakeClient(
+            bucket_url=config.oedi_bucket_url,
+            systems_key=config.oedi_systems_key,
+            data_prefix=config.oedi_data_prefix,
+        ) as oedi_client,
+        _make_emitter(config) as emitter,
+        IdempotencyStore(
+            table_name=config.idempotency_table_name,
+            table_service_uri=config.table_storage_uri,
+        ) as idem_store,
+    ):
         # Resolve site IDs: use explicit list if configured, otherwise discover
         if config.pvdaq_site_ids:
             site_ids = config.pvdaq_site_ids
@@ -260,22 +263,24 @@ async def pvdaq_ingestion(timer: func.TimerRequest) -> None:
                             emitter=emitter,
                             idem_store=idem_store,
                             stats=stats,
-                            check_idempotency=lambda: idem_store.check_and_reserve(
-                                site_id=record_site_id,
-                                measdatetime=measdatetime,
-                                correlation_id=correlation_id,
+                            check_idempotency=lambda site_id=record_site_id, measdatetime=measdatetime: (
+                                idem_store.check_and_reserve(
+                                    site_id=site_id,
+                                    measdatetime=measdatetime,
+                                    correlation_id=correlation_id,
+                                )
                             ),
-                            mark_completed=lambda: idem_store.mark_completed_for(
-                                site_id=record_site_id,
-                                measdatetime=measdatetime,
+                            mark_completed=lambda site_id=record_site_id, measdatetime=measdatetime: (
+                                idem_store.mark_completed_for(
+                                    site_id=site_id,
+                                    measdatetime=measdatetime,
+                                )
                             ),
                         )
-                    except Exception as exc:
-                        logger.error(
-                            "Error processing record from site %s: %s",
+                    except Exception:
+                        logger.exception(
+                            "Error processing record from site %s",
                             record.get("SiteID", "unknown"),
-                            exc,
-                            exc_info=True,
                         )
 
     stats.duration_ms = (time.monotonic() - start_time) * 1000
@@ -311,11 +316,15 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
     3. Enqueue a work-item message per unprocessed file (mark_queued before send)
     """
     correlation_id = str(uuid4())
-    logger = create_logger(correlation_id, vendor="PVDAQ", function_name="historical_dispatcher")
+    logger = create_logger(
+        correlation_id, vendor="PVDAQ", function_name="historical_dispatcher"
+    )
     start_time = time.monotonic()
 
     config = load_historical_config()
-    stats = DatasetIngestionStats(source="PVDAQ-historical-dispatcher", correlation_id=correlation_id)
+    stats = DatasetIngestionStats(
+        source="PVDAQ-historical-dispatcher", correlation_id=correlation_id
+    )
     failed_sites: list[int] = []
 
     logger.info(
@@ -323,21 +332,26 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
         config.pvdaq_historical_site_ids,
     )
 
-    async with OediHistoricalClient(
-        bucket_url=config.oedi_bucket_url,
-        historical_prefix=config.oedi_historical_prefix,
-    ) as oedi_client, FileTrackingStore(
-        table_name=config.file_tracking_table_name,
-        table_service_uri=config.table_storage_uri,
-        connection_string=_storage_connection_string(),
-    ) as tracker, _make_emitter(config) as emitter:
-
+    async with (
+        OediHistoricalClient(
+            bucket_url=config.oedi_bucket_url,
+            historical_prefix=config.oedi_historical_prefix,
+        ) as oedi_client,
+        FileTrackingStore(
+            table_name=config.file_tracking_table_name,
+            table_service_uri=config.table_storage_uri,
+            connection_string=_storage_connection_string(),
+        ) as tracker,
+        _make_emitter(config) as emitter,
+    ):
         for site_id in config.pvdaq_historical_site_ids:
             try:
                 discovered = await oedi_client.list_csv_files(site_id)
             except OediHistoricalAccessError as exc:
                 logger.error(
-                    "Failed to list files for site %d: %s", site_id, exc,
+                    "Failed to list files for site %d: %s",
+                    site_id,
+                    exc,
                 )
                 failed_sites.append(site_id)
                 continue
@@ -350,7 +364,9 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
 
             unprocessed = await tracker.get_unprocessed_files(site_id, discovered)
             if not unprocessed:
-                logger.info("Site %d: all %d files already processed", site_id, len(discovered))
+                logger.info(
+                    "Site %d: all %d files already processed", site_id, len(discovered)
+                )
                 continue
 
             for file_info in unprocessed:
@@ -412,7 +428,9 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
     work_item = json.loads(raw_body)
 
     correlation_id: str = work_item.get("correlation_id", "unknown")
-    logger = create_logger(correlation_id, vendor="PVDAQ", function_name="historical_worker")
+    logger = create_logger(
+        correlation_id, vendor="PVDAQ", function_name="historical_worker"
+    )
 
     config = load_historical_config()
 
@@ -447,23 +465,28 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
     span_id = uuid4().hex[:16]
     traceparent = f"00-{trace_id}-{span_id}-01"
 
-    stats = DatasetIngestionStats(source="PVDAQ-historical-worker", correlation_id=correlation_id)
+    stats = DatasetIngestionStats(
+        source="PVDAQ-historical-worker", correlation_id=correlation_id
+    )
     ingestion_id = str(uuid4())
 
     logger.info("Historical worker started — site=%d, file=%s", site_id, file_name)
 
     source_url = f"{config.oedi_bucket_url.rstrip('/')}/{s3_key}"
 
-    async with FileTrackingStore(
-        table_name=config.file_tracking_table_name,
-        table_service_uri=config.table_storage_uri,
-        connection_string=_storage_connection_string(),
-    ) as tracker, AdlsStore(
-        account_url=config.adls_account_url,
-        container_name=config.adls_container_name,
-        connection_string=_storage_connection_string(),
-    ) as adls, _make_emitter(config) as emitter:
-
+    async with (
+        FileTrackingStore(
+            table_name=config.file_tracking_table_name,
+            table_service_uri=config.table_storage_uri,
+            connection_string=_storage_connection_string(),
+        ) as tracker,
+        AdlsStore(
+            account_url=config.adls_account_url,
+            container_name=config.adls_container_name,
+            connection_string=_storage_connection_string(),
+        ) as adls,
+        _make_emitter(config) as emitter,
+    ):
         # Version resolution — determines append-only version before any writes
         existing_versions = await tracker.get_versions(site_id, s3_key)
         version = max(existing_versions, default=0) + 1
@@ -566,7 +589,9 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
                     "site_id": site_id,
                     "category": category,
                     "file_format": "csv",
-                    "storage_path": _adls_uri(config.adls_account_url, config.adls_container_name, adls_path),
+                    "storage_path": _adls_uri(
+                        config.adls_account_url, config.adls_container_name, adls_path
+                    ),
                     "version": version,
                     "ingestion_id": ingestion_id,
                     "source_url": source_url,
@@ -586,9 +611,10 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
 
         except (AdlsUploadError, Exception) as exc:
             stats.datasets_failed = 1
-            logger.error(
-                "Historical worker failed — site=%d, file=%s: %s",
-                site_id, file_name, exc, exc_info=True,
+            logger.exception(
+                "Historical worker failed — site=%d, file=%s",
+                site_id,
+                file_name,
             )
             await tracker.mark_failed(site_id, s3_key, version)
             await emitter.emit_dead_letter(
@@ -607,7 +633,10 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
 
     logger.info(
         "Historical worker completed — site=%d, file=%s, bytes=%d, stored=%d, emitted=%d, duration_ms=%.0f",
-        site_id, file_name, bytes_written,
-        stats.datasets_stored, stats.datasets_emitted,
+        site_id,
+        file_name,
+        bytes_written,
+        stats.datasets_stored,
+        stats.datasets_emitted,
         stats.duration_ms,
     )
