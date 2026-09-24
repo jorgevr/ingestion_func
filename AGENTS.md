@@ -26,7 +26,8 @@ Run from this directory (repo root; tests import `src.*`).
 | Purpose | Command | Notes |
 | :--- | :--- | :--- |
 | Setup | `pip install -r requirements-dev.txt` | Works. |
-| Lint | `ruff check .` | Works — passes clean. `ruff.toml` excludes `.claude/`. |
+| Lint | `ruff check .` | Works — passes clean. `ruff.toml` excludes `.claude/` and `specs/`. |
+| Format check | `ruff format --check .` | Works — passes clean (same excludes). |
 | Unit + contract tests | `pytest tests/unit tests/contract` | Works — 173 passed. |
 | All tests | `pytest` | Works — 197 passed. `tests/integration/` is fully mocked (respx/`AsyncMock`); no live Azurite/Service Bus needed to pass today. |
 | Run locally | `func start` | **Not run.** Needs Azurite + Service Bus emulator from the workspace root `docker-compose.yml`. |

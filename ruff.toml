@@ -1,1 +1,1 @@
-extend-exclude = [".claude"]
+extend-exclude = [".claude", "specs"]
