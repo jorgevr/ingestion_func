@@ -46,3 +46,8 @@ Thumbs.db
 # Claude Code (may contain secrets like PATs)
 .claude/settings.json
 .claude/settings.json.txt
+
+# Azurite (VS Code extension workspace folder) and coverage
+.azurite/
+.coverage
+cov_annotate/
