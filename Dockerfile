@@ -1,5 +1,7 @@
 # ---- Build Stage ----
-FROM python:3.11-slim AS build
+# Same base as the runtime stage (glibc-compatible) so wheels built here,
+# e.g. cryptography, load without GLIBC version mismatches at runtime.
+FROM mcr.microsoft.com/azure-functions/python:4-python3.11-buildenv AS build
 
 WORKDIR /build
 
