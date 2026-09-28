@@ -219,7 +219,8 @@ class TestIdempotencyContextManager:
         from unittest.mock import patch
 
         mock_cred = MagicMock()
-        mock_table_client = MagicMock()
+        mock_table_client = AsyncMock()
+        mock_table_client.create_table = AsyncMock(return_value=None)
 
         with (
             patch(
@@ -235,6 +236,61 @@ class TestIdempotencyContextManager:
 
         assert client is mock_table_client
         assert store._credential is mock_cred
+        mock_table_client.create_table.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_get_client_uses_connection_string_when_set(self) -> None:
+        """_get_client uses TableClient.from_connection_string in local/emulator mode
+        (ADR 0005) instead of DefaultAzureCredential, and does not create a credential.
+        """
+        from unittest.mock import patch
+
+        mock_table_client = AsyncMock()
+        mock_table_client.create_table = AsyncMock(return_value=None)
+
+        with patch(
+            "src.idempotency_store.TableClient.from_connection_string",
+            return_value=mock_table_client,
+        ) as mock_from_conn:
+            store = IdempotencyStore(
+                table_name="PvdaqIdempotency",
+                table_service_uri="https://test.table.core.windows.net",
+                connection_string="UseDevelopmentStorage=true",
+            )
+            client = await store._get_client()
+
+        mock_from_conn.assert_called_once_with(
+            conn_str="UseDevelopmentStorage=true",
+            table_name="PvdaqIdempotency",
+        )
+        assert client is mock_table_client
+        assert store._credential is None
+        mock_table_client.create_table.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_get_client_ignores_table_already_exists(self) -> None:
+        """create_table raising ResourceExistsError (table already present) is swallowed."""
+        from unittest.mock import patch
+
+        from azure.core.exceptions import ResourceExistsError
+
+        mock_table_client = AsyncMock()
+        mock_table_client.create_table = AsyncMock(
+            side_effect=ResourceExistsError("Table already exists")
+        )
+
+        with patch(
+            "src.idempotency_store.TableClient.from_connection_string",
+            return_value=mock_table_client,
+        ):
+            store = IdempotencyStore(
+                table_name="PvdaqIdempotency",
+                table_service_uri="https://test.table.core.windows.net",
+                connection_string="UseDevelopmentStorage=true",
+            )
+            client = await store._get_client()
+
+        assert client is mock_table_client
 
     @pytest.mark.asyncio
     async def test_close_owned_client(self) -> None:

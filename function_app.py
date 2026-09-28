@@ -10,6 +10,7 @@ Data source: OEDI Data Lake (public S3 bucket).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -48,22 +49,6 @@ app = func.FunctionApp()
 # ---------------------------------------------------------------------------
 
 _WORK_ITEM_VALIDATOR: Draft202012Validator | None = None
-
-
-def _adls_uri(account_url: str, container: str, path: str) -> str:
-    """Build a full ADLS URI from account URL, container, and relative path.
-
-    For Azurite (HTTP), returns ``http://host/account/container/path``.
-    For production (HTTPS DFS endpoint), returns ``abfss://container@account.dfs.core.windows.net/path``.
-    """
-    from urllib.parse import urlparse
-
-    parsed = urlparse(account_url)
-    if parsed.scheme == "http":
-        return f"{account_url.rstrip('/')}/{container}/{path}"
-    # Production: https://account.dfs.core.windows.net → abfss://container@account.dfs.core.windows.net/path
-    account_name = parsed.hostname.split(".")[0]
-    return f"abfss://{container}@{account_name}.dfs.core.windows.net/{path}"
 
 
 def _get_work_item_validator() -> Draft202012Validator:
@@ -112,11 +97,25 @@ def _metadata_path(site_id: int, category: str, ingestion_date: str) -> str:
     )
 
 
-def _storage_connection_string() -> str | None:
-    """Return the storage connection string when running against the local emulator."""
-    if os.environ.get("STORAGE_EMULATOR", "").lower() == "true":
-        return "UseDevelopmentStorage=true"
-    return None
+def _storage_connection_string(
+    logger: logging.LoggerAdapter | None = None,
+) -> str | None:
+    """Return the local storage connection string when configured, else ``None``.
+
+    ``DATA_STORAGE_CONNECTION`` (e.g. pointing at Azurite) selects the
+    connection-string branch of the Blob/Table clients; when unset, callers
+    fall back to their account-URL + ``DefaultAzureCredential`` branch (cloud).
+    Named to match ``DATA_STORAGE_ACCOUNT_URL`` / ``BRONZE_CONTAINER`` — the
+    cross-service storage config names this repo has adopted per the
+    Contract Owner's naming request, pending a matching write-up in
+    docs/contracts.md. When *logger* is given, logs which mode was selected
+    for this invocation.
+    """
+    conn_str = os.environ.get("DATA_STORAGE_CONNECTION", "").strip() or None
+    if logger is not None:
+        mode = "connection_string" if conn_str else "default_azure_credential"
+        logger.info("Storage client mode selected: %s", mode)
+    return conn_str
 
 
 def _make_emitter(config):
@@ -209,6 +208,7 @@ async def pvdaq_ingestion(timer: func.TimerRequest) -> None:
         IdempotencyStore(
             table_name=config.idempotency_table_name,
             table_service_uri=config.table_storage_uri,
+            connection_string=_storage_connection_string(logger),
         ) as idem_store,
     ):
         # Resolve site IDs: use explicit list if configured, otherwise discover
@@ -340,7 +340,7 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
         FileTrackingStore(
             table_name=config.file_tracking_table_name,
             table_service_uri=config.table_storage_uri,
-            connection_string=_storage_connection_string(),
+            connection_string=_storage_connection_string(logger),
         ) as tracker,
         _make_emitter(config) as emitter,
     ):
@@ -473,17 +473,18 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
     logger.info("Historical worker started — site=%d, file=%s", site_id, file_name)
 
     source_url = f"{config.oedi_bucket_url.rstrip('/')}/{s3_key}"
+    storage_conn_str = _storage_connection_string(logger)
 
     async with (
         FileTrackingStore(
             table_name=config.file_tracking_table_name,
             table_service_uri=config.table_storage_uri,
-            connection_string=_storage_connection_string(),
+            connection_string=storage_conn_str,
         ) as tracker,
         AdlsStore(
-            account_url=config.adls_account_url,
-            container_name=config.adls_container_name,
-            connection_string=_storage_connection_string(),
+            account_url=config.data_storage_account_url,
+            container_name=config.bronze_container,
+            connection_string=storage_conn_str,
         ) as adls,
         _make_emitter(config) as emitter,
     ):
@@ -589,9 +590,7 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
                     "site_id": site_id,
                     "category": category,
                     "file_format": "csv",
-                    "storage_path": _adls_uri(
-                        config.adls_account_url, config.adls_container_name, adls_path
-                    ),
+                    "storage_path": await adls.blob_url(adls_path),
                     "version": version,
                     "ingestion_id": ingestion_id,
                     "source_url": source_url,

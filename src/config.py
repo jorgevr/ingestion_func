@@ -70,9 +70,12 @@ class HistoricalConfig:
     file_tracking_table_name: str
     table_storage_uri: str
 
-    # ADLS Gen2
-    adls_account_url: str
-    adls_container_name: str
+    # Data storage (Blob API, ADR 0005) — shared names, docs/contracts.md
+    # "Shared configuration": at least one of DATA_STORAGE_CONNECTION /
+    # DATA_STORAGE_ACCOUNT_URL must be set; data_storage_account_url is ""
+    # when only the connection string is configured (local/emulator mode).
+    data_storage_account_url: str
+    bronze_container: str
 
     # Metadata
     tenant_id: str
@@ -92,6 +95,13 @@ _REQUIRED_SETTINGS: list[str] = [
 # Required only when ServiceBusConnection (connection string) is not set
 _REQUIRED_WHEN_NO_CONN_STR: list[str] = [
     "ServiceBusConnection__fullyQualifiedNamespace",
+]
+
+# Required only when DATA_STORAGE_CONNECTION (connection string) is not set —
+# i.e. at least one of the two must be present, or storage clients have no way
+# to build a BlobServiceClient (docs/contracts.md "Shared configuration").
+_REQUIRED_WHEN_NO_DATA_STORAGE_CONN_STR: list[str] = [
+    "DATA_STORAGE_ACCOUNT_URL",
 ]
 
 
@@ -173,8 +183,7 @@ _HISTORICAL_REQUIRED_SETTINGS: list[str] = [
     "DEAD_LETTER_QUEUE_NAME",
     "FILE_TRACKING_TABLE_NAME",
     "TableStorageConnection__tableServiceUri",
-    "ADLS_ACCOUNT_URL",
-    "ADLS_CONTAINER_NAME",
+    "BRONZE_CONTAINER",
 ]
 
 
@@ -195,6 +204,12 @@ def load_historical_config() -> HistoricalConfig:
     if not os.environ.get("ServiceBusConnection", "").strip():
         missing += [
             n for n in _REQUIRED_WHEN_NO_CONN_STR if not os.environ.get(n, "").strip()
+        ]
+    if not os.environ.get("DATA_STORAGE_CONNECTION", "").strip():
+        missing += [
+            n
+            for n in _REQUIRED_WHEN_NO_DATA_STORAGE_CONN_STR
+            if not os.environ.get(n, "").strip()
         ]
     if missing:
         raise ConfigurationError(
@@ -221,8 +236,11 @@ def load_historical_config() -> HistoricalConfig:
         ),
         file_tracking_table_name=_require("FILE_TRACKING_TABLE_NAME"),
         table_storage_uri=_require("TableStorageConnection__tableServiceUri"),
-        adls_account_url=_require("ADLS_ACCOUNT_URL"),
-        adls_container_name=_require("ADLS_CONTAINER_NAME"),
+        # Not _require(): the "missing" check above already guarantees at
+        # least one of DATA_STORAGE_CONNECTION / DATA_STORAGE_ACCOUNT_URL is
+        # set: when the former covers it, this may legitimately be blank.
+        data_storage_account_url=os.environ.get("DATA_STORAGE_ACCOUNT_URL", "").strip(),
+        bronze_container=_require("BRONZE_CONTAINER"),
         tenant_id=os.environ.get("TENANT_ID", "default").strip(),
         mapping_version_pvdaq=os.environ.get(
             "MAPPING_VERSION_PVDAQ", "unknown"

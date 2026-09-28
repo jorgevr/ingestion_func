@@ -288,8 +288,8 @@ def _historical_env() -> dict[str, str]:
         "ServiceBusConnection__fullyQualifiedNamespace": "test-sb.servicebus.windows.net",
         "FILE_TRACKING_TABLE_NAME": "PvdaqFileTracking",
         "TableStorageConnection__tableServiceUri": "https://teststorage.table.core.windows.net",
-        "ADLS_ACCOUNT_URL": "https://testaccount.dfs.core.windows.net",
-        "ADLS_CONTAINER_NAME": "raw",
+        "DATA_STORAGE_ACCOUNT_URL": "https://testaccount.blob.core.windows.net",
+        "BRONZE_CONTAINER": "raw",
     }
 
 
@@ -308,8 +308,10 @@ class TestLoadHistoricalConfigValid:
         assert cfg.file_tracking_table_name == "PvdaqFileTracking"
         assert cfg.service_bus_queue_name == "raw-energy-events"
         assert cfg.dead_letter_queue_name == "pvdaq-dead-letter"
-        assert cfg.adls_account_url == "https://testaccount.dfs.core.windows.net"
-        assert cfg.adls_container_name == "raw"
+        assert (
+            cfg.data_storage_account_url == "https://testaccount.blob.core.windows.net"
+        )
+        assert cfg.bronze_container == "raw"
 
     def test_oedi_historical_prefix_default(self) -> None:
         env = _historical_env()
@@ -410,3 +412,59 @@ class TestHistoricalMissingRequired:
             pytest.raises(ConfigurationError, match="PVDAQ_HISTORICAL_CRON_SCHEDULE"),
         ):
             load_historical_config()
+
+    def test_missing_bronze_container_raises(self) -> None:
+        env = _historical_env()
+        del env["BRONZE_CONTAINER"]
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ConfigurationError, match="BRONZE_CONTAINER"),
+        ):
+            load_historical_config()
+
+
+class TestDataStorageConnectionOrAccountUrlRequired:
+    """docs/contracts.md 'Shared configuration': at least one of
+    DATA_STORAGE_CONNECTION / DATA_STORAGE_ACCOUNT_URL must be set, or
+    config loading fails fast rather than deferring to a confusing SDK
+    error deep inside AdlsStore."""
+
+    def test_neither_set_raises(self) -> None:
+        env = _historical_env()
+        del env["DATA_STORAGE_ACCOUNT_URL"]
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ConfigurationError, match="DATA_STORAGE_ACCOUNT_URL"),
+        ):
+            load_historical_config()
+
+    def test_connection_string_only_succeeds_with_blank_account_url(self) -> None:
+        env = _historical_env()
+        del env["DATA_STORAGE_ACCOUNT_URL"]
+        env["DATA_STORAGE_CONNECTION"] = "UseDevelopmentStorage=true"
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_historical_config()
+
+        assert cfg.data_storage_account_url == ""
+        assert cfg.bronze_container == "raw"
+
+    def test_account_url_only_succeeds(self) -> None:
+        env = _historical_env()
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_historical_config()
+
+        assert (
+            cfg.data_storage_account_url == "https://testaccount.blob.core.windows.net"
+        )
+
+    def test_both_set_prefers_neither_fails(self) -> None:
+        """Both present is not an error — DATA_STORAGE_CONNECTION still wins
+        at the AdlsStore level; config loading only asserts at-least-one."""
+        env = _historical_env()
+        env["DATA_STORAGE_CONNECTION"] = "UseDevelopmentStorage=true"
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_historical_config()
+
+        assert (
+            cfg.data_storage_account_url == "https://testaccount.blob.core.windows.net"
+        )

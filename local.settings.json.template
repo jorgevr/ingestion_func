@@ -23,6 +23,10 @@
     "PVDAQ_HISTORICAL_CRON_SCHEDULE": "0 0 */6 * * *",
     "PVDAQ_HISTORICAL_QUEUE_NAME": "pvdaq-historical-work",
     "FILE_TRACKING_TABLE_NAME": "PvdaqFileTracking",
-    "OEDI_HISTORICAL_PREFIX": "pvdaq/2023-solar-data-prize"
+    "OEDI_HISTORICAL_PREFIX": "pvdaq/2023-solar-data-prize",
+
+    "DATA_STORAGE_CONNECTION": "UseDevelopmentStorage=true",
+    "DATA_STORAGE_ACCOUNT_URL": "http://127.0.0.1:10000/devstoreaccount1",
+    "BRONZE_CONTAINER": "bronze"
   }
 }
