@@ -246,6 +246,50 @@ class TestMissingRequired:
             load_config()
 
 
+class TestServiceBusModes:
+    """load_config: local (connection string) vs cloud (namespace + managed
+    identity) Service Bus modes — regression coverage for src/config.py:234's
+    unconditional _require("ServiceBusConnection__fullyQualifiedNamespace"),
+    which crashed load_config()/load_historical_config() in local mode even
+    though the pre-check correctly treated the setting as optional there."""
+
+    def test_local_mode_connection_string_only_succeeds(self) -> None:
+        """Only ServiceBusConnection set, no …__fullyQualifiedNamespace at all."""
+        env = _base_env()
+        del env["ServiceBusConnection__fullyQualifiedNamespace"]
+        env["ServiceBusConnection"] = (
+            "Endpoint=sb://localhost;SharedAccessKeyName=Root;"
+            "SharedAccessKey=test;UseDevelopmentEmulator=true;"
+        )
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_config()
+
+        assert cfg.service_bus_fully_qualified_namespace == ""
+
+    def test_cloud_mode_namespace_only_succeeds(self) -> None:
+        """Only …__fullyQualifiedNamespace set, no ServiceBusConnection at all."""
+        env = _base_env()
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_config()
+
+        assert (
+            cfg.service_bus_fully_qualified_namespace
+            == "test-sb.servicebus.windows.net"
+        )
+
+    def test_missing_both_raises(self) -> None:
+        env = _base_env()
+        del env["ServiceBusConnection__fullyQualifiedNamespace"]
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(
+                ConfigurationError,
+                match="ServiceBusConnection__fullyQualifiedNamespace",
+            ),
+        ):
+            load_config()
+
+
 class TestRequireDirectly:
     """Direct tests for the _require helper function."""
 
@@ -468,3 +512,65 @@ class TestDataStorageConnectionOrAccountUrlRequired:
         assert (
             cfg.data_storage_account_url == "https://testaccount.blob.core.windows.net"
         )
+
+
+class TestHistoricalServiceBusModes:
+    """load_historical_config: the same local/cloud Service Bus split as
+    Config, and it must not call _require() on the conditional field —
+    regression coverage for src/config.py:234's unconditional _require bug."""
+
+    def test_local_mode_connection_string_only_succeeds(self) -> None:
+        """Only ServiceBusConnection set, no …__fullyQualifiedNamespace at all."""
+        env = _historical_env()
+        del env["ServiceBusConnection__fullyQualifiedNamespace"]
+        env["ServiceBusConnection"] = (
+            "Endpoint=sb://localhost;SharedAccessKeyName=Root;"
+            "SharedAccessKey=test;UseDevelopmentEmulator=true;"
+        )
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_historical_config()
+
+        assert cfg.service_bus_fully_qualified_namespace == ""
+
+    def test_cloud_mode_namespace_only_succeeds(self) -> None:
+        """Only …__fullyQualifiedNamespace set, no ServiceBusConnection at all."""
+        env = _historical_env()
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_historical_config()
+
+        assert (
+            cfg.service_bus_fully_qualified_namespace
+            == "test-sb.servicebus.windows.net"
+        )
+
+    def test_missing_both_raises(self) -> None:
+        env = _historical_env()
+        del env["ServiceBusConnection__fullyQualifiedNamespace"]
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(
+                ConfigurationError,
+                match="ServiceBusConnection__fullyQualifiedNamespace",
+            ),
+        ):
+            load_historical_config()
+
+
+class TestMissingBothModesNamesBothKeys:
+    """When neither Service Bus nor storage alternative is configured, the
+    single ConfigurationError must name both missing keys — not stop at the
+    first, and not silently proceed with a half-built config."""
+
+    def test_missing_all_mode_dependent_settings_names_both_keys(self) -> None:
+        env = _historical_env()
+        del env["ServiceBusConnection__fullyQualifiedNamespace"]
+        del env["DATA_STORAGE_ACCOUNT_URL"]
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ConfigurationError) as exc_info,
+        ):
+            load_historical_config()
+
+        message = str(exc_info.value)
+        assert "ServiceBusConnection__fullyQualifiedNamespace" in message
+        assert "DATA_STORAGE_ACCOUNT_URL" in message

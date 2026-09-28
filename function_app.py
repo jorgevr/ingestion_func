@@ -18,6 +18,12 @@ from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 import azure.functions as func
+import httpx
+from azure.core.exceptions import (
+    HttpResponseError,
+    ServiceRequestError,
+    ServiceResponseError,
+)
 from jsonschema import Draft202012Validator, ValidationError
 
 from src.adls_store import AdlsStore, AdlsUploadError
@@ -45,23 +51,33 @@ from src.service_bus_emitter import ServiceBusEmitter
 app = func.FunctionApp()
 
 # ---------------------------------------------------------------------------
+# Fail fast: validate configuration AND compile schemas once at import time
+# (worker startup), not lazily on the first invocation. A misconfigured
+# environment or a missing/invalid schema then keeps this worker process
+# from finishing initialization at all — which surfaces as an unhealthy
+# container via the Functions host healthcheck — instead of registering
+# triggers that only discover the problem when a message finally arrives
+# (a schema load failure inside the trigger is exactly what caused ~8,000
+# immediate redeliveries: an uncaught FileNotFoundError on every message).
+# Both config loaders' return values are discarded here; each trigger still
+# calls its own loader per invocation to get the live Config.
+#
+# Every schema path is resolved relative to this package (Path(__file__))
+# under schemas/ — the one directory the Dockerfile actually copies into the
+# image. Never specs/ or docs/: those exist only in local dev, so a path
+# built from either looks fine on a laptop and 404s in the container.
+# tests/unit/test_schema_packaging.py guards this at the path level.
+# ---------------------------------------------------------------------------
+load_config()
+load_historical_config()
+
+_WORK_ITEM_SCHEMA_PATH = Path(__file__).parent / "schemas" / "work-item.v1.json"
+_WORK_ITEM_SCHEMA: dict = json.loads(_WORK_ITEM_SCHEMA_PATH.read_text(encoding="utf-8"))
+_WORK_ITEM_VALIDATOR = Draft202012Validator(_WORK_ITEM_SCHEMA)
+
+# ---------------------------------------------------------------------------
 # Feature 002: Module-level helpers
 # ---------------------------------------------------------------------------
-
-_WORK_ITEM_VALIDATOR: Draft202012Validator | None = None
-
-
-def _get_work_item_validator() -> Draft202012Validator:
-    """Return a cached JSON Schema validator for historical work-item messages."""
-    global _WORK_ITEM_VALIDATOR
-    if _WORK_ITEM_VALIDATOR is None:
-        schema_path = (
-            Path(__file__).parent
-            / "specs/002-pvdaq-historical-ingestion/contracts/work-item-message.json"
-        )
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
-        _WORK_ITEM_VALIDATOR = Draft202012Validator(schema)
-    return _WORK_ITEM_VALIDATOR
 
 
 def _adls_path(site_id: int, category: str, ingestion_date: str, version: int) -> str:
@@ -132,6 +148,32 @@ def _make_emitter(config):
     return ServiceBusEmitter(
         fully_qualified_namespace=config.service_bus_fully_qualified_namespace,
     )
+
+
+def _is_transient_upload_error(exc: BaseException) -> bool:
+    """True only for network, throttling, and 5xx failures — worth retrying.
+
+    Everything else (a missing source file, an unclassified error, a bug) is
+    deterministic and must dead-letter on the first attempt rather than
+    redeliver forever (AGENTS.md §6 "Definition of done"): retrying a 404
+    against the same URL, or a genuine defect, can never succeed, and doing
+    so anyway is exactly what turned one bad message into ~8,000 immediate
+    redeliveries.
+    """
+    if isinstance(exc, AdlsUploadError):
+        if "Source not found" in str(exc):
+            return False
+        cause = exc.__cause__
+        if isinstance(cause, httpx.HTTPStatusError):
+            status = cause.response.status_code
+            return status >= 500 or status == 429
+        if isinstance(cause, httpx.TimeoutException | httpx.TransportError):
+            return True
+        if isinstance(cause, HttpResponseError):
+            status = cause.status_code
+            return status is None or status >= 500 or status == 429
+        return isinstance(cause, ServiceRequestError | ServiceResponseError)
+    return False
 
 
 def _date_range(lookback_hours: int) -> list[tuple[int, int, int]]:
@@ -437,7 +479,7 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
     # Validate work item schema — Constitution II: every inbound payload must be
     # validated against a versioned JSON Schema before processing begins.
     try:
-        _get_work_item_validator().validate(work_item)
+        _WORK_ITEM_VALIDATOR.validate(work_item)
     except ValidationError as exc:
         logger.error("Work item schema validation failed: %s", exc.message)
         async with _make_emitter(config) as dl_emitter:
@@ -608,7 +650,7 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
             )
             stats.datasets_emitted = 1
 
-        except (AdlsUploadError, Exception) as exc:
+        except Exception as exc:
             stats.datasets_failed = 1
             logger.exception(
                 "Historical worker failed — site=%d, file=%s",
@@ -625,7 +667,12 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
                 },
                 subject="dataset_failure",
             )
-            raise
+            # Deterministic failures (a missing source file, a bug, anything
+            # not explicitly recognised as transient) complete the message
+            # here instead of raising — see _is_transient_upload_error.
+            if _is_transient_upload_error(exc):
+                raise
+            return
 
     stats.duration_ms = (time.monotonic() - start_time) * 1000
     emit_dataset_metrics(stats)

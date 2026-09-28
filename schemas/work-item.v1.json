@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "work-item-message.json",
+  "$id": "work-item.v1.json",
   "title": "Historical CSV Work Item Message",
-  "description": "Message dispatched by the historical-dispatcher function to the historical-worker queue. Each message represents one CSV file to download and process.",
+  "description": "Message dispatched by the historical-dispatcher function to the historical-worker queue. Each message represents one CSV file to download and process. Internal to ingestion-func — never crosses a service boundary, so it is not part of the contracts/ registry (docs/contracts.md §5).",
   "type": "object",
   "required": ["site_id", "s3_key", "file_name", "correlation_id", "enqueued_at"],
   "properties": {

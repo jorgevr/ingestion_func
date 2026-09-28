@@ -162,9 +162,14 @@ def load_config() -> Config:
         pvdaq_cron_schedule=_require("PVDAQ_CRON_SCHEDULE"),
         service_bus_queue_name=_require("SERVICE_BUS_QUEUE_NAME"),
         dead_letter_queue_name=_require("DEAD_LETTER_QUEUE_NAME"),
-        service_bus_fully_qualified_namespace=_require(
-            "ServiceBusConnection__fullyQualifiedNamespace"
-        ),
+        # Not _require(): the "missing" check above already guarantees at
+        # least one of ServiceBusConnection / …__fullyQualifiedNamespace is
+        # set; when the former (a connection string) covers it, this may
+        # legitimately be blank — _make_emitter re-checks ServiceBusConnection
+        # directly and never reads this field in that branch.
+        service_bus_fully_qualified_namespace=os.environ.get(
+            "ServiceBusConnection__fullyQualifiedNamespace", ""
+        ).strip(),
         idempotency_table_name=_require("IDEMPOTENCY_TABLE_NAME"),
         table_storage_uri=_require("TableStorageConnection__tableServiceUri"),
         tenant_id=os.environ.get("TENANT_ID", "research").strip(),
@@ -231,9 +236,10 @@ def load_historical_config() -> HistoricalConfig:
         pvdaq_historical_queue_name=_require("PVDAQ_HISTORICAL_QUEUE_NAME"),
         service_bus_queue_name=_require("SERVICE_BUS_QUEUE_NAME"),
         dead_letter_queue_name=_require("DEAD_LETTER_QUEUE_NAME"),
-        service_bus_fully_qualified_namespace=_require(
-            "ServiceBusConnection__fullyQualifiedNamespace"
-        ),
+        # Not _require() — see load_config() above for the same reasoning.
+        service_bus_fully_qualified_namespace=os.environ.get(
+            "ServiceBusConnection__fullyQualifiedNamespace", ""
+        ).strip(),
         file_tracking_table_name=_require("FILE_TRACKING_TABLE_NAME"),
         table_storage_uri=_require("TableStorageConnection__tableServiceUri"),
         # Not _require(): the "missing" check above already guarantees at

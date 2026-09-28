@@ -312,8 +312,14 @@ class TestWorkerIntegration:
         assert data["file_hash"] == "abc123hash"
 
     @pytest.mark.asyncio
-    async def test_worker_marks_failed_on_upload_error(self) -> None:
-        """Worker marks file as failed and dead-letters when upload raises."""
+    async def test_worker_marks_failed_and_dead_letters_without_raising_on_deterministic_upload_error(
+        self,
+    ) -> None:
+        """A deterministic upload failure (unclassified — not recognised as
+        network/5xx/throttling) marks the file failed, dead-letters, and
+        completes the message rather than raising (AGENTS.md §6: only
+        transient errors may redeliver — see also
+        test_worker_reraises_on_transient_upload_error below)."""
         from src.adls_store import AdlsUploadError
 
         work_item = _default_work_item()
@@ -346,8 +352,7 @@ class TestWorkerIntegration:
         ):
             from function_app import historical_worker
 
-            with pytest.raises(AdlsUploadError):
-                await historical_worker(mock_msg)
+            await historical_worker(mock_msg)  # must NOT raise
 
         mock_tracker.mark_failed.assert_called_once_with(9068, work_item["s3_key"], 1)
         emitter.emit_dead_letter.assert_called_once()
@@ -355,6 +360,123 @@ class TestWorkerIntegration:
         assert dead_letter_body["file_reference"] == work_item["s3_key"]
         assert "failure_reason" in dead_letter_body
         assert dead_letter_body["correlation_id"] == "test-corr-id"
+
+    @pytest.mark.asyncio
+    async def test_worker_dead_letters_without_raising_on_missing_source_file(
+        self,
+    ) -> None:
+        """A 404 ("Source not found") is explicitly deterministic — retrying
+        the identical URL can never succeed."""
+        from src.adls_store import AdlsUploadError
+
+        work_item = _default_work_item()
+        mock_msg = _mock_work_item_msg(work_item)
+
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(
+            side_effect=AdlsUploadError("Source not found: https://example.com/x.csv"),
+        )
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
+
+        mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
+        mock_tracker.mark_processing = AsyncMock()
+        mock_tracker.mark_failed = AsyncMock()
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        emitter = _mock_emitter()
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)  # must NOT raise
+
+        emitter.emit_dead_letter.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_worker_reraises_on_transient_upload_error(self) -> None:
+        """A 503 from the Blob SDK (wrapped as AdlsUploadError's __cause__)
+        is transient — the worker must still dead-letter (for visibility)
+        but also re-raise so Service Bus redelivers the message."""
+        from azure.core.exceptions import HttpResponseError
+
+        from src.adls_store import AdlsUploadError
+
+        work_item = _default_work_item()
+        mock_msg = _mock_work_item_msg(work_item)
+
+        transient_cause = HttpResponseError(message="Service unavailable")
+        transient_cause.status_code = 503
+        upload_error = AdlsUploadError("Failed to upload: 503")
+        upload_error.__cause__ = transient_cause
+
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(side_effect=upload_error)
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
+
+        mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
+        mock_tracker.mark_processing = AsyncMock()
+        mock_tracker.mark_failed = AsyncMock()
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        emitter = _mock_emitter()
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_worker
+
+            with pytest.raises(AdlsUploadError):
+                await historical_worker(mock_msg)
+
+        emitter.emit_dead_letter.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_worker_invalid_work_item_dead_lettered_not_raised(self) -> None:
+        """A work item that fails schema validation (e.g. missing a
+        required field) dead-letters and completes the message — it must
+        never raise into the trigger."""
+        invalid_work_item = {
+            "site_id": 9068,
+            # missing s3_key, file_name, correlation_id, enqueued_at
+        }
+        mock_msg = _mock_work_item_msg(invalid_work_item)
+
+        emitter = _mock_emitter()
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)  # must NOT raise
+
+        emitter.emit_dead_letter.assert_called_once()
+        dead_letter_body = emitter.emit_dead_letter.call_args.kwargs["message_body"]
+        assert dead_letter_body["error_type"] == "validation_failure"
 
     @pytest.mark.asyncio
     async def test_worker_deterministic_adls_path(self) -> None:
