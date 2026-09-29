@@ -29,17 +29,21 @@
     "correlation_id": {
       "type": "string",
       "format": "uuid",
-      "description": "UUID correlation ID for distributed tracing"
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "Lowercase canonical UUID correlation ID for distributed tracing. The pattern is carried alongside format so validation is deterministic whether or not jsonschema's optional date-time/uuid format packages are installed (this repo deliberately does not install them — see schemas/README.md)."
     },
     "enqueued_at": {
       "type": "string",
       "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$",
       "description": "ISO-8601 timestamp when the work item was dispatched"
     },
     "last_modified": {
       "type": "string",
       "format": "date-time",
-      "description": "ISO-8601 S3 LastModified timestamp of the CSV file. Used by the worker to derive year/month (UTC) for the ADLS path raw/pvdaq/site_id={id}/year={y}/month={m}/{file}. Falls back to ingestion date if absent."
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$",
+      "minLength": 1,
+      "description": "ISO-8601 S3 LastModified timestamp of the CSV file. Used by the worker to derive year/month (UTC) for the ADLS path raw/pvdaq/site_id={id}/year={y}/month={m}/{file}. Required and non-empty: the dispatcher now skips (and logs) any S3 listing entry that lacks one rather than enqueueing it with a blank default."
     }
   },
   "additionalProperties": false

@@ -24,9 +24,15 @@ from azure.core.exceptions import (
     ServiceRequestError,
     ServiceResponseError,
 )
+from azure.servicebus.exceptions import (
+    OperationTimeoutError,
+    ServiceBusCommunicationError,
+    ServiceBusConnectionError,
+    ServiceBusServerBusyError,
+)
 from jsonschema import Draft202012Validator, ValidationError
 
-from src.adls_store import AdlsStore, AdlsUploadError
+from src.adls_store import AdlsStore
 from src.cloudevents_envelope import build_dataset_envelope
 from src.config import load_config, load_historical_config
 from src.file_tracking_store import FileTrackingStore
@@ -54,13 +60,17 @@ app = func.FunctionApp()
 # Fail fast: validate configuration AND compile schemas once at import time
 # (worker startup), not lazily on the first invocation. A misconfigured
 # environment or a missing/invalid schema then keeps this worker process
-# from finishing initialization at all — which surfaces as an unhealthy
-# container via the Functions host healthcheck — instead of registering
-# triggers that only discover the problem when a message finally arrives
-# (a schema load failure inside the trigger is exactly what caused ~8,000
-# immediate redeliveries: an uncaught FileNotFoundError on every message).
-# Both config loaders' return values are discarded here; each trigger still
-# calls its own loader per invocation to get the live Config.
+# from finishing initialization at all, instead of registering triggers
+# that only discover the problem when a message finally arrives (a schema
+# load failure inside the trigger is exactly what caused ~8,000 immediate
+# redeliveries: an uncaught FileNotFoundError on every message). Note: this
+# has only been verified to stop the Functions host from registering any
+# triggers (confirmed via /admin/functions returning an empty list) — the
+# docker-compose healthcheck only probes /admin/host/status, which stays
+# "Running" regardless, so it does NOT currently surface this as an
+# unhealthy container. Both config loaders' return values are discarded
+# here; each trigger still calls its own loader per invocation to get the
+# live Config.
 #
 # Every schema path is resolved relative to this package (Path(__file__))
 # under schemas/ — the one directory the Dockerfile actually copies into the
@@ -150,29 +160,75 @@ def _make_emitter(config):
     )
 
 
-def _is_transient_upload_error(exc: BaseException) -> bool:
-    """True only for network, throttling, and 5xx failures — worth retrying.
+async def _dead_letter(config, correlation_id: str, reason: str, detail: dict) -> None:
+    """Single choke point for every dead-letter ``historical_worker`` sends.
 
-    Everything else (a missing source file, an unclassified error, a bug) is
-    deterministic and must dead-letter on the first attempt rather than
-    redeliver forever (AGENTS.md §6 "Definition of done"): retrying a 404
-    against the same URL, or a genuine defect, can never succeed, and doing
-    so anyway is exactly what turned one bad message into ~8,000 immediate
-    redeliveries.
+    The body stays this repo's current app-level queue shape — a flat dict
+    with ``correlation_id``, ``error_type`` (== *reason*), and whatever
+    *detail* supplies (``file_reference``, ``failure_reason``). R2.6 (ADR
+    0001) replaces this body with a quarantine record; keeping every
+    dead-letter site routed through here means that swap only touches one
+    place, not three.
     """
-    if isinstance(exc, AdlsUploadError):
-        if "Source not found" in str(exc):
-            return False
-        cause = exc.__cause__
-        if isinstance(cause, httpx.HTTPStatusError):
-            status = cause.response.status_code
-            return status >= 500 or status == 429
-        if isinstance(cause, httpx.TimeoutException | httpx.TransportError):
+    async with _make_emitter(config) as emitter:
+        await emitter.emit_dead_letter(
+            queue_name=config.dead_letter_queue_name,
+            message_body={
+                "correlation_id": correlation_id,
+                "error_type": reason,
+                **detail,
+            },
+            subject=reason,
+        )
+
+
+_TRANSIENT_SERVICE_BUS_ERRORS = (
+    ServiceBusConnectionError,
+    ServiceBusCommunicationError,
+    ServiceBusServerBusyError,
+    OperationTimeoutError,
+)
+
+
+def _is_transient_single(exc: BaseException) -> bool:
+    """Classify one exception (not its cause chain) as transient."""
+    if isinstance(exc, ServiceRequestError | ServiceResponseError):
+        return True
+    if isinstance(exc, HttpResponseError):
+        status = exc.status_code
+        return status is not None and (status >= 500 or status in (408, 429))
+    if isinstance(exc, _TRANSIENT_SERVICE_BUS_ERRORS):
+        return True
+    if isinstance(exc, httpx.TimeoutException | httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status >= 500 or status in (408, 429)
+    return False
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True only for network, throttling, and 5xx/408/429 failures — worth
+    retrying. Classifies the exception itself and walks its ``__cause__``
+    chain (e.g. ``AdlsUploadError`` wraps the real SDK exception via
+    ``raise ... from exc``), so this works directly on whatever any of the
+    four guarded call sites (stream_upload, write_json, emit_cloudevent,
+    mark_completed) actually raises — no special-casing by wrapper type.
+
+    Everything else (a missing source file, a malformed work item, an
+    unclassified error, a bug) is deterministic and must dead-letter on the
+    first attempt rather than redeliver forever (AGENTS.md §6 "Definition
+    of done"): retrying a 404 against the same URL, or a genuine defect,
+    can never succeed, and doing so anyway is exactly what turned one bad
+    message into ~8,000 immediate redeliveries.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _is_transient_single(current):
             return True
-        if isinstance(cause, HttpResponseError):
-            status = cause.status_code
-            return status is None or status >= 500 or status == 429
-        return isinstance(cause, ServiceRequestError | ServiceResponseError)
+        current = current.__cause__
     return False
 
 
@@ -412,6 +468,19 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
                 continue
 
             for file_info in unprocessed:
+                last_modified = file_info.get("last_modified")
+                if not last_modified:
+                    # No default: an empty last_modified breaks get_unprocessed_files'
+                    # change-detection (it would always look "changed") and now
+                    # fails work-item schema validation (minLength: 1) anyway —
+                    # skip and log rather than enqueue a work item we know is bad.
+                    logger.warning(
+                        "Site %d: skipping %s — S3 listing has no last_modified",
+                        site_id,
+                        file_info["key"],
+                    )
+                    continue
+
                 file_name = PurePosixPath(file_info["key"]).name
                 category = extract_category(file_name, site_id)
 
@@ -420,7 +489,7 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
                     site_id=site_id,
                     s3_key=file_info["key"],
                     file_size=file_info["size"],
-                    last_modified=file_info.get("last_modified", ""),
+                    last_modified=last_modified,
                     correlation_id=correlation_id,
                     category=category,
                 )
@@ -431,7 +500,7 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
                     "category": category,
                     "correlation_id": correlation_id,
                     "enqueued_at": datetime.now(timezone.utc).isoformat(),
-                    "last_modified": file_info.get("last_modified", ""),
+                    "last_modified": last_modified,
                 }
                 await emitter.send_queue_message(
                     queue_name=config.pvdaq_historical_queue_name,
@@ -456,233 +525,278 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
     connection="ServiceBusConnection",
 )
 async def historical_worker(msg: func.ServiceBusMessage) -> None:
-    """Process a single historical CSV file: stream S3 → ADLS, register metadata, emit event.
+    """Process a single historical CSV file: stream S3 → ADLS, emit event, mark complete.
 
     Pipeline:
-    1. Deserialize work item message
-    2. Mark file as processing
-    3. Stream download from S3 + upload to ADLS Gen2 (one-pass, ~4 MiB memory)
-    4. Update tracking entity with storage metadata
-    5. Emit solar.pvdaq.dataset.available CloudEvent
-    6. Mark file as completed
-    """
-    raw_body = msg.get_body().decode("utf-8")
-    work_item = json.loads(raw_body)
+    1. Parse the message body (deterministic on failure — dead-letter, no redeliver)
+    2. Validate work item schema (deterministic on failure — dead-letter, no redeliver)
+    3. Mark file as processing
+    4. Stream download from S3 + upload to ADLS Gen2 (one-pass, ~4 MiB memory)
+    5. Write the metadata.json sidecar
+    6. Emit the solar.pvdaq.dataset.available CloudEvent
+    7. Mark file as completed — LAST, because "completed" must mean "event
+       published". A transient failure at any of steps 4-6 leaves the
+       tracker showing no completed version, so a redelivery of the same
+       message resolves the *same* version again and re-emits — and the
+       CloudEvent id is deterministic (site_id+category+version), so that
+       re-emit is a detectable duplicate for the consumer, not a new event.
 
-    correlation_id: str = work_item.get("correlation_id", "unknown")
+    Every exit path (both deterministic dead-letters, the transient raise,
+    and the successful completion) runs through the same `finally` so
+    dataset metrics are always emitted, and stats.datasets_failed reflects
+    every failure — not only the ones that happen to fall through the
+    bottom of the function.
+    """
+    config = load_historical_config()
+    raw_body_bytes = msg.get_body()
+
+    correlation_id = "unknown"
     logger = create_logger(
         correlation_id, vendor="PVDAQ", function_name="historical_worker"
     )
-
-    config = load_historical_config()
-
-    # Validate work item schema — Constitution II: every inbound payload must be
-    # validated against a versioned JSON Schema before processing begins.
-    try:
-        _WORK_ITEM_VALIDATOR.validate(work_item)
-    except ValidationError as exc:
-        logger.error("Work item schema validation failed: %s", exc.message)
-        async with _make_emitter(config) as dl_emitter:
-            await dl_emitter.emit_dead_letter(
-                queue_name=config.dead_letter_queue_name,
-                message_body={
-                    "file_reference": raw_body,
-                    "failure_reason": exc.message,
-                    "error_type": "validation_failure",
-                    "correlation_id": correlation_id,
-                },
-                subject="validation_failure",
-            )
-        return
-
-    site_id: int = work_item["site_id"]
-    s3_key: str = work_item["s3_key"]
-    file_name: str = work_item["file_name"]
-    category: str = work_item.get("category") or extract_category(file_name, site_id)
-
-    start_time = time.monotonic()
-
-    # Generate traceparent for this worker invocation
-    trace_id = uuid4().hex
-    span_id = uuid4().hex[:16]
-    traceparent = f"00-{trace_id}-{span_id}-01"
-
     stats = DatasetIngestionStats(
         source="PVDAQ-historical-worker", correlation_id=correlation_id
     )
-    ingestion_id = str(uuid4())
+    start_time = time.monotonic()
+    site_id: int | None = None
+    file_name = "unknown"
+    bytes_written = 0
 
-    logger.info("Historical worker started — site=%d, file=%s", site_id, file_name)
-
-    source_url = f"{config.oedi_bucket_url.rstrip('/')}/{s3_key}"
-    storage_conn_str = _storage_connection_string(logger)
-
-    async with (
-        FileTrackingStore(
-            table_name=config.file_tracking_table_name,
-            table_service_uri=config.table_storage_uri,
-            connection_string=storage_conn_str,
-        ) as tracker,
-        AdlsStore(
-            account_url=config.data_storage_account_url,
-            container_name=config.bronze_container,
-            connection_string=storage_conn_str,
-        ) as adls,
-        _make_emitter(config) as emitter,
-    ):
-        # Version resolution — determines append-only version before any writes
-        existing_versions = await tracker.get_versions(site_id, s3_key)
-        version = max(existing_versions, default=0) + 1
-
-        ingestion_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        adls_path = _adls_path(site_id, category, ingestion_date, version)
-        meta_path = _metadata_path(site_id, category, ingestion_date)
-
-        await tracker.mark_processing(site_id, s3_key, version)
-
+    try:
+        # --- Parse the body: decode, JSON-load, require a JSON object.
+        # A malformed body will never parse no matter how many times Service
+        # Bus redelivers the identical bytes — deterministic, dead-letter
+        # once and complete the message.
         try:
-            # Stream S3 → ADLS: one-pass, ~4 MiB memory, returns (bytes, sha256, newlines)
-            bytes_written, file_hash, row_count = await adls.stream_upload(
-                source_url=source_url,
-                file_path=adls_path,
-            )
-            stats.datasets_downloaded = 1
-            stats.datasets_stored = 1
-
-            ingestion_time = datetime.now(timezone.utc).isoformat()
-            elapsed = time.monotonic() - start_time
-
-            # Build metadata.json conforming to contracts/metadata-file.json
-            dataset_id = f"{site_id}_{category}"
-            metadata_dict = {
-                "dataset": {
-                    "dataset_id": dataset_id,
-                    "dataset_type": "time_series",
-                    "version": version,
-                    "schema_version": "unknown",
-                    "tags": ["pvdaq", "solar"],
-                },
-                "source": {
-                    "source": "pvdaq",
-                    "source_type": "s3_public",
-                    "endpoint": f"pvdaq/2023-solar-data-prize/{site_id}_OEDI/data/",
-                    "provider": "NREL",
-                    "region": "us-east-1",
-                },
-                "ingestion": {
-                    "ingestion_time": ingestion_time,
-                    "ingestion_id": ingestion_id,
-                    "batch_id": correlation_id,
-                    "pipeline": "energy-ingestion-boundary-v1",
-                    "trigger_type": "rerun" if version > 1 else "scheduled",
-                    "retry_count": 0,
-                    "source_file_name": file_name,
-                    "file_size_bytes": bytes_written,
-                    "checksum": file_hash,
-                    "ingestion_latency_seconds": round(elapsed, 1),
-                    "status": "success",
-                },
-                "event_time": {
-                    "event_time_start": None,
-                    "event_time_end": None,
-                    "expected_frequency_seconds": 300,
-                    "expected_records": None,
-                },
-                "data_profile": {
-                    "row_count": row_count,
-                    "null_percentage": None,
-                    "duplicate_rows": None,
-                    "min_timestamp": None,
-                    "max_timestamp": None,
-                    "schema_detected": None,
-                    "corrupted_rows": None,
-                },
-                "quality_hint": {
-                    "basic_quality_score": None,
-                    "schema_valid": None,
-                    "time_continuity_suspected_gap": None,
-                    "notes": [],
-                },
-                "lineage": {
-                    "parent_dataset_version": version - 1 if version > 1 else None,
-                    "rerun_of": f"{dataset_id}_v{version - 1}" if version > 1 else None,
-                    "related_incident_id": None,
-                },
-            }
-            await adls.write_json(meta_path, metadata_dict)
-
-            # Register metadata in tracking table (US2)
-            await tracker.mark_completed(
-                site_id=site_id,
-                s3_key=s3_key,
-                version=version,
-                category=category,
-                storage_path=adls_path,
-                file_hash=file_hash,
-                ingestion_id=ingestion_id,
-                source_url=source_url,
-                ingestion_time=ingestion_time,
-                row_count=row_count,
-                metadata_path=meta_path,
-            )
-
-            # Emit dataset-available CloudEvent (US3)
-            envelope = build_dataset_envelope(
-                data={
-                    "site_id": site_id,
-                    "category": category,
-                    "file_format": "csv",
-                    "storage_path": await adls.blob_url(adls_path),
-                    "version": version,
-                    "ingestion_id": ingestion_id,
-                    "source_url": source_url,
-                    "file_size": bytes_written,
-                    "file_hash": file_hash,
-                },
-                config=config,
-                ingestion_id=ingestion_id,
-                traceparent=traceparent,
-                ingestion_timestamp=ingestion_time,
-            )
-            await emitter.emit_cloudevent(
-                topic_name=config.service_bus_queue_name,
-                envelope=envelope,
-            )
-            stats.datasets_emitted = 1
-
-        except Exception as exc:
+            raw_body = raw_body_bytes.decode("utf-8")
+            work_item = json.loads(raw_body)
+            if not isinstance(work_item, dict):
+                raise TypeError(
+                    "work item body must be a JSON object, got "
+                    f"{type(work_item).__name__}"
+                )
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
             stats.datasets_failed = 1
-            logger.exception(
-                "Historical worker failed — site=%d, file=%s",
-                site_id,
-                file_name,
+            logger.error("Work item body could not be parsed: %s", exc)
+            preview = raw_body_bytes.decode("utf-8", errors="replace")[:500]
+            await _dead_letter(
+                config,
+                correlation_id,
+                reason="malformed_body",
+                detail={"file_reference": preview, "failure_reason": str(exc)},
             )
-            await tracker.mark_failed(site_id, s3_key, version)
-            await emitter.emit_dead_letter(
-                queue_name=config.dead_letter_queue_name,
-                message_body={
-                    "file_reference": s3_key,
-                    "failure_reason": str(exc),
-                    "correlation_id": correlation_id,
-                },
-                subject="dataset_failure",
-            )
-            # Deterministic failures (a missing source file, a bug, anything
-            # not explicitly recognised as transient) complete the message
-            # here instead of raising — see _is_transient_upload_error.
-            if _is_transient_upload_error(exc):
-                raise
             return
 
-    stats.duration_ms = (time.monotonic() - start_time) * 1000
-    emit_dataset_metrics(stats)
+        correlation_id = work_item.get("correlation_id", "unknown")
+        logger = create_logger(
+            correlation_id, vendor="PVDAQ", function_name="historical_worker"
+        )
+        stats.correlation_id = correlation_id
 
-    logger.info(
-        "Historical worker completed — site=%d, file=%s, bytes=%d, stored=%d, emitted=%d, duration_ms=%.0f",
-        site_id,
-        file_name,
-        bytes_written,
-        stats.datasets_stored,
-        stats.datasets_emitted,
-        stats.duration_ms,
-    )
+        # Validate work item schema — Constitution II: every inbound payload must be
+        # validated against a versioned JSON Schema before processing begins.
+        try:
+            _WORK_ITEM_VALIDATOR.validate(work_item)
+        except ValidationError as exc:
+            stats.datasets_failed = 1
+            logger.error("Work item schema validation failed: %s", exc.message)
+            await _dead_letter(
+                config,
+                correlation_id,
+                reason="validation_failure",
+                detail={"file_reference": raw_body, "failure_reason": exc.message},
+            )
+            return
+
+        site_id = work_item["site_id"]
+        s3_key: str = work_item["s3_key"]
+        file_name = work_item["file_name"]
+        category: str = work_item.get("category") or extract_category(
+            file_name, site_id
+        )
+
+        # Generate traceparent for this worker invocation
+        trace_id = uuid4().hex
+        span_id = uuid4().hex[:16]
+        traceparent = f"00-{trace_id}-{span_id}-01"
+        ingestion_id = str(uuid4())
+
+        logger.info("Historical worker started — site=%d, file=%s", site_id, file_name)
+
+        source_url = f"{config.oedi_bucket_url.rstrip('/')}/{s3_key}"
+        storage_conn_str = _storage_connection_string(logger)
+
+        async with (
+            FileTrackingStore(
+                table_name=config.file_tracking_table_name,
+                table_service_uri=config.table_storage_uri,
+                connection_string=storage_conn_str,
+            ) as tracker,
+            AdlsStore(
+                account_url=config.data_storage_account_url,
+                container_name=config.bronze_container,
+                connection_string=storage_conn_str,
+            ) as adls,
+            _make_emitter(config) as emitter,
+        ):
+            # Version resolution — determines append-only version before any writes.
+            # get_versions only counts *completed* versions, and mark_completed
+            # now runs last (after emit_cloudevent), so a redelivery following a
+            # transient failure resolves this same version again — see the
+            # docstring above.
+            existing_versions = await tracker.get_versions(site_id, s3_key)
+            version = max(existing_versions, default=0) + 1
+
+            ingestion_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            adls_path = _adls_path(site_id, category, ingestion_date, version)
+            meta_path = _metadata_path(site_id, category, ingestion_date)
+
+            await tracker.mark_processing(site_id, s3_key, version)
+
+            try:
+                # Stream S3 → ADLS: one-pass, ~4 MiB memory, returns (bytes, sha256, newlines)
+                bytes_written, file_hash, row_count = await adls.stream_upload(
+                    source_url=source_url,
+                    file_path=adls_path,
+                )
+                stats.datasets_downloaded = 1
+                stats.datasets_stored = 1
+
+                ingestion_time = datetime.now(timezone.utc).isoformat()
+                elapsed = time.monotonic() - start_time
+
+                # Build metadata.json conforming to contracts/metadata-file.json
+                dataset_id = f"{site_id}_{category}"
+                metadata_dict = {
+                    "dataset": {
+                        "dataset_id": dataset_id,
+                        "dataset_type": "time_series",
+                        "version": version,
+                        "schema_version": "unknown",
+                        "tags": ["pvdaq", "solar"],
+                    },
+                    "source": {
+                        "source": "pvdaq",
+                        "source_type": "s3_public",
+                        "endpoint": f"pvdaq/2023-solar-data-prize/{site_id}_OEDI/data/",
+                        "provider": "NREL",
+                        "region": "us-east-1",
+                    },
+                    "ingestion": {
+                        "ingestion_time": ingestion_time,
+                        "ingestion_id": ingestion_id,
+                        "batch_id": correlation_id,
+                        "pipeline": "energy-ingestion-boundary-v1",
+                        "trigger_type": "rerun" if version > 1 else "scheduled",
+                        "retry_count": 0,
+                        "source_file_name": file_name,
+                        "file_size_bytes": bytes_written,
+                        "checksum": file_hash,
+                        "ingestion_latency_seconds": round(elapsed, 1),
+                        "status": "success",
+                    },
+                    "event_time": {
+                        "event_time_start": None,
+                        "event_time_end": None,
+                        "expected_frequency_seconds": 300,
+                        "expected_records": None,
+                    },
+                    "data_profile": {
+                        "row_count": row_count,
+                        "null_percentage": None,
+                        "duplicate_rows": None,
+                        "min_timestamp": None,
+                        "max_timestamp": None,
+                        "schema_detected": None,
+                        "corrupted_rows": None,
+                    },
+                    "quality_hint": {
+                        "basic_quality_score": None,
+                        "schema_valid": None,
+                        "time_continuity_suspected_gap": None,
+                        "notes": [],
+                    },
+                    "lineage": {
+                        "parent_dataset_version": version - 1 if version > 1 else None,
+                        "rerun_of": f"{dataset_id}_v{version - 1}"
+                        if version > 1
+                        else None,
+                        "related_incident_id": None,
+                    },
+                }
+                await adls.write_json(meta_path, metadata_dict)
+
+                # Emit dataset-available CloudEvent (US3) — before mark_completed;
+                # "completed" must mean "event published".
+                envelope = build_dataset_envelope(
+                    data={
+                        "site_id": site_id,
+                        "category": category,
+                        "file_format": "csv",
+                        "storage_path": await adls.blob_url(adls_path),
+                        "version": version,
+                        "ingestion_id": ingestion_id,
+                        "source_url": source_url,
+                        "file_size": bytes_written,
+                        "file_hash": file_hash,
+                    },
+                    config=config,
+                    ingestion_id=ingestion_id,
+                    traceparent=traceparent,
+                    ingestion_timestamp=ingestion_time,
+                )
+                await emitter.emit_cloudevent(
+                    topic_name=config.service_bus_queue_name,
+                    envelope=envelope,
+                )
+                stats.datasets_emitted = 1
+
+                # Register metadata in tracking table — LAST: this is what
+                # get_versions() reads to decide "already completed", so it
+                # must not be set until the event it gates has been sent.
+                await tracker.mark_completed(
+                    site_id=site_id,
+                    s3_key=s3_key,
+                    version=version,
+                    category=category,
+                    storage_path=adls_path,
+                    file_hash=file_hash,
+                    ingestion_id=ingestion_id,
+                    source_url=source_url,
+                    ingestion_time=ingestion_time,
+                    row_count=row_count,
+                    metadata_path=meta_path,
+                )
+
+            except Exception as exc:
+                stats.datasets_failed = 1
+                logger.exception(
+                    "Historical worker failed — site=%d, file=%s",
+                    site_id,
+                    file_name,
+                )
+                await tracker.mark_failed(site_id, s3_key, version)
+                await _dead_letter(
+                    config,
+                    correlation_id,
+                    reason="dataset_failure",
+                    detail={"file_reference": s3_key, "failure_reason": str(exc)},
+                )
+                # Deterministic failures (a missing source file, a bug,
+                # anything not explicitly recognised as transient) complete
+                # the message here instead of raising — see _is_transient.
+                if _is_transient(exc):
+                    raise
+                return
+
+        logger.info(
+            "Historical worker completed — site=%d, file=%s, bytes=%d, stored=%d, emitted=%d",
+            site_id,
+            file_name,
+            bytes_written,
+            stats.datasets_stored,
+            stats.datasets_emitted,
+        )
+    finally:
+        stats.duration_ms = (time.monotonic() - start_time) * 1000
+        emit_dataset_metrics(stats)

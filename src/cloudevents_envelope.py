@@ -7,6 +7,7 @@ tenant, vendor, schema, and tracing metadata.
 from __future__ import annotations
 
 import copy
+import uuid
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -14,6 +15,25 @@ from src.config import Config, HistoricalConfig
 
 # Type alias for configs that provide the metadata fields we need
 _ConfigLike = Config | HistoricalConfig
+
+# Fixed, arbitrary namespace for deriving dataset-available event ids —
+# never changes; changing it would change every future event's id for a
+# file+version pair that was previously deterministic.
+_DATASET_EVENT_ID_NAMESPACE = uuid.UUID("6d1f1a2e-8b7a-4b8b-9c3f-9a8f9e6d5c4b")
+
+
+def _deterministic_event_id(site_id: int, category: str, version: int) -> str:
+    """Derive the CloudEvent ``id`` from file identity + version — not random.
+
+    A redelivered work item that gets as far as re-emitting (e.g. after a
+    transient failure that struck after the previous attempt's upload but
+    before mark_completed ran) resolves the *same* version again, so this
+    produces the *same* id both times. A downstream consumer can then
+    dedupe by id instead of silently double-processing the same dataset.
+    """
+    return str(
+        uuid.uuid5(_DATASET_EVENT_ID_NAMESPACE, f"{site_id}_{category}_v{version}")
+    )
 
 
 def build_dataset_envelope(
@@ -28,7 +48,7 @@ def build_dataset_envelope(
     Produces a ``solar.pvdaq.dataset.available`` envelope conforming to
     ``contracts/dataset-event.json``.  ``mapping_version`` is set to
     ``"unknown"`` per Constitution III fallback (no field mapping at dataset
-    level).
+    level). ``id`` is deterministic — see ``_deterministic_event_id``.
 
     Args:
         data: Dataset data block dict (site_id, category, file_format,
@@ -46,7 +66,9 @@ def build_dataset_envelope(
         "specversion": "1.0",
         "type": "solar.pvdaq.dataset.available",
         "source": "/energy-ingestion-boundary/pvdaq",
-        "id": str(uuid4()),
+        "id": _deterministic_event_id(
+            data["site_id"], data["category"], data["version"]
+        ),
         "time": ingestion_timestamp,
         "datacontenttype": "application/json",
         "tenant_id": config.tenant_id,

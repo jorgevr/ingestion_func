@@ -169,7 +169,7 @@ def _default_work_item(
         "s3_key": f"{_PREFIX}/{site_id}_OEDI/data/{file_name}",
         "file_name": file_name,
         "category": "ac_power",
-        "correlation_id": "test-corr-id",
+        "correlation_id": "550e8400-e29b-41d4-a716-446655440000",
         "enqueued_at": "2024-01-15T12:00:00Z",
         "last_modified": "2024-01-15T12:00:00Z",
     }
@@ -359,7 +359,9 @@ class TestWorkerIntegration:
         dead_letter_body = emitter.emit_dead_letter.call_args.kwargs["message_body"]
         assert dead_letter_body["file_reference"] == work_item["s3_key"]
         assert "failure_reason" in dead_letter_body
-        assert dead_letter_body["correlation_id"] == "test-corr-id"
+        assert (
+            dead_letter_body["correlation_id"] == "550e8400-e29b-41d4-a716-446655440000"
+        )
 
     @pytest.mark.asyncio
     async def test_worker_dead_letters_without_raising_on_missing_source_file(
@@ -679,3 +681,467 @@ class TestIncrementalDetection:
 
         # Site 9068 failed, but site 9069 was still processed
         assert mock_emitter.send_queue_message.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_file_without_last_modified_skipped_and_logged(self) -> None:
+        """No default: an S3 listing entry with no last_modified is skipped
+        and logged, never enqueued (it would otherwise fail work-item schema
+        validation's minLength:1 on the worker side anyway)."""
+        good_file = _file_info(9068, "9068_ac_power_data.csv")
+        bad_file = {
+            "key": f"{_PREFIX}/9068_OEDI/data/9068_tracker_data.csv",
+            "size": 100,
+            # no last_modified key at all
+        }
+
+        mock_oedi = AsyncMock()
+        mock_oedi.list_csv_files = AsyncMock(side_effect=[[good_file, bad_file], []])
+        mock_oedi.__aenter__ = AsyncMock(return_value=mock_oedi)
+        mock_oedi.__aexit__ = AsyncMock(return_value=False)
+
+        mock_tracker = AsyncMock()
+        mock_tracker.get_unprocessed_files = AsyncMock(
+            side_effect=[[good_file, bad_file], []]
+        )
+        mock_tracker.mark_queued = AsyncMock()
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        mock_emitter = AsyncMock()
+        mock_emitter.send_queue_message = AsyncMock()
+        mock_emitter.__aenter__ = AsyncMock(return_value=mock_emitter)
+        mock_emitter.__aexit__ = AsyncMock(return_value=False)
+
+        mock_logger = MagicMock()
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.OediHistoricalClient", return_value=mock_oedi),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=mock_emitter),
+            patch("function_app.create_logger", return_value=mock_logger),
+        ):
+            from function_app import historical_dispatcher
+
+            timer = MagicMock()
+            await historical_dispatcher(timer)
+
+        # Only the good file was enqueued/tracked.
+        assert mock_emitter.send_queue_message.call_count == 1
+        assert mock_tracker.mark_queued.call_count == 1
+        enqueued = mock_emitter.send_queue_message.call_args.kwargs["message_body"]
+        assert enqueued["file_name"] == "9068_ac_power_data.csv"
+
+        # The skip was logged as a warning naming the skipped file (site
+        # 9069 also logs its own unrelated "no files found" warning).
+        skip_calls = [
+            call
+            for call in mock_logger.warning.call_args_list
+            if "9068_tracker_data.csv" in " ".join(str(a) for a in call.args)
+        ]
+        assert len(skip_calls) == 1
+
+
+class TestWorkerMalformedBody:
+    """The message body is decoded/parsed inside the guarded path — a
+    malformed body is deterministic (retrying the identical bytes can never
+    succeed): dead-lettered on the first delivery, never raised."""
+
+    @pytest.mark.asyncio
+    async def test_non_utf8_body_dead_lettered_not_raised(self) -> None:
+        mock_msg = MagicMock()
+        mock_msg.get_body.return_value = b"\xff\xfe\x00\x01 not valid utf-8"
+
+        emitter = _mock_emitter()
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)  # must NOT raise
+
+        emitter.emit_dead_letter.assert_called_once()
+        body = emitter.emit_dead_letter.call_args.kwargs["message_body"]
+        assert body["error_type"] == "malformed_body"
+
+    @pytest.mark.asyncio
+    async def test_non_json_body_dead_lettered_not_raised(self) -> None:
+        mock_msg = MagicMock()
+        mock_msg.get_body.return_value = b"this is not json {"
+
+        emitter = _mock_emitter()
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)  # must NOT raise
+
+        emitter.emit_dead_letter.assert_called_once()
+        body = emitter.emit_dead_letter.call_args.kwargs["message_body"]
+        assert body["error_type"] == "malformed_body"
+
+    @pytest.mark.asyncio
+    async def test_json_array_body_dead_lettered_not_raised(self) -> None:
+        mock_msg = MagicMock()
+        mock_msg.get_body.return_value = json.dumps([1, 2, 3]).encode("utf-8")
+
+        emitter = _mock_emitter()
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)  # must NOT raise
+
+        emitter.emit_dead_letter.assert_called_once()
+        body = emitter.emit_dead_letter.call_args.kwargs["message_body"]
+        assert body["error_type"] == "malformed_body"
+
+    @pytest.mark.asyncio
+    async def test_json_scalar_body_dead_lettered_not_raised(self) -> None:
+        mock_msg = MagicMock()
+        mock_msg.get_body.return_value = json.dumps("just a string").encode("utf-8")
+
+        emitter = _mock_emitter()
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)  # must NOT raise
+
+        emitter.emit_dead_letter.assert_called_once()
+        body = emitter.emit_dead_letter.call_args.kwargs["message_body"]
+        assert body["error_type"] == "malformed_body"
+
+
+class TestMetricsEmittedOnEveryExitPath:
+    """emit_dataset_metrics(stats) must run on every exit path — both
+    deterministic dead-letter returns, the transient raise, and success —
+    and stats.datasets_failed must be 1 on every failing path, including
+    the two that return before ever building the "old" stats object (body
+    parse failure and schema validation failure)."""
+
+    @pytest.mark.asyncio
+    async def test_malformed_body_emits_metrics_with_failed_flag(self) -> None:
+        mock_msg = MagicMock()
+        mock_msg.get_body.return_value = b"not json"
+        emitter = _mock_emitter()
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+            patch("function_app.emit_dataset_metrics") as mock_metrics,
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)
+
+        mock_metrics.assert_called_once()
+        assert mock_metrics.call_args.args[0].datasets_failed == 1
+
+    @pytest.mark.asyncio
+    async def test_schema_validation_failure_emits_metrics_with_failed_flag(
+        self,
+    ) -> None:
+        invalid_work_item = {"site_id": 9068}
+        mock_msg = _mock_work_item_msg(invalid_work_item)
+        emitter = _mock_emitter()
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+            patch("function_app.emit_dataset_metrics") as mock_metrics,
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)
+
+        mock_metrics.assert_called_once()
+        assert mock_metrics.call_args.args[0].datasets_failed == 1
+
+    @pytest.mark.asyncio
+    async def test_deterministic_processing_failure_emits_metrics(self) -> None:
+        from src.adls_store import AdlsUploadError
+
+        work_item = _default_work_item()
+        mock_msg = _mock_work_item_msg(work_item)
+
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(side_effect=AdlsUploadError("boom"))
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
+
+        mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
+        mock_tracker.mark_processing = AsyncMock()
+        mock_tracker.mark_failed = AsyncMock()
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        emitter = _mock_emitter()
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+            patch("function_app.emit_dataset_metrics") as mock_metrics,
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)  # must NOT raise
+
+        mock_metrics.assert_called_once()
+        assert mock_metrics.call_args.args[0].datasets_failed == 1
+
+    @pytest.mark.asyncio
+    async def test_transient_processing_failure_emits_metrics_before_raising(
+        self,
+    ) -> None:
+        from azure.core.exceptions import HttpResponseError
+
+        from src.adls_store import AdlsUploadError
+
+        work_item = _default_work_item()
+        mock_msg = _mock_work_item_msg(work_item)
+
+        transient_cause = HttpResponseError(message="unavailable")
+        transient_cause.status_code = 503
+        upload_error = AdlsUploadError("failed")
+        upload_error.__cause__ = transient_cause
+
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(side_effect=upload_error)
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
+
+        mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
+        mock_tracker.mark_processing = AsyncMock()
+        mock_tracker.mark_failed = AsyncMock()
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        emitter = _mock_emitter()
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+            patch("function_app.emit_dataset_metrics") as mock_metrics,
+        ):
+            from function_app import historical_worker
+
+            with pytest.raises(AdlsUploadError):
+                await historical_worker(mock_msg)
+
+        # Metrics still ran, via `finally`, even though the function raised.
+        mock_metrics.assert_called_once()
+        assert mock_metrics.call_args.args[0].datasets_failed == 1
+
+    @pytest.mark.asyncio
+    async def test_success_emits_metrics_without_failed_flag(self) -> None:
+        work_item = _default_work_item()
+        mock_msg = _mock_work_item_msg(work_item)
+
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(return_value=(100, "a" * 64, 10))
+        mock_adls.write_json = AsyncMock()
+        mock_adls.blob_url = AsyncMock(return_value="http://azurite/bronze/x.csv")
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
+
+        mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        emitter = _mock_emitter()
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+            patch("function_app.emit_dataset_metrics") as mock_metrics,
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)
+
+        mock_metrics.assert_called_once()
+        stats = mock_metrics.call_args.args[0]
+        assert stats.datasets_failed == 0
+        assert stats.datasets_emitted == 1
+
+
+class TestCompletedMeansEventPublished:
+    """Order: upload -> write_json -> emit_cloudevent -> mark_completed.
+    mark_completed is the signal get_versions() reads to decide "already
+    done", so it must not fire until after the event a consumer reacts to
+    has actually been sent."""
+
+    @pytest.mark.asyncio
+    async def test_emit_cloudevent_happens_before_mark_completed(self) -> None:
+        work_item = _default_work_item()
+        mock_msg = _mock_work_item_msg(work_item)
+
+        call_order: list[str] = []
+
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(return_value=(100, "a" * 64, 10))
+        mock_adls.write_json = AsyncMock()
+        mock_adls.blob_url = AsyncMock(return_value="http://azurite/bronze/x.csv")
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
+
+        mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
+
+        async def _mark_completed(*args, **kwargs) -> None:
+            call_order.append("mark_completed")
+
+        mock_tracker.mark_completed = _mark_completed
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        emitter = _mock_emitter()
+
+        async def _emit_cloudevent(*args, **kwargs) -> None:
+            call_order.append("emit_cloudevent")
+
+        emitter.emit_cloudevent = _emit_cloudevent
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)
+
+        assert call_order == ["emit_cloudevent", "mark_completed"]
+
+
+class TestRedeliveryAfterTransientEmitFailure:
+    """A transient failure during emit_cloudevent must not have run
+    mark_completed, so a redelivery of the same message resolves the same
+    version (get_versions still sees no completed version), re-uploads
+    (idempotent overwrite of the same path), and re-emits with the same
+    deterministic id — the event is "emitted once" from a dedupe-by-id
+    consumer's perspective, even though emit_cloudevent was called twice."""
+
+    @pytest.mark.asyncio
+    async def test_emit_transient_then_redelivered_emits_once_with_same_id(
+        self,
+    ) -> None:
+        from azure.core.exceptions import HttpResponseError
+
+        work_item = _default_work_item()
+
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(return_value=(100, "a" * 64, 10))
+        mock_adls.write_json = AsyncMock()
+        mock_adls.blob_url = AsyncMock(return_value="http://azurite/bronze/x.csv")
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
+
+        # No completed version exists across either attempt — that's the
+        # whole point: mark_completed never ran after attempt 1.
+        mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
+        mock_tracker.mark_processing = AsyncMock()
+        mock_tracker.mark_failed = AsyncMock()
+        mock_tracker.mark_completed = AsyncMock()
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        transient_cause = HttpResponseError(message="unavailable")
+        transient_cause.status_code = 503
+
+        emitter = _mock_emitter()
+        emitter.emit_cloudevent = AsyncMock(side_effect=transient_cause)
+
+        # --- Attempt 1: emit_cloudevent fails transiently, worker raises ---
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_worker
+
+            with pytest.raises(HttpResponseError):
+                await historical_worker(_mock_work_item_msg(work_item))
+
+        mock_tracker.mark_completed.assert_not_called()
+        first_envelope = emitter.emit_cloudevent.call_args.kwargs["envelope"]
+        first_id = first_envelope["id"]
+        first_version = first_envelope["data"]["version"]
+
+        # --- Attempt 2 (redelivery of the identical message): succeeds ---
+        emitter.emit_cloudevent = AsyncMock(return_value=None)
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(_mock_work_item_msg(work_item))  # must NOT raise
+
+        mock_tracker.mark_completed.assert_called_once()
+        second_envelope = emitter.emit_cloudevent.call_args.kwargs["envelope"]
+
+        # Same file identity + version resolved both times -> same id.
+        assert second_envelope["data"]["version"] == first_version
+        assert second_envelope["id"] == first_id
