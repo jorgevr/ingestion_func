@@ -25,10 +25,14 @@ from azure.core.exceptions import (
     ServiceResponseError,
 )
 from azure.servicebus.exceptions import (
-    OperationTimeoutError,
-    ServiceBusCommunicationError,
-    ServiceBusConnectionError,
-    ServiceBusServerBusyError,
+    MessageNotFoundError,
+    MessageSizeExceededError,
+    MessagingEntityAlreadyExistsError,
+    MessagingEntityDisabledError,
+    MessagingEntityNotFoundError,
+    ServiceBusAuthenticationError,
+    ServiceBusAuthorizationError,
+    ServiceBusError,
 )
 from jsonschema import Draft202012Validator, ValidationError
 
@@ -160,7 +164,13 @@ def _make_emitter(config):
     )
 
 
-async def _dead_letter(config, correlation_id: str, reason: str, detail: dict) -> None:
+async def _dead_letter(
+    config,
+    logger: logging.LoggerAdapter,
+    correlation_id: str,
+    reason: str,
+    detail: dict,
+) -> None:
     """Single choke point for every dead-letter ``historical_worker`` sends.
 
     The body stays this repo's current app-level queue shape — a flat dict
@@ -169,24 +179,56 @@ async def _dead_letter(config, correlation_id: str, reason: str, detail: dict) -
     0001) replaces this body with a quarantine record; keeping every
     dead-letter site routed through here means that swap only touches one
     place, not three.
+
+    If the send itself fails, this logs an ERROR (naming *reason* and
+    *correlation_id*) and re-raises — the caller then also raises (or lets
+    this propagate), so the *original* message is never completed and is
+    redelivered instead, bounded by the queue's ``maxDeliveryCount``. Losing
+    the dead-letter send must never look like "handled".
     """
-    async with _make_emitter(config) as emitter:
-        await emitter.emit_dead_letter(
-            queue_name=config.dead_letter_queue_name,
-            message_body={
-                "correlation_id": correlation_id,
-                "error_type": reason,
-                **detail,
-            },
-            subject=reason,
+    try:
+        async with _make_emitter(config) as emitter:
+            await emitter.emit_dead_letter(
+                queue_name=config.dead_letter_queue_name,
+                message_body={
+                    "correlation_id": correlation_id,
+                    "error_type": reason,
+                    **detail,
+                },
+                subject=reason,
+            )
+    except Exception:
+        logger.error(
+            "Failed to send dead-letter message — reason=%s correlation_id=%s",
+            reason,
+            correlation_id,
+            exc_info=True,
         )
+        raise
 
 
-_TRANSIENT_SERVICE_BUS_ERRORS = (
-    ServiceBusConnectionError,
-    ServiceBusCommunicationError,
-    ServiceBusServerBusyError,
-    OperationTimeoutError,
+# ServiceBusError itself defaults to transient (below) — this is the
+# curated exception list: subclasses where a retry cannot help (auth,
+# entity gone/disabled/already-exists, message permanently too big, a
+# message that genuinely does not exist). Anything NOT listed here —
+# including a future SDK subclass this code has never heard of — stays
+# transient by falling through to the base-class check, which is the safe
+# default for Service Bus specifically (most failures here really are
+# connection/timeout/throttle). Quota/lock-lost errors are deliberately
+# *not* listed: they're transient (a retry, possibly after backoff, can
+# succeed once quota frees up or a new lock is acquired) — the base default
+# already covers them. tests/unit/test_servicebus_error_classification.py
+# recursively enumerates every ServiceBusError subclass in the installed
+# SDK and asserts each has an explicit expected classification here,
+# documenting each one instead of relying on silent fallthrough.
+_DETERMINISTIC_SERVICE_BUS_ERRORS = (
+    MessagingEntityNotFoundError,
+    MessagingEntityDisabledError,
+    MessagingEntityAlreadyExistsError,
+    ServiceBusAuthenticationError,
+    ServiceBusAuthorizationError,
+    MessageSizeExceededError,
+    MessageNotFoundError,
 )
 
 
@@ -197,8 +239,8 @@ def _is_transient_single(exc: BaseException) -> bool:
     if isinstance(exc, HttpResponseError):
         status = exc.status_code
         return status is not None and (status >= 500 or status in (408, 429))
-    if isinstance(exc, _TRANSIENT_SERVICE_BUS_ERRORS):
-        return True
+    if isinstance(exc, ServiceBusError):
+        return not isinstance(exc, _DETERMINISTIC_SERVICE_BUS_ERRORS)
     if isinstance(exc, httpx.TimeoutException | httpx.TransportError):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
@@ -527,27 +569,35 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
 async def historical_worker(msg: func.ServiceBusMessage) -> None:
     """Process a single historical CSV file: stream S3 → ADLS, emit event, mark complete.
 
-    Pipeline:
-    1. Parse the message body (deterministic on failure — dead-letter, no redeliver)
-    2. Validate work item schema (deterministic on failure — dead-letter, no redeliver)
-    3. Mark file as processing
-    4. Stream download from S3 + upload to ADLS Gen2 (one-pass, ~4 MiB memory)
-    5. Write the metadata.json sidecar
-    6. Emit the solar.pvdaq.dataset.available CloudEvent
-    7. Mark file as completed — LAST, because "completed" must mean "event
-       published". A transient failure at any of steps 4-6 leaves the
+    Pipeline (all one classified try region, from config load through
+    mark_completed):
+    1. Load config
+    2. Parse the message body (deterministic on failure — dead-letter, no redeliver)
+    3. Validate work item schema (deterministic on failure — dead-letter, no redeliver)
+    4. Construct the stores, resolve the version, mark file as processing
+    5. Stream download from S3 + upload to ADLS Gen2 (one-pass, ~4 MiB memory)
+    6. Write the metadata.json sidecar
+    7. Emit the solar.pvdaq.dataset.available CloudEvent
+    8. Mark file as completed — LAST, because "completed" must mean "event
+       published". A transient failure at any of steps 5-7 leaves the
        tracker showing no completed version, so a redelivery of the same
        message resolves the *same* version again and re-emits — and the
-       CloudEvent id is deterministic (site_id+category+version), so that
-       re-emit is a detectable duplicate for the consumer, not a new event.
+       CloudEvent id is deterministic (s3_key+version), so that re-emit is
+       a detectable duplicate for the consumer, not a new event.
 
-    Every exit path (both deterministic dead-letters, the transient raise,
-    and the successful completion) runs through the same `finally` so
-    dataset metrics are always emitted, and stats.datasets_failed reflects
-    every failure — not only the ones that happen to fall through the
-    bottom of the function.
+    Body-parsing and schema-validation failures are handled by their own
+    inner try/except (always deterministic, never classified — a malformed
+    body or an invalid work item is never made valid by retrying) and
+    return directly. Every other failure — from config load through
+    mark_completed — is caught by the single outer `except`, which is the
+    one place classification (`_is_transient`) happens: config-load failure
+    has no config to dead-letter with, so it always re-raises; every other
+    failure dead-letters and then raises only if transient.
+
+    Every exit path runs through the same `finally` so dataset metrics are
+    always emitted, and stats.datasets_failed reflects every failure — not
+    only the ones that happen to fall through the bottom of the function.
     """
-    config = load_historical_config()
     raw_body_bytes = msg.get_body()
 
     correlation_id = "unknown"
@@ -558,11 +608,16 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
         source="PVDAQ-historical-worker", correlation_id=correlation_id
     )
     start_time = time.monotonic()
+    config = None
     site_id: int | None = None
+    s3_key: str | None = None
+    version: int | None = None
     file_name = "unknown"
     bytes_written = 0
 
     try:
+        config = load_historical_config()
+
         # --- Parse the body: decode, JSON-load, require a JSON object.
         # A malformed body will never parse no matter how many times Service
         # Bus redelivers the identical bytes — deterministic, dead-letter
@@ -581,6 +636,7 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
             preview = raw_body_bytes.decode("utf-8", errors="replace")[:500]
             await _dead_letter(
                 config,
+                logger,
                 correlation_id,
                 reason="malformed_body",
                 detail={"file_reference": preview, "failure_reason": str(exc)},
@@ -602,6 +658,7 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
             logger.error("Work item schema validation failed: %s", exc.message)
             await _dead_letter(
                 config,
+                logger,
                 correlation_id,
                 reason="validation_failure",
                 detail={"file_reference": raw_body, "failure_reason": exc.message},
@@ -609,7 +666,7 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
             return
 
         site_id = work_item["site_id"]
-        s3_key: str = work_item["s3_key"]
+        s3_key = work_item["s3_key"]
         file_name = work_item["file_name"]
         category: str = work_item.get("category") or extract_category(
             file_name, site_id
@@ -653,141 +710,119 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
 
             await tracker.mark_processing(site_id, s3_key, version)
 
-            try:
-                # Stream S3 → ADLS: one-pass, ~4 MiB memory, returns (bytes, sha256, newlines)
-                bytes_written, file_hash, row_count = await adls.stream_upload(
-                    source_url=source_url,
-                    file_path=adls_path,
-                )
-                stats.datasets_downloaded = 1
-                stats.datasets_stored = 1
+            # Stream S3 → ADLS: one-pass, ~4 MiB memory, returns (bytes, sha256, newlines)
+            bytes_written, file_hash, row_count = await adls.stream_upload(
+                source_url=source_url,
+                file_path=adls_path,
+                s3_key=s3_key,
+            )
+            stats.datasets_downloaded = 1
+            stats.datasets_stored = 1
 
-                ingestion_time = datetime.now(timezone.utc).isoformat()
-                elapsed = time.monotonic() - start_time
+            ingestion_time = datetime.now(timezone.utc).isoformat()
+            elapsed = time.monotonic() - start_time
 
-                # Build metadata.json conforming to contracts/metadata-file.json
-                dataset_id = f"{site_id}_{category}"
-                metadata_dict = {
-                    "dataset": {
-                        "dataset_id": dataset_id,
-                        "dataset_type": "time_series",
-                        "version": version,
-                        "schema_version": "unknown",
-                        "tags": ["pvdaq", "solar"],
-                    },
-                    "source": {
-                        "source": "pvdaq",
-                        "source_type": "s3_public",
-                        "endpoint": f"pvdaq/2023-solar-data-prize/{site_id}_OEDI/data/",
-                        "provider": "NREL",
-                        "region": "us-east-1",
-                    },
-                    "ingestion": {
-                        "ingestion_time": ingestion_time,
-                        "ingestion_id": ingestion_id,
-                        "batch_id": correlation_id,
-                        "pipeline": "energy-ingestion-boundary-v1",
-                        "trigger_type": "rerun" if version > 1 else "scheduled",
-                        "retry_count": 0,
-                        "source_file_name": file_name,
-                        "file_size_bytes": bytes_written,
-                        "checksum": file_hash,
-                        "ingestion_latency_seconds": round(elapsed, 1),
-                        "status": "success",
-                    },
-                    "event_time": {
-                        "event_time_start": None,
-                        "event_time_end": None,
-                        "expected_frequency_seconds": 300,
-                        "expected_records": None,
-                    },
-                    "data_profile": {
-                        "row_count": row_count,
-                        "null_percentage": None,
-                        "duplicate_rows": None,
-                        "min_timestamp": None,
-                        "max_timestamp": None,
-                        "schema_detected": None,
-                        "corrupted_rows": None,
-                    },
-                    "quality_hint": {
-                        "basic_quality_score": None,
-                        "schema_valid": None,
-                        "time_continuity_suspected_gap": None,
-                        "notes": [],
-                    },
-                    "lineage": {
-                        "parent_dataset_version": version - 1 if version > 1 else None,
-                        "rerun_of": f"{dataset_id}_v{version - 1}"
-                        if version > 1
-                        else None,
-                        "related_incident_id": None,
-                    },
-                }
-                await adls.write_json(meta_path, metadata_dict)
+            # Build metadata.json conforming to contracts/metadata-file.json
+            dataset_id = f"{site_id}_{category}"
+            metadata_dict = {
+                "dataset": {
+                    "dataset_id": dataset_id,
+                    "dataset_type": "time_series",
+                    "version": version,
+                    "schema_version": "unknown",
+                    "tags": ["pvdaq", "solar"],
+                },
+                "source": {
+                    "source": "pvdaq",
+                    "source_type": "s3_public",
+                    "endpoint": f"pvdaq/2023-solar-data-prize/{site_id}_OEDI/data/",
+                    "provider": "NREL",
+                    "region": "us-east-1",
+                },
+                "ingestion": {
+                    "ingestion_time": ingestion_time,
+                    "ingestion_id": ingestion_id,
+                    "batch_id": correlation_id,
+                    "pipeline": "energy-ingestion-boundary-v1",
+                    "trigger_type": "rerun" if version > 1 else "scheduled",
+                    "retry_count": 0,
+                    "source_file_name": file_name,
+                    "file_size_bytes": bytes_written,
+                    "checksum": file_hash,
+                    "ingestion_latency_seconds": round(elapsed, 1),
+                    "status": "success",
+                },
+                "event_time": {
+                    "event_time_start": None,
+                    "event_time_end": None,
+                    "expected_frequency_seconds": 300,
+                    "expected_records": None,
+                },
+                "data_profile": {
+                    "row_count": row_count,
+                    "null_percentage": None,
+                    "duplicate_rows": None,
+                    "min_timestamp": None,
+                    "max_timestamp": None,
+                    "schema_detected": None,
+                    "corrupted_rows": None,
+                },
+                "quality_hint": {
+                    "basic_quality_score": None,
+                    "schema_valid": None,
+                    "time_continuity_suspected_gap": None,
+                    "notes": [],
+                },
+                "lineage": {
+                    "parent_dataset_version": version - 1 if version > 1 else None,
+                    "rerun_of": f"{dataset_id}_v{version - 1}" if version > 1 else None,
+                    "related_incident_id": None,
+                },
+            }
+            await adls.write_json(meta_path, metadata_dict)
 
-                # Emit dataset-available CloudEvent (US3) — before mark_completed;
-                # "completed" must mean "event published".
-                envelope = build_dataset_envelope(
-                    data={
-                        "site_id": site_id,
-                        "category": category,
-                        "file_format": "csv",
-                        "storage_path": await adls.blob_url(adls_path),
-                        "version": version,
-                        "ingestion_id": ingestion_id,
-                        "source_url": source_url,
-                        "file_size": bytes_written,
-                        "file_hash": file_hash,
-                    },
-                    config=config,
-                    ingestion_id=ingestion_id,
-                    traceparent=traceparent,
-                    ingestion_timestamp=ingestion_time,
-                )
-                await emitter.emit_cloudevent(
-                    topic_name=config.service_bus_queue_name,
-                    envelope=envelope,
-                )
-                stats.datasets_emitted = 1
+            # Emit dataset-available CloudEvent (US3) — before mark_completed;
+            # "completed" must mean "event published".
+            envelope = build_dataset_envelope(
+                data={
+                    "site_id": site_id,
+                    "category": category,
+                    "file_format": "csv",
+                    "storage_path": await adls.blob_url(adls_path),
+                    "version": version,
+                    "ingestion_id": ingestion_id,
+                    "source_url": source_url,
+                    "file_size": bytes_written,
+                    "file_hash": file_hash,
+                },
+                config=config,
+                ingestion_id=ingestion_id,
+                traceparent=traceparent,
+                ingestion_timestamp=ingestion_time,
+                s3_key=s3_key,
+            )
+            await emitter.emit_cloudevent(
+                topic_name=config.service_bus_queue_name,
+                envelope=envelope,
+            )
+            stats.datasets_emitted = 1
 
-                # Register metadata in tracking table — LAST: this is what
-                # get_versions() reads to decide "already completed", so it
-                # must not be set until the event it gates has been sent.
-                await tracker.mark_completed(
-                    site_id=site_id,
-                    s3_key=s3_key,
-                    version=version,
-                    category=category,
-                    storage_path=adls_path,
-                    file_hash=file_hash,
-                    ingestion_id=ingestion_id,
-                    source_url=source_url,
-                    ingestion_time=ingestion_time,
-                    row_count=row_count,
-                    metadata_path=meta_path,
-                )
-
-            except Exception as exc:
-                stats.datasets_failed = 1
-                logger.exception(
-                    "Historical worker failed — site=%d, file=%s",
-                    site_id,
-                    file_name,
-                )
-                await tracker.mark_failed(site_id, s3_key, version)
-                await _dead_letter(
-                    config,
-                    correlation_id,
-                    reason="dataset_failure",
-                    detail={"file_reference": s3_key, "failure_reason": str(exc)},
-                )
-                # Deterministic failures (a missing source file, a bug,
-                # anything not explicitly recognised as transient) complete
-                # the message here instead of raising — see _is_transient.
-                if _is_transient(exc):
-                    raise
-                return
+            # Register metadata in tracking table — LAST: this is what
+            # get_versions() reads to decide "already completed", so it
+            # must not be set until the event it gates has been sent.
+            await tracker.mark_completed(
+                site_id=site_id,
+                s3_key=s3_key,
+                version=version,
+                category=category,
+                storage_path=adls_path,
+                file_hash=file_hash,
+                ingestion_id=ingestion_id,
+                source_url=source_url,
+                ingestion_time=ingestion_time,
+                row_count=row_count,
+                metadata_path=meta_path,
+            )
 
         logger.info(
             "Historical worker completed — site=%d, file=%s, bytes=%d, stored=%d, emitted=%d",
@@ -797,6 +832,57 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
             stats.datasets_stored,
             stats.datasets_emitted,
         )
+
+    except Exception as exc:
+        stats.datasets_failed = 1
+
+        if config is None:
+            # load_historical_config() itself failed: there is no config to
+            # dead-letter with (and no way to construct one), so this
+            # cannot be classified or dead-lettered here — it must raise
+            # and let the host's own redelivery policy handle it.
+            logger.exception("Historical worker failed before config could be loaded")
+            raise
+
+        logger.exception(
+            "Historical worker failed — site=%s, file=%s",
+            site_id,
+            file_name,
+        )
+
+        if site_id is not None and s3_key is not None and version is not None:
+            # A fresh store, not the enclosing `tracker` — if the failure
+            # happened inside the `async with` block, `tracker` may already
+            # be closed by the time this except runs.
+            try:
+                async with FileTrackingStore(
+                    table_name=config.file_tracking_table_name,
+                    table_service_uri=config.table_storage_uri,
+                    connection_string=_storage_connection_string(),
+                ) as fresh_tracker:
+                    await fresh_tracker.mark_failed(site_id, s3_key, version)
+            except Exception:
+                logger.error(
+                    "Failed to mark file as failed after worker error",
+                    exc_info=True,
+                )
+
+        await _dead_letter(
+            config,
+            logger,
+            correlation_id,
+            reason="dataset_failure",
+            detail={
+                "file_reference": s3_key or "unknown",
+                "failure_reason": str(exc),
+            },
+        )
+        # Deterministic failures (a missing source file, a bug,
+        # anything not explicitly recognised as transient) complete
+        # the message here instead of raising — see _is_transient.
+        if _is_transient(exc):
+            raise
+        return
     finally:
         stats.duration_ms = (time.monotonic() - start_time) * 1000
         emit_dataset_metrics(stats)

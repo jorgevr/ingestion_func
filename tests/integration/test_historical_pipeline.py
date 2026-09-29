@@ -491,7 +491,7 @@ class TestWorkerIntegration:
         captured_paths: list[str] = []
 
         async def capture_upload(
-            source_url: str, file_path: str
+            source_url: str, file_path: str, s3_key: str
         ) -> tuple[int, str, int]:
             captured_paths.append(file_path)
             return (1000, "deadbeef" * 8, 500)
@@ -1145,3 +1145,193 @@ class TestRedeliveryAfterTransientEmitFailure:
         # Same file identity + version resolved both times -> same id.
         assert second_envelope["data"]["version"] == first_version
         assert second_envelope["id"] == first_id
+
+
+class TestOneTryRegionCoversEveryCallSite:
+    """R2.1d item 3: a single try/except region covers load_historical_config,
+    store construction, get_versions, mark_processing, upload, emit, and
+    mark_completed. Classification happens in exactly one place, and every
+    failure sets stats.datasets_failed — table-driven over
+    call site x {transient, deterministic}.
+
+    config-load failure is the one exception: there is no config yet to
+    dead-letter with, so it always raises regardless of the exception type,
+    and is tested separately below rather than in the shared table.
+    """
+
+    def _mocks(self) -> tuple[AsyncMock, AsyncMock, AsyncMock]:
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(return_value=(100, "a" * 64, 10))
+        mock_adls.write_json = AsyncMock()
+        mock_adls.blob_url = AsyncMock(return_value="http://azurite/bronze/x.csv")
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
+
+        mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
+        mock_tracker.mark_processing = AsyncMock()
+        mock_tracker.mark_completed = AsyncMock()
+        mock_tracker.mark_failed = AsyncMock()
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        emitter = _mock_emitter()
+        return mock_adls, mock_tracker, emitter
+
+    async def _run(self, call_site: str, exc: Exception):
+        """Run historical_worker with *exc* injected at *call_site*.
+
+        Returns (raised_exception_or_None, captured_stats, mock_tracker,
+        emitter).
+        """
+        from src.observability import DatasetIngestionStats
+
+        mock_adls, mock_tracker, emitter = self._mocks()
+
+        if call_site == "store_construction":
+            tracker_factory = MagicMock(side_effect=exc)
+        else:
+            tracker_factory = MagicMock(return_value=mock_tracker)
+
+        if call_site == "get_versions":
+            mock_tracker.get_versions = AsyncMock(side_effect=exc)
+        elif call_site == "mark_processing":
+            mock_tracker.mark_processing = AsyncMock(side_effect=exc)
+        elif call_site == "upload":
+            mock_adls.stream_upload = AsyncMock(side_effect=exc)
+        elif call_site == "emit":
+            emitter.emit_cloudevent = AsyncMock(side_effect=exc)
+        elif call_site == "mark_completed":
+            mock_tracker.mark_completed = AsyncMock(side_effect=exc)
+
+        captured_stats: list[DatasetIngestionStats] = []
+
+        def _capture_metrics(stats: DatasetIngestionStats) -> dict:
+            captured_stats.append(stats)
+            return {}
+
+        work_item = _default_work_item()
+        mock_msg = _mock_work_item_msg(work_item)
+
+        raised = None
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", tracker_factory),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+            patch("function_app.emit_dataset_metrics", side_effect=_capture_metrics),
+        ):
+            from function_app import historical_worker
+
+            try:
+                await historical_worker(mock_msg)
+            except Exception as caught:  # noqa: BLE001 - capturing for assertion
+                raised = caught
+
+        return raised, captured_stats, mock_tracker, emitter
+
+    _CALL_SITES = [
+        "store_construction",
+        "get_versions",
+        "mark_processing",
+        "upload",
+        "emit",
+        "mark_completed",
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("call_site", _CALL_SITES)
+    async def test_transient_failure_reraises_dead_letters_and_sets_metric(
+        self, call_site: str
+    ) -> None:
+        from azure.core.exceptions import ServiceRequestError
+
+        exc = ServiceRequestError("connection reset")
+        raised, captured_stats, _tracker, emitter = await self._run(call_site, exc)
+
+        assert raised is exc, f"{call_site}: transient failure must re-raise"
+        emitter.emit_dead_letter.assert_called_once()
+        assert len(captured_stats) == 1
+        assert captured_stats[0].datasets_failed == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("call_site", _CALL_SITES)
+    async def test_deterministic_failure_completes_dead_letters_and_sets_metric(
+        self, call_site: str
+    ) -> None:
+        exc = ValueError(f"deterministic bug at {call_site}")
+        raised, captured_stats, _tracker, emitter = await self._run(call_site, exc)
+
+        assert raised is None, f"{call_site}: deterministic failure must not raise"
+        emitter.emit_dead_letter.assert_called_once()
+        assert len(captured_stats) == 1
+        assert captured_stats[0].datasets_failed == 1
+
+    @pytest.mark.asyncio
+    async def test_config_load_failure_always_raises_never_dead_letters(self) -> None:
+        """No config exists yet to dead-letter with — this is the one call
+        site excluded from classification: it always re-raises, whatever
+        the exception, and metrics are still emitted with datasets_failed set."""
+        from src.observability import DatasetIngestionStats
+
+        exc = RuntimeError("bad config")
+        captured_stats: list[DatasetIngestionStats] = []
+
+        def _capture_metrics(stats: DatasetIngestionStats) -> dict:
+            captured_stats.append(stats)
+            return {}
+
+        emitter = _mock_emitter()
+        work_item = _default_work_item()
+        mock_msg = _mock_work_item_msg(work_item)
+
+        with (
+            patch("function_app.load_historical_config", side_effect=exc),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+            patch("function_app.emit_dataset_metrics", side_effect=_capture_metrics),
+        ):
+            from function_app import historical_worker
+
+            with pytest.raises(RuntimeError, match="bad config"):
+                await historical_worker(mock_msg)
+
+        emitter.emit_dead_letter.assert_not_called()
+        assert len(captured_stats) == 1
+        assert captured_stats[0].datasets_failed == 1
+
+    @pytest.mark.asyncio
+    async def test_success_path_sets_no_failed_metric(self) -> None:
+        from src.observability import DatasetIngestionStats
+
+        mock_adls, mock_tracker, emitter = self._mocks()
+        captured_stats: list[DatasetIngestionStats] = []
+
+        def _capture_metrics(stats: DatasetIngestionStats) -> dict:
+            captured_stats.append(stats)
+            return {}
+
+        work_item = _default_work_item()
+        mock_msg = _mock_work_item_msg(work_item)
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+            patch("function_app.emit_dataset_metrics", side_effect=_capture_metrics),
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)
+
+        assert len(captured_stats) == 1
+        assert captured_stats[0].datasets_failed == 0
+        assert captured_stats[0].datasets_emitted == 1
+        emitter.emit_dead_letter.assert_not_called()

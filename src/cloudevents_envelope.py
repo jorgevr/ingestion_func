@@ -22,8 +22,17 @@ _ConfigLike = Config | HistoricalConfig
 _DATASET_EVENT_ID_NAMESPACE = uuid.UUID("6d1f1a2e-8b7a-4b8b-9c3f-9a8f9e6d5c4b")
 
 
-def _deterministic_event_id(site_id: int, category: str, version: int) -> str:
-    """Derive the CloudEvent ``id`` from file identity + version — not random.
+def _deterministic_event_id(s3_key: str, version: int) -> str:
+    """Derive the CloudEvent ``id`` from the true file identity + version —
+    not random, and not site_id+category.
+
+    ``site_id`` + ``category`` is a *derived* grouping (category comes from
+    parsing the filename via ``extract_category``), not a unique identity:
+    two genuinely different S3 objects can extract to the same category and
+    would then collide on the same id. ``s3_key`` — the actual S3 object
+    key — is always unique per source file, so it's what this must be keyed
+    on (see also ``AdlsStore._check_no_identity_collision``, which guards
+    the same non-uniqueness at the storage-path level).
 
     A redelivered work item that gets as far as re-emitting (e.g. after a
     transient failure that struck after the previous attempt's upload but
@@ -31,9 +40,7 @@ def _deterministic_event_id(site_id: int, category: str, version: int) -> str:
     produces the *same* id both times. A downstream consumer can then
     dedupe by id instead of silently double-processing the same dataset.
     """
-    return str(
-        uuid.uuid5(_DATASET_EVENT_ID_NAMESPACE, f"{site_id}_{category}_v{version}")
-    )
+    return str(uuid.uuid5(_DATASET_EVENT_ID_NAMESPACE, f"{s3_key}#v{version}"))
 
 
 def build_dataset_envelope(
@@ -42,6 +49,7 @@ def build_dataset_envelope(
     ingestion_id: str,
     traceparent: str,
     ingestion_timestamp: str,
+    s3_key: str,
 ) -> dict:
     """Build a CloudEvents v1.0 envelope for a dataset-available event.
 
@@ -58,6 +66,9 @@ def build_dataset_envelope(
             lineage tracing.
         traceparent: W3C Trace Context traceparent header value.
         ingestion_timestamp: ISO-8601 timestamp when the file was processed.
+        s3_key: The S3 object key this event is for — used only to derive
+            the deterministic ``id`` (see ``_deterministic_event_id``); not
+            itself included in the envelope body.
 
     Returns:
         A dict conforming to the dataset CloudEvents envelope contract.
@@ -66,9 +77,7 @@ def build_dataset_envelope(
         "specversion": "1.0",
         "type": "solar.pvdaq.dataset.available",
         "source": "/energy-ingestion-boundary/pvdaq",
-        "id": _deterministic_event_id(
-            data["site_id"], data["category"], data["version"]
-        ),
+        "id": _deterministic_event_id(s3_key, data["version"]),
         "time": ingestion_timestamp,
         "datacontenttype": "application/json",
         "tenant_id": config.tenant_id,

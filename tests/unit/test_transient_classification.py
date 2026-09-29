@@ -18,13 +18,18 @@ from azure.core.exceptions import (
     ServiceResponseError,
 )
 from azure.servicebus.exceptions import (
+    MessageLockLostError,
     MessageSizeExceededError,
+    MessagingEntityDisabledError,
     MessagingEntityNotFoundError,
     OperationTimeoutError,
+    ServiceBusAuthenticationError,
     ServiceBusAuthorizationError,
     ServiceBusCommunicationError,
     ServiceBusConnectionError,
+    ServiceBusQuotaExceededError,
     ServiceBusServerBusyError,
+    SessionLockLostError,
 )
 
 from function_app import _is_transient
@@ -72,13 +77,21 @@ _CASES: list[tuple[BaseException, bool]] = [
     (_http_response_error(409), False),
     (_http_response_error(None), False),
     (ResourceNotFoundError("not found"), False),
-    # --- transient: Service Bus transport/throttle ---
+    # --- transient: ServiceBusError base defaults to transient ---
     (ServiceBusConnectionError(message="disconnected"), True),
     (ServiceBusCommunicationError(message="no link"), True),
     (ServiceBusServerBusyError(message="busy"), True),
     (OperationTimeoutError(message="timed out"), True),
-    # --- deterministic: Service Bus non-transport errors ---
+    # Quota/lock-lost errors are deliberately transient (R2.1d item 2): a
+    # retry, possibly after backoff, can succeed once quota frees up or a
+    # new lock is acquired.
+    (ServiceBusQuotaExceededError(message="quota exceeded"), True),
+    (MessageLockLostError(message="lock lost"), True),
+    (SessionLockLostError(message="session lock lost"), True),
+    # --- deterministic: curated list — retrying cannot help ---
     (MessagingEntityNotFoundError(message="no such queue"), False),
+    (MessagingEntityDisabledError(message="entity disabled"), False),
+    (ServiceBusAuthenticationError(message="unauthenticated"), False),
     (ServiceBusAuthorizationError(message="forbidden"), False),
     (MessageSizeExceededError(message="too big"), False),
     # --- transient: httpx transport/timeout ---

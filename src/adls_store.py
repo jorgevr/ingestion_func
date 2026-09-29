@@ -25,9 +25,9 @@ from types import TracebackType
 from typing import Self
 
 import httpx
-from azure.core.exceptions import ResourceExistsError
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.identity.aio import DefaultAzureCredential
-from azure.storage.blob.aio import BlobServiceClient
+from azure.storage.blob.aio import BlobClient, BlobServiceClient
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,22 @@ CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB
 
 class AdlsUploadError(Exception):
     """Raised when an ADLS Gen2 upload fails."""
+
+
+class AdlsBlobIdentityMismatchError(AdlsUploadError):
+    """Raised when the target blob already exists under a *different*
+    source identity (``s3_key``) than the one being uploaded.
+
+    ``_adls_path`` derives its path from ``site_id`` + a *derived* category
+    string (via ``extract_category``), not from the S3 key directly — two
+    genuinely different source files can map to the same category and
+    therefore the same path+version. Without this guard the second upload
+    would silently overwrite the first file's data. It is a subclass of
+    ``AdlsUploadError`` so the existing deterministic-by-default
+    classification (function_app._is_transient) treats it correctly with no
+    special-casing: retrying the identical upload would hit the identical
+    collision every time.
+    """
 
 
 def _block_id(index: int) -> str:
@@ -119,10 +135,41 @@ class AdlsStore:
         except ResourceExistsError:
             pass
 
+    async def _check_no_identity_collision(
+        self, blob_client: BlobClient, file_path: str, s3_key: str
+    ) -> None:
+        """Refuse to overwrite a blob written for a *different* source file.
+
+        A no-op when the blob doesn't exist yet, or exists with no recorded
+        ``s3_key`` (pre-existing blobs from before this guard existed) — in
+        both cases there's nothing to compare against.
+        """
+        try:
+            props = await blob_client.get_blob_properties()
+        except ResourceNotFoundError:
+            return
+        existing_s3_key = (props.metadata or {}).get("s3_key")
+        if existing_s3_key and existing_s3_key != s3_key:
+            logger.error(
+                "Blob identity collision at %s/%s: existing blob was written "
+                "for s3_key=%r, this upload is for s3_key=%r — refusing to "
+                "overwrite",
+                self._container_name,
+                file_path,
+                existing_s3_key,
+                s3_key,
+            )
+            raise AdlsBlobIdentityMismatchError(
+                f"Refusing to overwrite {file_path}: existing blob's s3_key "
+                f"({existing_s3_key!r}) does not match this upload's "
+                f"({s3_key!r})"
+            )
+
     async def stream_upload(
         self,
         source_url: str,
         file_path: str,
+        s3_key: str,
         http_client: httpx.AsyncClient | None = None,
     ) -> tuple[int, str, int]:
         """Stream a remote file into ADLS Gen2 as a block blob.
@@ -136,10 +183,19 @@ class AdlsStore:
         file has downloaded successfully. A source-side failure therefore
         leaves no blob, partial or otherwise, behind.
 
+        Before staging, the target blob's existing metadata (if any) is
+        checked against *s3_key* — see ``_check_no_identity_collision``. On
+        commit, *s3_key* is written to the blob's metadata so a *future*
+        upload to the same path can make the same check.
+
         Args:
             source_url: HTTP(S) URL to download from (typically an S3 URL).
             file_path: Destination path within the container, without a
                 leading slash.
+            s3_key: The full S3 object key this upload is for — the true,
+                always-unique source identity (unlike the path, which is
+                derived from a non-unique category string). Recorded in the
+                blob's metadata and used as the identity-collision guard.
             http_client: Optional ``httpx.AsyncClient`` for testability.
 
         Returns:
@@ -149,6 +205,8 @@ class AdlsStore:
 
         Raises:
             AdlsUploadError: If the download or upload fails.
+            AdlsBlobIdentityMismatchError: If the target path already holds a
+                blob written for a different ``s3_key``.
         """
         owns_http = http_client is None
         if http_client is None:
@@ -174,6 +232,7 @@ class AdlsStore:
                 blob_client = blob_svc.get_blob_client(
                     container=self._container_name, blob=file_path
                 )
+                await self._check_no_identity_collision(blob_client, file_path, s3_key)
 
                 async for chunk in response.aiter_bytes(chunk_size=CHUNK_SIZE):
                     hasher.update(chunk)
@@ -183,8 +242,10 @@ class AdlsStore:
                     block_ids.append(block_id)
                     offset += len(chunk)
 
-            # Commit — this is the single point at which the blob becomes visible.
-            await blob_client.commit_block_list(block_ids)
+            # Commit — this is the single point at which the blob becomes
+            # visible — with s3_key recorded so a future upload to this same
+            # path can detect a collision too.
+            await blob_client.commit_block_list(block_ids, metadata={"s3_key": s3_key})
             file_hash = hasher.hexdigest()
 
             logger.debug(
