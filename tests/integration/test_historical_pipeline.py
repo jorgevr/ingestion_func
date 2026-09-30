@@ -543,7 +543,7 @@ class TestWorkerIntegration:
         mock_adls.stream_upload = AsyncMock(return_value=(65000000, "a" * 64, 105121))
         captured_json_args: list[tuple] = []
 
-        async def capture_write_json(file_path: str, data: dict) -> None:
+        async def capture_write_json(file_path: str, data: dict, s3_key: str) -> None:
             captured_json_args.append((file_path, data))
 
         mock_adls.write_json = capture_write_json
@@ -1335,3 +1335,196 @@ class TestOneTryRegionCoversEveryCallSite:
         assert captured_stats[0].datasets_failed == 0
         assert captured_stats[0].datasets_emitted == 1
         emitter.emit_dead_letter.assert_not_called()
+
+
+class TestDeadLetterSendFailureDoesNotRetry:
+    """R2.1e item 2: if the dead-letter send itself fails, _dead_letter
+    raises DeadLetterSendError, and historical_worker must not attempt a
+    second dead-letter send for the same delivery — it escapes instead so
+    Service Bus redelivers. The reviewer's scenario: a malformed body (the
+    first thing that can trigger a dead-letter send), whose first
+    emit_dead_letter call fails; a second call, if attempted, would
+    succeed — proving this is about NOT retrying, not about the retry
+    being doomed."""
+
+    @pytest.mark.asyncio
+    async def test_malformed_body_dead_letter_send_failure_escapes_without_retry(
+        self,
+    ) -> None:
+        from function_app import DeadLetterSendError
+
+        mock_msg = MagicMock()
+        mock_msg.get_body.return_value = b"this is not json {"
+
+        emitter = _mock_emitter()
+        emitter.emit_dead_letter = AsyncMock(
+            side_effect=[RuntimeError("transient send failure"), None]
+        )
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_worker
+
+            with pytest.raises(DeadLetterSendError):
+                await historical_worker(mock_msg)
+
+        # Exactly one dead-letter attempt per delivery — the failed one.
+        # historical_worker must not have tried again with the same reason.
+        emitter.emit_dead_letter.assert_called_once()
+        body = emitter.emit_dead_letter.call_args.kwargs["message_body"]
+        assert body["error_type"] == "malformed_body"
+
+
+class TestFullCallOrder:
+    """R2.1e item 3: asserts the exact end-to-end call order across the
+    four guarded operations. Manually verified as mutation-sensitive: with
+    function_app.py locally edited to call write_json after emit_cloudevent
+    instead of before, this test fails (call_order comes back as
+    [stream_upload, emit_cloudevent, write_json, mark_completed]); reverting
+    the edit makes it pass again — see the R2.1e report for the exact
+    mutation and result."""
+
+    @pytest.mark.asyncio
+    async def test_call_order_is_upload_write_json_emit_complete(self) -> None:
+        call_order: list[str] = []
+
+        mock_adls = AsyncMock()
+
+        async def _stream_upload(*args, **kwargs):
+            call_order.append("stream_upload")
+            return (100, "a" * 64, 10)
+
+        async def _write_json(*args, **kwargs):
+            call_order.append("write_json")
+
+        mock_adls.stream_upload = _stream_upload
+        mock_adls.write_json = _write_json
+        mock_adls.blob_url = AsyncMock(return_value="http://azurite/bronze/x.csv")
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
+
+        mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
+        mock_tracker.mark_processing = AsyncMock()
+
+        async def _mark_completed(*args, **kwargs):
+            call_order.append("mark_completed")
+
+        mock_tracker.mark_completed = _mark_completed
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        emitter = _mock_emitter()
+
+        async def _emit_cloudevent(*args, **kwargs):
+            call_order.append("emit_cloudevent")
+
+        emitter.emit_cloudevent = _emit_cloudevent
+
+        work_item = _default_work_item()
+        mock_msg = _mock_work_item_msg(work_item)
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)
+
+        assert call_order == [
+            "stream_upload",
+            "write_json",
+            "emit_cloudevent",
+            "mark_completed",
+        ]
+
+
+class TestGuardedRegionCoversInitialSteps:
+    """R2.1e item 5: msg.get_body(), create_logger, and stats construction
+    are themselves inside the guarded try region (stats constructed first,
+    so the `finally` can always report through it) — a failure in any of
+    them is handled the same way a config-load failure is (no config yet
+    to dead-letter with, so it always escapes), not an uncaught crash
+    outside the try/finally."""
+
+    @pytest.mark.asyncio
+    async def test_get_body_failure_raises(self) -> None:
+        mock_msg = MagicMock()
+        mock_msg.get_body.side_effect = RuntimeError("body unreadable")
+
+        from function_app import historical_worker
+
+        with pytest.raises(RuntimeError, match="body unreadable"):
+            await historical_worker(mock_msg)
+
+    @pytest.mark.asyncio
+    async def test_create_logger_failure_raises_and_logs_via_fallback(
+        self, caplog
+    ) -> None:
+        import logging
+
+        work_item = _default_work_item()
+        mock_msg = _mock_work_item_msg(work_item)
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch(
+                "function_app.create_logger",
+                side_effect=RuntimeError("logger setup failed"),
+            ),
+            caplog.at_level(logging.ERROR, logger="function_app"),
+        ):
+            from function_app import historical_worker
+
+            with pytest.raises(RuntimeError, match="logger setup failed"):
+                await historical_worker(mock_msg)
+
+        # The fallback logger (plain logging.getLogger(__name__), not
+        # create_logger's LoggerAdapter) is what reports this — proving the
+        # except/finally blocks never crash for want of a working logger.
+        assert any(
+            "before config could be loaded" in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_stats_construction_failure_raises_and_skips_metrics(self) -> None:
+        work_item = _default_work_item()
+        mock_msg = _mock_work_item_msg(work_item)
+
+        captured_calls: list = []
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch(
+                "function_app.DatasetIngestionStats",
+                side_effect=RuntimeError("stats ctor failed"),
+            ),
+            patch(
+                "function_app.emit_dataset_metrics",
+                side_effect=lambda s: captured_calls.append(s),
+            ),
+        ):
+            from function_app import historical_worker
+
+            with pytest.raises(RuntimeError, match="stats ctor failed"):
+                await historical_worker(mock_msg)
+
+        # No stats object was ever successfully constructed — nothing to
+        # emit metrics for, and no AttributeError/NameError either.
+        assert captured_calls == []

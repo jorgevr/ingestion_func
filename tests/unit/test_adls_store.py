@@ -18,7 +18,12 @@ import inspect
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+from azure.core import MatchConditions
+from azure.core.exceptions import (
+    ResourceExistsError,
+    ResourceModifiedError,
+    ResourceNotFoundError,
+)
 
 from src import adls_store
 from src.adls_store import AdlsBlobIdentityMismatchError, AdlsStore, AdlsUploadError
@@ -227,6 +232,7 @@ class TestBothCredentialModesRunTheSameUploadPath:
     @pytest.mark.asyncio
     async def test_write_json_identical_for_both_modes(self) -> None:
         payload = {"dataset": {"dataset_id": "1_ac_power"}}
+        s3_key = "pvdaq/2023-solar-data-prize/1_OEDI/data/9068_ac_power_data.csv"
 
         # local/emulator mode
         blob_client_local = _mock_blob_client()
@@ -242,10 +248,13 @@ class TestBothCredentialModesRunTheSameUploadPath:
                 connection_string="UseDevelopmentStorage=true",
             )
             await store.write_json(
-                "source=pvdaq/dataset=1_ac_power/metadata.json", payload
+                "source=pvdaq/dataset=1_ac_power/metadata.json", payload, s3_key=s3_key
             )
         blob_client_local.upload_blob.assert_called_once()
         assert blob_client_local.upload_blob.call_args.kwargs.get("overwrite") is True
+        assert blob_client_local.upload_blob.call_args.kwargs.get("metadata") == {
+            "s3_key": s3_key
+        }
 
         # cloud/credential mode
         blob_client_cloud = _mock_blob_client()
@@ -261,28 +270,69 @@ class TestBothCredentialModesRunTheSameUploadPath:
                 container_name="bronze",
             )
             await store.write_json(
-                "source=pvdaq/dataset=1_ac_power/metadata.json", payload
+                "source=pvdaq/dataset=1_ac_power/metadata.json", payload, s3_key=s3_key
             )
         blob_client_cloud.upload_blob.assert_called_once()
         assert blob_client_cloud.upload_blob.call_args.kwargs.get("overwrite") is True
+        assert blob_client_cloud.upload_blob.call_args.kwargs.get("metadata") == {
+            "s3_key": s3_key
+        }
 
 
 class TestBlobIdentityCollisionGuard:
-    """R2.1d item 1: the target blob's existing metadata is checked against
-    the uploading s3_key before any block is staged, and every successful
-    upload records its own s3_key in metadata for future uploads to check
-    against.
+    """R2.1e item 1: the identity guard is enforced *atomically* at commit
+    time via a conditional commit_block_list — no blob yet ->
+    match_condition=IfMissing; a blob already holding this same s3_key ->
+    etag=<props.etag>, match_condition=IfNotModified. Blocks are staged
+    unconditionally beforehand (staging is provisional, never visible).
 
     Motivating scenario: two distinct S3 objects (e.g. a dataset split
     across two files) can extract to the same site_id+category and
-    therefore the same _adls_path+version — without this guard the second
-    upload would silently overwrite the first file's data.
+    therefore the same _adls_path+version — a plain read-then-write check
+    has a TOCTOU race between two concurrent uploads to the same path;
+    making the commit itself conditional closes that race server-side.
     """
 
     @pytest.mark.asyncio
-    async def test_commit_stores_s3_key_in_blob_metadata(self) -> None:
-        chunks = [b"a,b,c\n1,2,3\n"]
+    async def test_commit_uses_ifmissing_when_no_existing_blob(self) -> None:
+        """No blob at this path yet -> conditional commit with IfMissing,
+        no etag (there's nothing to match against)."""
+        blob_client = _mock_blob_client()  # default: get_blob_properties -> 404
+        service_client = _mock_service_client(blob_client)
+        store = AdlsStore(
+            account_url="https://acct.blob.core.windows.net",
+            container_name="bronze",
+            service_client=service_client,
+        )
+        s3_key = "pvdaq/2023-solar-data-prize/1_OEDI/data/9068_ac_power_part1.csv"
+
+        await store.stream_upload(
+            source_url="https://example.com/file.csv",
+            file_path="source=pvdaq/dataset=1_ac_power/file_v1.csv",
+            s3_key=s3_key,
+            http_client=_http_client_streaming([b"a,b,c\n1,2,3\n"]),
+        )
+
+        blob_client.commit_block_list.assert_called_once()
+        kwargs = blob_client.commit_block_list.call_args.kwargs
+        assert kwargs.get("metadata") == {"s3_key": s3_key}
+        assert kwargs.get("match_condition") == MatchConditions.IfMissing
+        assert "etag" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_commit_uses_ifnotmodified_with_etag_when_same_s3_key_exists(
+        self,
+    ) -> None:
+        """A retry/redelivery re-uploading the identical file (same s3_key
+        already at this path) -> conditional commit pinned to the read
+        etag, IfNotModified."""
+        s3_key = "pvdaq/2023-solar-data-prize/1_OEDI/data/9068_ac_power_part1.csv"
+
         blob_client = _mock_blob_client()
+        existing_props = MagicMock()
+        existing_props.metadata = {"s3_key": s3_key}
+        existing_props.etag = "etag-abc-123"
+        blob_client.get_blob_properties = AsyncMock(return_value=existing_props)
         service_client = _mock_service_client(blob_client)
         store = AdlsStore(
             account_url="https://acct.blob.core.windows.net",
@@ -291,32 +341,43 @@ class TestBlobIdentityCollisionGuard:
         )
 
         await store.stream_upload(
-            source_url="https://example.com/file.csv",
+            source_url="https://example.com/part1.csv",
             file_path="source=pvdaq/dataset=1_ac_power/file_v1.csv",
-            s3_key="pvdaq/2023-solar-data-prize/1_OEDI/data/9068_ac_power_part1.csv",
-            http_client=_http_client_streaming(chunks),
+            s3_key=s3_key,
+            http_client=_http_client_streaming([b"x,y\n1,2\n"]),
         )
 
         blob_client.commit_block_list.assert_called_once()
-        assert blob_client.commit_block_list.call_args.kwargs.get("metadata") == {
-            "s3_key": "pvdaq/2023-solar-data-prize/1_OEDI/data/9068_ac_power_part1.csv"
-        }
+        kwargs = blob_client.commit_block_list.call_args.kwargs
+        assert kwargs.get("etag") == "etag-abc-123"
+        assert kwargs.get("match_condition") == MatchConditions.IfNotModified
 
     @pytest.mark.asyncio
-    async def test_second_split_file_to_same_path_fails_loudly_no_overwrite(
+    async def test_conditional_failure_then_different_key_raises_mismatch(
         self,
     ) -> None:
-        """The review's exact scenario: two split files that extract to the
-        same category/path collide — the second must fail deterministically,
-        never overwrite, and never stage a single block."""
+        """The review's split-file race: attempt B reads "no blob", loses
+        the conditional commit race to attempt A, re-reads once more, finds
+        A's (different) s3_key now in place, and fails loudly — never a
+        second commit attempt, never an overwrite."""
         key_a = "pvdaq/2023-solar-data-prize/1_OEDI/data/9068_ac_power_part1.csv"
         key_b = "pvdaq/2023-solar-data-prize/1_OEDI/data/9068_ac_power_part2.csv"
         same_path = "source=pvdaq/dataset=1_ac_power/file_v1.csv"
 
+        props_after_race = MagicMock()
+        props_after_race.metadata = {"s3_key": key_a}
+        props_after_race.etag = "etag-a"
+
         blob_client = _mock_blob_client()
-        existing_props = MagicMock()
-        existing_props.metadata = {"s3_key": key_a}
-        blob_client.get_blob_properties = AsyncMock(return_value=existing_props)
+        blob_client.get_blob_properties = AsyncMock(
+            side_effect=[
+                ResourceNotFoundError("not found"),  # B's first read: no blob yet
+                props_after_race,  # re-read after losing the race: A won
+            ]
+        )
+        blob_client.commit_block_list = AsyncMock(
+            side_effect=ResourceExistsError("conditional commit failed")
+        )
         service_client = _mock_service_client(blob_client)
         store = AdlsStore(
             account_url="https://acct.blob.core.windows.net",
@@ -334,25 +395,41 @@ class TestBlobIdentityCollisionGuard:
                 http_client=_http_client_streaming([b"x,y\n1,2\n"]),
             )
 
-        blob_client.stage_block.assert_not_called()
-        blob_client.commit_block_list.assert_not_called()
+        # Blocks were staged (provisional, harmless) but only the one failed
+        # conditional commit attempt happened — no second commit, no
+        # overwrite of A's data.
+        blob_client.stage_block.assert_called_once()
+        blob_client.commit_block_list.assert_called_once()
+        assert blob_client.get_blob_properties.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_identity_mismatch_is_an_adls_upload_error_subclass(self) -> None:
-        """Deterministic classification (function_app._is_transient) relies
-        on this being an AdlsUploadError — no special-casing needed."""
-        assert issubclass(AdlsBlobIdentityMismatchError, AdlsUploadError)
+    async def test_conditional_failure_then_same_key_retries_and_succeeds(
+        self,
+    ) -> None:
+        """A lost race against an equivalent retry/redelivery of the *same*
+        file is not an error: re-reading reveals the same s3_key, so this
+        retries the commit once more (now IfNotModified against the fresh
+        etag) and succeeds silently."""
+        s3_key = "pvdaq/2023-solar-data-prize/1_OEDI/data/9068_ac_power_part1.csv"
+        same_path = "source=pvdaq/dataset=1_ac_power/file_v1.csv"
 
-    @pytest.mark.asyncio
-    async def test_reupload_with_same_s3_key_is_not_a_collision(self) -> None:
-        """A retry/redelivery re-uploading the identical file is fine — the
-        guard only rejects a *different* s3_key at the same path."""
-        key_a = "pvdaq/2023-solar-data-prize/1_OEDI/data/9068_ac_power_part1.csv"
+        props_after_race = MagicMock()
+        props_after_race.metadata = {"s3_key": s3_key}
+        props_after_race.etag = "etag-fresh"
 
         blob_client = _mock_blob_client()
-        existing_props = MagicMock()
-        existing_props.metadata = {"s3_key": key_a}
-        blob_client.get_blob_properties = AsyncMock(return_value=existing_props)
+        blob_client.get_blob_properties = AsyncMock(
+            side_effect=[
+                ResourceNotFoundError("not found"),  # first read: no blob yet
+                props_after_race,  # re-read: another writer committed first, same key
+            ]
+        )
+        blob_client.commit_block_list = AsyncMock(
+            side_effect=[
+                ResourceModifiedError("conditional commit failed"),  # lost the race
+                None,  # retry succeeds
+            ]
+        )
         service_client = _mock_service_client(blob_client)
         store = AdlsStore(
             account_url="https://acct.blob.core.windows.net",
@@ -362,21 +439,34 @@ class TestBlobIdentityCollisionGuard:
 
         await store.stream_upload(
             source_url="https://example.com/part1.csv",
-            file_path="source=pvdaq/dataset=1_ac_power/file_v1.csv",
-            s3_key=key_a,
+            file_path=same_path,
+            s3_key=s3_key,
             http_client=_http_client_streaming([b"x,y\n1,2\n"]),
         )
 
-        blob_client.commit_block_list.assert_called_once()
+        assert blob_client.commit_block_list.call_count == 2
+        second_call_kwargs = blob_client.commit_block_list.call_args_list[1].kwargs
+        assert second_call_kwargs.get("etag") == "etag-fresh"
+        assert (
+            second_call_kwargs.get("match_condition") == MatchConditions.IfNotModified
+        )
+
+    @pytest.mark.asyncio
+    async def test_identity_mismatch_is_an_adls_upload_error_subclass(self) -> None:
+        """Deterministic classification (function_app._is_transient) relies
+        on this being an AdlsUploadError — no special-casing needed."""
+        assert issubclass(AdlsBlobIdentityMismatchError, AdlsUploadError)
 
     @pytest.mark.asyncio
     async def test_blob_with_no_recorded_s3_key_is_not_a_collision(self) -> None:
         """A pre-existing blob written before this guard existed has no
-        s3_key metadata — nothing to compare against, so it's not treated
-        as a collision."""
+        s3_key metadata — nothing to compare against, so this proceeds
+        (conditional on IfNotModified against its current etag rather than
+        refusing outright)."""
         blob_client = _mock_blob_client()
         existing_props = MagicMock()
         existing_props.metadata = {}
+        existing_props.etag = "etag-preexisting"
         blob_client.get_blob_properties = AsyncMock(return_value=existing_props)
         service_client = _mock_service_client(blob_client)
         store = AdlsStore(
@@ -465,7 +555,11 @@ class TestStreamUploadErrors:
             service_client=service_client,
         )
 
-        await store.write_json("metadata.json", {"a": 1})
+        await store.write_json(
+            "metadata.json",
+            {"a": 1},
+            s3_key="pvdaq/2023-solar-data-prize/1_OEDI/data/x.csv",
+        )
 
         blob_client.upload_blob.assert_called_once()
 

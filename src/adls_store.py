@@ -25,7 +25,12 @@ from types import TracebackType
 from typing import Self
 
 import httpx
-from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+from azure.core import MatchConditions
+from azure.core.exceptions import (
+    ResourceExistsError,
+    ResourceModifiedError,
+    ResourceNotFoundError,
+)
 from azure.identity.aio import DefaultAzureCredential
 from azure.storage.blob.aio import BlobClient, BlobServiceClient
 
@@ -135,35 +140,89 @@ class AdlsStore:
         except ResourceExistsError:
             pass
 
-    async def _check_no_identity_collision(
-        self, blob_client: BlobClient, file_path: str, s3_key: str
+    async def _commit_with_identity_guard(
+        self,
+        blob_client: BlobClient,
+        file_path: str,
+        s3_key: str,
+        block_ids: list[str],
     ) -> None:
-        """Refuse to overwrite a blob written for a *different* source file.
+        """Atomically commit the block list, refusing to overwrite a blob
+        already holding a *different* source identity (``s3_key``).
 
-        A no-op when the blob doesn't exist yet, or exists with no recorded
-        ``s3_key`` (pre-existing blobs from before this guard existed) — in
-        both cases there's nothing to compare against.
+        A plain read-then-write check (read metadata, decide, then commit)
+        has a TOCTOU race: two concurrent uploads to the same path (e.g. two
+        split files that both extract to the same ``_adls_path``) can each
+        pass the read and then both commit, one silently overwriting the
+        other. This instead makes the *commit itself* conditional:
+
+        - No blob exists yet at this path -> commit with
+          ``match_condition=IfMissing`` (If-None-Match: *). If a concurrent
+          writer commits first, this fails server-side.
+        - A blob exists with this same ``s3_key`` already in its metadata
+          (a retry/redelivery re-uploading the identical file) -> commit
+          with ``etag=<props.etag>, match_condition=IfNotModified``
+          (If-Match), so this only succeeds if nothing has changed since
+          the read.
+        - A blob exists with a *different* ``s3_key`` -> refuse immediately,
+          no commit attempted.
+
+        On a conditional-commit failure (``ResourceExistsError`` — 409, from
+        the ``IfMissing`` branch losing a race — or ``ResourceModifiedError``
+        — 412, from the ``IfNotModified`` branch losing a race), the
+        properties are re-read exactly once more and the decision is made
+        again: if the winner turns out to share this upload's ``s3_key``,
+        this is just a lost race against an equivalent retry and the commit
+        is attempted once more with the fresh etag; if it's a different
+        ``s3_key``, this raises ``AdlsBlobIdentityMismatchError``.
         """
-        try:
-            props = await blob_client.get_blob_properties()
-        except ResourceNotFoundError:
-            return
-        existing_s3_key = (props.metadata or {}).get("s3_key")
-        if existing_s3_key and existing_s3_key != s3_key:
-            logger.error(
-                "Blob identity collision at %s/%s: existing blob was written "
-                "for s3_key=%r, this upload is for s3_key=%r — refusing to "
-                "overwrite",
-                self._container_name,
-                file_path,
-                existing_s3_key,
-                s3_key,
+        for attempt in range(2):
+            try:
+                props = await blob_client.get_blob_properties()
+            except ResourceNotFoundError:
+                existing_s3_key = None
+                etag = None
+            else:
+                existing_s3_key = (props.metadata or {}).get("s3_key")
+                etag = props.etag
+
+            if existing_s3_key is not None and existing_s3_key != s3_key:
+                logger.error(
+                    "Blob identity collision at %s/%s: existing blob was "
+                    "written for s3_key=%r, this upload is for s3_key=%r — "
+                    "refusing to overwrite",
+                    self._container_name,
+                    file_path,
+                    existing_s3_key,
+                    s3_key,
+                )
+                raise AdlsBlobIdentityMismatchError(
+                    f"Refusing to overwrite {file_path}: existing blob's "
+                    f"s3_key ({existing_s3_key!r}) does not match this "
+                    f"upload's ({s3_key!r})"
+                )
+
+            commit_kwargs = (
+                {"match_condition": MatchConditions.IfMissing}
+                if etag is None
+                else {"etag": etag, "match_condition": MatchConditions.IfNotModified}
             )
-            raise AdlsBlobIdentityMismatchError(
-                f"Refusing to overwrite {file_path}: existing blob's s3_key "
-                f"({existing_s3_key!r}) does not match this upload's "
-                f"({s3_key!r})"
-            )
+
+            try:
+                await blob_client.commit_block_list(
+                    block_ids, metadata={"s3_key": s3_key}, **commit_kwargs
+                )
+                return
+            except (ResourceExistsError, ResourceModifiedError):
+                if attempt == 0:
+                    logger.warning(
+                        "Conditional commit to %s/%s lost a race — re-reading "
+                        "blob identity once before deciding again",
+                        self._container_name,
+                        file_path,
+                    )
+                    continue
+                raise
 
     async def stream_upload(
         self,
@@ -183,10 +242,12 @@ class AdlsStore:
         file has downloaded successfully. A source-side failure therefore
         leaves no blob, partial or otherwise, behind.
 
-        Before staging, the target blob's existing metadata (if any) is
-        checked against *s3_key* — see ``_check_no_identity_collision``. On
-        commit, *s3_key* is written to the blob's metadata so a *future*
-        upload to the same path can make the same check.
+        Blocks are staged unconditionally (staging is provisional — an
+        uncommitted block costs nothing and is never visible); the identity
+        guard against *s3_key* is enforced atomically at commit time — see
+        ``_commit_with_identity_guard``. On a successful commit, *s3_key* is
+        written to the blob's metadata so a *future* upload to the same path
+        can make the same check.
 
         Args:
             source_url: HTTP(S) URL to download from (typically an S3 URL).
@@ -232,7 +293,6 @@ class AdlsStore:
                 blob_client = blob_svc.get_blob_client(
                     container=self._container_name, blob=file_path
                 )
-                await self._check_no_identity_collision(blob_client, file_path, s3_key)
 
                 async for chunk in response.aiter_bytes(chunk_size=CHUNK_SIZE):
                     hasher.update(chunk)
@@ -243,9 +303,11 @@ class AdlsStore:
                     offset += len(chunk)
 
             # Commit — this is the single point at which the blob becomes
-            # visible — with s3_key recorded so a future upload to this same
-            # path can detect a collision too.
-            await blob_client.commit_block_list(block_ids, metadata={"s3_key": s3_key})
+            # visible — atomically guarded against a different s3_key
+            # already occupying this path (see _commit_with_identity_guard).
+            await self._commit_with_identity_guard(
+                blob_client, file_path, s3_key, block_ids
+            )
             file_hash = hasher.hexdigest()
 
             logger.debug(
@@ -268,7 +330,7 @@ class AdlsStore:
             if owns_http:
                 await http_client.aclose()
 
-    async def write_json(self, file_path: str, data: dict) -> None:
+    async def write_json(self, file_path: str, data: dict, s3_key: str) -> None:
         """Write a JSON-serialisable dict as a single block blob in ADLS Gen2.
 
         ``upload_blob`` is a single call that creates the block blob
@@ -278,6 +340,12 @@ class AdlsStore:
             file_path: Destination path within the container, without a
                 leading slash (e.g. ``"source=pvdaq/.../metadata.json"``).
             data: JSON-serialisable dict to write.
+            s3_key: The S3 object key this metadata document describes —
+                recorded in the blob's metadata for the same traceability
+                stream_upload's blob gets. Unlike the CSV upload, this path
+                has no version component (a rerun intentionally overwrites
+                metadata.json), so this is not guarded by
+                ``_commit_with_identity_guard`` — it is a plain overwrite.
 
         Raises:
             AdlsUploadError: If the write fails.
@@ -290,7 +358,9 @@ class AdlsStore:
             blob_client = blob_svc.get_blob_client(
                 container=self._container_name, blob=file_path
             )
-            await blob_client.upload_blob(payload, overwrite=True)
+            await blob_client.upload_blob(
+                payload, overwrite=True, metadata={"s3_key": s3_key}
+            )
 
             logger.debug(
                 "Wrote %d bytes of JSON to %s/%s",

@@ -164,6 +164,18 @@ def _make_emitter(config):
     )
 
 
+class DeadLetterSendError(Exception):
+    """Raised when the dead-letter send itself fails (not the failure being
+    dead-lettered).
+
+    A distinct type so the caller can tell "the thing we were trying to
+    record failed" apart from "recording it also failed" — historical_worker
+    catches this specifically and re-raises it without attempting a second
+    dead-letter send (which would very likely fail identically and could
+    turn one delivery into an unbounded loop of dead-letter attempts).
+    """
+
+
 async def _dead_letter(
     config,
     logger: logging.LoggerAdapter,
@@ -181,10 +193,12 @@ async def _dead_letter(
     place, not three.
 
     If the send itself fails, this logs an ERROR (naming *reason* and
-    *correlation_id*) and re-raises — the caller then also raises (or lets
-    this propagate), so the *original* message is never completed and is
-    redelivered instead, bounded by the queue's ``maxDeliveryCount``. Losing
-    the dead-letter send must never look like "handled".
+    *correlation_id*) and raises ``DeadLetterSendError`` from the original —
+    the caller must let this propagate (never attempt another dead-letter
+    send for the same delivery), so the *original* message is never
+    completed and is redelivered instead, bounded by the queue's
+    ``maxDeliveryCount``. Losing the dead-letter send must never look like
+    "handled".
     """
     try:
         async with _make_emitter(config) as emitter:
@@ -197,14 +211,17 @@ async def _dead_letter(
                 },
                 subject=reason,
             )
-    except Exception:
+    except Exception as exc:
         logger.error(
             "Failed to send dead-letter message — reason=%s correlation_id=%s",
             reason,
             correlation_id,
             exc_info=True,
         )
-        raise
+        raise DeadLetterSendError(
+            f"Failed to send dead-letter message for reason={reason!r} "
+            f"correlation_id={correlation_id!r}"
+        ) from exc
 
 
 # ServiceBusError itself defaults to transient (below) — this is the
@@ -597,16 +614,18 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
     Every exit path runs through the same `finally` so dataset metrics are
     always emitted, and stats.datasets_failed reflects every failure — not
     only the ones that happen to fall through the bottom of the function.
-    """
-    raw_body_bytes = msg.get_body()
 
+    ``msg.get_body()``, ``create_logger``, and the ``stats`` object's own
+    construction are themselves inside the guarded region (stats first, so
+    the `finally` below can always report through it) — a failure in any of
+    them is still a dataset failure, not an uncaught crash. Until
+    ``create_logger`` succeeds, ``logger`` is a plain stdlib logger: a
+    fallback for the case where the correlation id (still the "unknown"
+    placeholder this early) or anything else about that call makes it fail.
+    """
     correlation_id = "unknown"
-    logger = create_logger(
-        correlation_id, vendor="PVDAQ", function_name="historical_worker"
-    )
-    stats = DatasetIngestionStats(
-        source="PVDAQ-historical-worker", correlation_id=correlation_id
-    )
+    logger: logging.Logger | logging.LoggerAdapter = logging.getLogger(__name__)
+    stats: DatasetIngestionStats | None = None
     start_time = time.monotonic()
     config = None
     site_id: int | None = None
@@ -616,6 +635,13 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
     bytes_written = 0
 
     try:
+        stats = DatasetIngestionStats(
+            source="PVDAQ-historical-worker", correlation_id=correlation_id
+        )
+        raw_body_bytes = msg.get_body()
+        logger = create_logger(
+            correlation_id, vendor="PVDAQ", function_name="historical_worker"
+        )
         config = load_historical_config()
 
         # --- Parse the body: decode, JSON-load, require a JSON object.
@@ -779,7 +805,7 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
                     "related_incident_id": None,
                 },
             }
-            await adls.write_json(meta_path, metadata_dict)
+            await adls.write_json(meta_path, metadata_dict, s3_key=s3_key)
 
             # Emit dataset-available CloudEvent (US3) — before mark_completed;
             # "completed" must mean "event published".
@@ -834,13 +860,23 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
         )
 
     except Exception as exc:
-        stats.datasets_failed = 1
+        if stats is not None:
+            stats.datasets_failed = 1
+
+        if isinstance(exc, DeadLetterSendError):
+            # _dead_letter already logged the send failure. Do not attempt
+            # a second dead-letter send for the same delivery — it would
+            # very likely fail identically — just let it escape so Service
+            # Bus redelivers.
+            raise
 
         if config is None:
-            # load_historical_config() itself failed: there is no config to
-            # dead-letter with (and no way to construct one), so this
-            # cannot be classified or dead-lettered here — it must raise
-            # and let the host's own redelivery policy handle it.
+            # load_historical_config() (or msg.get_body()/create_logger()/
+            # stats construction, all now guarded alongside it) failed:
+            # there is no config to dead-letter with (and no way to
+            # construct one), so this cannot be classified or dead-lettered
+            # here — it must raise and let the host's own redelivery policy
+            # handle it.
             logger.exception("Historical worker failed before config could be loaded")
             raise
 
@@ -884,5 +920,6 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
             raise
         return
     finally:
-        stats.duration_ms = (time.monotonic() - start_time) * 1000
-        emit_dataset_metrics(stats)
+        if stats is not None:
+            stats.duration_ms = (time.monotonic() - start_time) * 1000
+            emit_dataset_metrics(stats)

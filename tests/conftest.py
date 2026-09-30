@@ -36,6 +36,11 @@ _BASELINE_TEST_ENV: dict[str, str] = {
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "azurite: requires a live Azurite instance — skipped unless "
+        "AZURITE_TEST_CONNECTION is set to its connection string.",
+    )
     for key, value in _BASELINE_TEST_ENV.items():
         os.environ.setdefault(key, value)
 

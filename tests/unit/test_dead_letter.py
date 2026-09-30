@@ -1,9 +1,14 @@
-"""R2.1d item 4: ``_dead_letter`` is the single choke point for every
-dead-letter ``historical_worker`` sends. If the send itself fails, this must
-log an ERROR naming the reason and correlation_id and re-raise — the
-original message is then never completed and is redelivered instead
-(bounded by the queue's maxDeliveryCount). Losing the dead-letter send must
-never silently look like "handled".
+"""R2.1d item 4 / R2.1e item 2: ``_dead_letter`` is the single choke point
+for every dead-letter ``historical_worker`` sends. If the send itself
+fails, this must log an ERROR naming the reason and correlation_id and
+raise ``DeadLetterSendError`` from the original — the original message is
+then never completed and is redelivered instead (bounded by the queue's
+maxDeliveryCount). Losing the dead-letter send must never silently look
+like "handled". ``DeadLetterSendError`` is a distinct type specifically so
+the caller (historical_worker) can tell "the send failed" apart from any
+other failure and avoid attempting a second dead-letter send for the same
+delivery — see test_historical_pipeline.py's
+TestDeadLetterSendFailureDoesNotRetry for that half of the contract.
 """
 
 from __future__ import annotations
@@ -14,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from azure.servicebus.exceptions import MessagingEntityNotFoundError
 
-from function_app import _dead_letter
+from function_app import DeadLetterSendError, _dead_letter
 
 
 def _fake_config() -> SimpleNamespace:
@@ -42,7 +47,7 @@ class TestDeadLetterSendFailureEscalates:
         logger = MagicMock()
 
         with patch("function_app._make_emitter", return_value=fake_emitter):
-            with pytest.raises(MessagingEntityNotFoundError):
+            with pytest.raises(DeadLetterSendError) as exc_info:
                 await _dead_letter(
                     _fake_config(),
                     logger,
@@ -50,6 +55,9 @@ class TestDeadLetterSendFailureEscalates:
                     reason="dataset_failure",
                     detail={"file_reference": "x.csv", "failure_reason": "boom"},
                 )
+
+        # Chained from the original SDK exception, not swallowed.
+        assert isinstance(exc_info.value.__cause__, MessagingEntityNotFoundError)
 
         fake_emitter.emit_dead_letter.assert_called_once()
         logger.error.assert_called_once()
@@ -87,7 +95,7 @@ class TestDeadLetterSendFailureEscalates:
 
         with (
             patch("function_app._make_emitter", return_value=fake_emitter),
-            pytest.raises(MessagingEntityNotFoundError),
+            pytest.raises(DeadLetterSendError),
         ):
             await _dead_letter(
                 _fake_config(),

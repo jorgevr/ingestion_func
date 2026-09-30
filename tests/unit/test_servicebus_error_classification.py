@@ -1,19 +1,54 @@
-"""R2.1d item 2: every ServiceBusError subclass in the installed SDK must
-have an explicit, documented classification — no silent fallthrough.
+"""R2.1d item 2 / R2.1e item 6: every ServiceBusError subclass in the
+installed SDK must have an explicit, documented classification — no silent
+fallthrough.
 
 This recursively enumerates ``ServiceBusError.__subclasses__()`` from the
 *installed* azure-servicebus SDK (not a hardcoded list) so a future SDK
 upgrade that adds a new subclass fails this test loudly instead of quietly
 inheriting the base-class default with nobody having decided whether that's
 correct for that specific class.
+
+``__subclasses__()`` only sees classes whose *module has actually been
+imported* — a subclass defined in a submodule this test never touches
+(directly or transitively) would be invisible to it and silently excluded
+from coverage, which is exactly the kind of gap this test exists to catch.
+``azure.servicebus.exceptions`` (imported below) pulls in the ones current
+azure-servicebus versions define, but nothing guarantees a future version
+keeps defining all of them there — so before walking __subclasses__(), this
+imports every ``azure.servicebus`` submodule via ``pkgutil.walk_packages``,
+not just the one the classifier itself imports from.
 """
 
 from __future__ import annotations
 
+import importlib
+import pkgutil
+
+import azure.servicebus as sb
 import azure.servicebus.exceptions as sbe
 import pytest
 
 from function_app import _DETERMINISTIC_SERVICE_BUS_ERRORS, _is_transient_single
+
+
+def _import_every_servicebus_submodule() -> None:
+    """Best-effort import of every azure.servicebus submodule, so any
+    ServiceBusError subclass defined anywhere in the package (not just in
+    .exceptions) is loaded and therefore visible to __subclasses__().
+
+    Best-effort, not required-to-succeed: some submodules (e.g. optional
+    transport backends) may be unimportable in a given environment for
+    reasons unrelated to exception classification — a failure there must
+    not hide a real classification gap behind an unrelated ImportError.
+    """
+    for module_info in pkgutil.walk_packages(sb.__path__, prefix=f"{sb.__name__}."):
+        try:
+            importlib.import_module(module_info.name)
+        except ImportError:
+            continue
+
+
+_import_every_servicebus_submodule()
 
 # Expected classification for every ServiceBusError subclass the installed
 # SDK ships, keyed by class name. True = transient (redeliver), False =
