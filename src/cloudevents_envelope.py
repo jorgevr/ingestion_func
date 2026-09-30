@@ -31,7 +31,7 @@ def _deterministic_event_id(s3_key: str, version: int) -> str:
     two genuinely different S3 objects can extract to the same category and
     would then collide on the same id. ``s3_key`` — the actual S3 object
     key — is always unique per source file, so it's what this must be keyed
-    on (see also ``AdlsStore._check_no_identity_collision``, which guards
+    on (see also ``AdlsStore._commit_with_identity_guard``, which guards
     the same non-uniqueness at the storage-path level).
 
     A redelivered work item that gets as far as re-emitting (e.g. after a

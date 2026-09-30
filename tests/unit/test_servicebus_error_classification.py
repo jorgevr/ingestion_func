@@ -22,6 +22,7 @@ not just the one the classifier itself imports from.
 from __future__ import annotations
 
 import importlib
+import logging
 import pkgutil
 
 import azure.servicebus as sb
@@ -30,6 +31,8 @@ import pytest
 
 from function_app import _DETERMINISTIC_SERVICE_BUS_ERRORS, _is_transient_single
 
+_logger = logging.getLogger(__name__)
+
 
 def _import_every_servicebus_submodule() -> None:
     """Best-effort import of every azure.servicebus submodule, so any
@@ -37,14 +40,25 @@ def _import_every_servicebus_submodule() -> None:
     .exceptions) is loaded and therefore visible to __subclasses__().
 
     Best-effort, not required-to-succeed: some submodules (e.g. optional
-    transport backends) may be unimportable in a given environment for
-    reasons unrelated to exception classification — a failure there must
-    not hide a real classification gap behind an unrelated ImportError.
+    transport backends, or ones with an extra dependency not installed)
+    may be unimportable in a given environment for reasons unrelated to
+    exception classification. Catches ``Exception`` broadly (not just
+    ``ImportError``) — a module's top-level code can fail in other ways
+    (e.g. a missing optional C extension raising something else entirely)
+    — and logs rather than silently swallowing, so an unexpected failure
+    is still visible without failing this test over an unrelated import
+    problem in a module irrelevant to exception classification.
     """
     for module_info in pkgutil.walk_packages(sb.__path__, prefix=f"{sb.__name__}."):
         try:
             importlib.import_module(module_info.name)
-        except ImportError:
+        except Exception:
+            _logger.warning(
+                "Could not import %s while enumerating ServiceBusError "
+                "subclasses — continuing (best-effort)",
+                module_info.name,
+                exc_info=True,
+            )
             continue
 
 

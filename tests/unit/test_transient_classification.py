@@ -33,7 +33,7 @@ from azure.servicebus.exceptions import (
 )
 
 from function_app import _is_transient
-from src.adls_store import AdlsUploadError
+from src.adls_store import AdlsCommitContentionError, AdlsUploadError
 
 
 def _http_response_error(status_code: int | None) -> HttpResponseError:
@@ -148,3 +148,18 @@ class TestIsTransientSpecialCases:
 
     def test_bare_adls_upload_error_no_cause_is_deterministic(self) -> None:
         assert _is_transient(AdlsUploadError("some failure")) is False
+
+    def test_commit_contention_error_is_transient_despite_409_cause(self) -> None:
+        """AdlsCommitContentionError's __cause__ is always the raw SDK
+        409/412 (HttpResponseError) — which, classified on its own, is
+        deterministic (not in {408, 429, 5xx}). The explicit isinstance
+        check for AdlsCommitContentionError in _is_transient_single must
+        win over that cause-chain walk, since losing an atomic-commit race
+        against an equal-identity writer is contention, not a permanent
+        identity conflict."""
+        cause = HttpResponseError(message="If-Match failed")
+        cause.status_code = 412
+        contention = AdlsCommitContentionError("lost the race twice")
+        contention.__cause__ = cause
+
+        assert _is_transient(contention) is True

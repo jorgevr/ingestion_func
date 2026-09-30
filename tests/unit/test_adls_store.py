@@ -280,17 +280,23 @@ class TestBothCredentialModesRunTheSameUploadPath:
 
 
 class TestBlobIdentityCollisionGuard:
-    """R2.1e item 1: the identity guard is enforced *atomically* at commit
-    time via a conditional commit_block_list — no blob yet ->
-    match_condition=IfMissing; a blob already holding this same s3_key ->
-    etag=<props.etag>, match_condition=IfNotModified. Blocks are staged
-    unconditionally beforehand (staging is provisional, never visible).
+    """R2.1f item 1 (restoring R2.1d's design alongside R2.1e's atomic
+    commit): the identity guard is now two layers —
+
+    1. A cheap pre-check (``_check_no_identity_collision``) right after the
+       blob client is obtained, *before any block is staged*: an ordinary,
+       non-racing collision (e.g. a redelivery that lands well after the
+       first file already committed) is rejected immediately, without
+       paying to stream and stage the whole file first.
+    2. The atomic conditional commit (``_commit_with_identity_guard``) at
+       the end, which is what actually closes the TOCTOU race between two
+       *genuinely concurrent* uploads to the same path — the pre-check
+       alone cannot close that race, since both could pass it before
+       either commits.
 
     Motivating scenario: two distinct S3 objects (e.g. a dataset split
     across two files) can extract to the same site_id+category and
-    therefore the same _adls_path+version — a plain read-then-write check
-    has a TOCTOU race between two concurrent uploads to the same path;
-    making the commit itself conditional closes that race server-side.
+    therefore the same _adls_path+version.
     """
 
     @pytest.mark.asyncio
@@ -353,13 +359,52 @@ class TestBlobIdentityCollisionGuard:
         assert kwargs.get("match_condition") == MatchConditions.IfNotModified
 
     @pytest.mark.asyncio
+    async def test_non_racing_collision_rejected_before_staging_any_block(
+        self,
+    ) -> None:
+        """The ordinary (non-racing) case: the colliding blob is already
+        there well before this upload starts — the cheap pre-check catches
+        it immediately, and NOT ONE BLOCK is staged (the whole point of
+        having a pre-check at all: don't pay to stream+stage a doomed
+        upload)."""
+        key_a = "pvdaq/2023-solar-data-prize/1_OEDI/data/9068_ac_power_part1.csv"
+        key_b = "pvdaq/2023-solar-data-prize/1_OEDI/data/9068_ac_power_part2.csv"
+        same_path = "source=pvdaq/dataset=1_ac_power/file_v1.csv"
+
+        blob_client = _mock_blob_client()
+        existing_props = MagicMock()
+        existing_props.metadata = {"s3_key": key_a}
+        blob_client.get_blob_properties = AsyncMock(return_value=existing_props)
+        service_client = _mock_service_client(blob_client)
+        store = AdlsStore(
+            account_url="https://acct.blob.core.windows.net",
+            container_name="bronze",
+            service_client=service_client,
+        )
+
+        with pytest.raises(
+            AdlsBlobIdentityMismatchError, match="Refusing to overwrite"
+        ):
+            await store.stream_upload(
+                source_url="https://example.com/part2.csv",
+                file_path=same_path,
+                s3_key=key_b,
+                http_client=_http_client_streaming([b"x,y\n1,2\n"]),
+            )
+
+        blob_client.stage_block.assert_not_called()
+        blob_client.commit_block_list.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_conditional_failure_then_different_key_raises_mismatch(
         self,
     ) -> None:
-        """The review's split-file race: attempt B reads "no blob", loses
-        the conditional commit race to attempt A, re-reads once more, finds
-        A's (different) s3_key now in place, and fails loudly — never a
-        second commit attempt, never an overwrite."""
+        """The review's split-file race: B's pre-check and B's first commit
+        read both still see "no blob" (the race hasn't manifested yet at
+        read time), B's IfMissing commit then loses to A actually
+        committing first, B re-reads once more, finds A's (different)
+        s3_key now in place, and fails loudly — never a second commit
+        attempt, never an overwrite."""
         key_a = "pvdaq/2023-solar-data-prize/1_OEDI/data/9068_ac_power_part1.csv"
         key_b = "pvdaq/2023-solar-data-prize/1_OEDI/data/9068_ac_power_part2.csv"
         same_path = "source=pvdaq/dataset=1_ac_power/file_v1.csv"
@@ -371,7 +416,8 @@ class TestBlobIdentityCollisionGuard:
         blob_client = _mock_blob_client()
         blob_client.get_blob_properties = AsyncMock(
             side_effect=[
-                ResourceNotFoundError("not found"),  # B's first read: no blob yet
+                ResourceNotFoundError("not found"),  # pre-check: no blob yet
+                ResourceNotFoundError("not found"),  # commit-guard read: still none
                 props_after_race,  # re-read after losing the race: A won
             ]
         )
@@ -395,12 +441,12 @@ class TestBlobIdentityCollisionGuard:
                 http_client=_http_client_streaming([b"x,y\n1,2\n"]),
             )
 
-        # Blocks were staged (provisional, harmless) but only the one failed
-        # conditional commit attempt happened — no second commit, no
-        # overwrite of A's data.
+        # Blocks were staged (the pre-check passed — this genuinely raced)
+        # but only the one failed conditional commit attempt happened — no
+        # second commit, no overwrite of A's data.
         blob_client.stage_block.assert_called_once()
         blob_client.commit_block_list.assert_called_once()
-        assert blob_client.get_blob_properties.call_count == 2
+        assert blob_client.get_blob_properties.call_count == 3
 
     @pytest.mark.asyncio
     async def test_conditional_failure_then_same_key_retries_and_succeeds(
@@ -420,7 +466,8 @@ class TestBlobIdentityCollisionGuard:
         blob_client = _mock_blob_client()
         blob_client.get_blob_properties = AsyncMock(
             side_effect=[
-                ResourceNotFoundError("not found"),  # first read: no blob yet
+                ResourceNotFoundError("not found"),  # pre-check: no blob yet
+                ResourceNotFoundError("not found"),  # commit-guard read: still none
                 props_after_race,  # re-read: another writer committed first, same key
             ]
         )
@@ -444,11 +491,56 @@ class TestBlobIdentityCollisionGuard:
             http_client=_http_client_streaming([b"x,y\n1,2\n"]),
         )
 
+        assert blob_client.get_blob_properties.call_count == 3
         assert blob_client.commit_block_list.call_count == 2
         second_call_kwargs = blob_client.commit_block_list.call_args_list[1].kwargs
         assert second_call_kwargs.get("etag") == "etag-fresh"
         assert (
             second_call_kwargs.get("match_condition") == MatchConditions.IfNotModified
+        )
+
+    @pytest.mark.asyncio
+    async def test_commit_retries_exactly_once_then_raises_contention_error(
+        self,
+    ) -> None:
+        """F4/F5: when the conditional commit loses the race on *every*
+        attempt (real, heavy contention rather than a one-off), this must
+        stop after exactly _MAX_COMMIT_ATTEMPTS (2) tries — not retry
+        forever — and surface it as AdlsCommitContentionError (transient),
+        not a generic/deterministic AdlsUploadError."""
+        s3_key = "pvdaq/2023-solar-data-prize/1_OEDI/data/9068_ac_power_part1.csv"
+
+        blob_client = _mock_blob_client()  # pre-check + every read: no blob
+        blob_client.commit_block_list = AsyncMock(
+            side_effect=ResourceModifiedError("always contends")
+        )
+        service_client = _mock_service_client(blob_client)
+        store = AdlsStore(
+            account_url="https://acct.blob.core.windows.net",
+            container_name="bronze",
+            service_client=service_client,
+        )
+
+        with pytest.raises(adls_store.AdlsCommitContentionError):
+            await store.stream_upload(
+                source_url="https://example.com/file.csv",
+                file_path="source=pvdaq/dataset=1_ac_power/file_v1.csv",
+                s3_key=s3_key,
+                http_client=_http_client_streaming([b"x,y\n1,2\n"]),
+            )
+
+        assert blob_client.commit_block_list.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_contention_error_is_an_adls_upload_error_subclass_but_transient(
+        self,
+    ) -> None:
+        """Structurally an AdlsUploadError (so stream_upload's own
+        ``except AdlsUploadError: raise`` lets it through unwrapped), but
+        function_app classifies it transient explicitly — see
+        test_transient_classification.py."""
+        assert issubclass(
+            adls_store.AdlsCommitContentionError, adls_store.AdlsUploadError
         )
 
     @pytest.mark.asyncio
@@ -483,6 +575,40 @@ class TestBlobIdentityCollisionGuard:
         )
 
         blob_client.commit_block_list.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_empty_string_s3_key_metadata_is_not_a_collision(self) -> None:
+        """F7: a blank (empty-string) recorded s3_key is treated the same
+        as no recorded s3_key at all — "not recorded" — not as a real,
+        different identity. (An empty string is falsy, so a naive
+        ``is not None`` check would wrongly treat it as a genuine,
+        differing value and reject every upload to this path.)"""
+        blob_client = _mock_blob_client()
+        existing_props = MagicMock()
+        existing_props.metadata = {"s3_key": ""}
+        existing_props.etag = "etag-blank"
+        blob_client.get_blob_properties = AsyncMock(return_value=existing_props)
+        service_client = _mock_service_client(blob_client)
+        store = AdlsStore(
+            account_url="https://acct.blob.core.windows.net",
+            container_name="bronze",
+            service_client=service_client,
+        )
+
+        await store.stream_upload(
+            source_url="https://example.com/file.csv",
+            file_path="source=pvdaq/dataset=1_ac_power/file_v1.csv",
+            s3_key="pvdaq/2023-solar-data-prize/1_OEDI/data/9068_ac_power.csv",
+            http_client=_http_client_streaming([b"x,y\n1,2\n"]),
+        )
+
+        blob_client.commit_block_list.assert_called_once()
+        kwargs = blob_client.commit_block_list.call_args.kwargs
+        # Blob exists (has an etag) even though its s3_key is blank, so the
+        # conditional commit is still pinned IfNotModified against it, not
+        # IfMissing.
+        assert kwargs.get("etag") == "etag-blank"
+        assert kwargs.get("match_condition") == MatchConditions.IfNotModified
 
 
 class TestStreamUploadErrors:

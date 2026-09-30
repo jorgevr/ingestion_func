@@ -59,6 +59,29 @@ class AdlsBlobIdentityMismatchError(AdlsUploadError):
     """
 
 
+class AdlsCommitContentionError(AdlsUploadError):
+    """Raised when the conditional commit in ``_commit_with_identity_guard``
+    loses the race *twice* in a row — not an identity conflict (the re-read
+    in between found the *same* s3_key each time, i.e. a same-file retry
+    contending with itself), just unusually heavy concurrent write pressure
+    on this exact path.
+
+    Unlike ``AdlsBlobIdentityMismatchError`` (a genuine, permanent conflict
+    that retrying can never resolve), this is transient: another attempt,
+    possibly after a moment's backoff, is likely to land once the
+    contention clears. It is still a subclass of ``AdlsUploadError`` (so
+    ``stream_upload``'s own ``except AdlsUploadError: raise`` lets it
+    through unwrapped), but ``function_app._is_transient_single`` gives it
+    an explicit isinstance check rather than classifying it via the
+    wrapped-cause walk — a wrapped 409/412 would otherwise read as
+    deterministic (see ``_is_transient_single``'s ``HttpResponseError``
+    branch), which is wrong specifically for this exhausted-retry case.
+    """
+
+
+_MAX_COMMIT_ATTEMPTS = 2
+
+
 def _block_id(index: int) -> str:
     """Deterministic, fixed-length block ID for ``stage_block``.
 
@@ -140,6 +163,46 @@ class AdlsStore:
         except ResourceExistsError:
             pass
 
+    async def _check_no_identity_collision(
+        self, blob_client: BlobClient, file_path: str, s3_key: str
+    ) -> None:
+        """Cheap pre-check: refuse fast, *before staging a single block*, if
+        the target blob already holds a different source identity.
+
+        This is an optimization, not the actual guarantee — two concurrent
+        uploads to the same path can both pass this read before either has
+        committed, so it cannot close the race on its own. The real,
+        race-proof guard is ``_commit_with_identity_guard``'s conditional
+        commit; this just avoids paying to stream and stage a whole file
+        for an upload that a plain, uncontended check already shows is
+        doomed (e.g. two split files that extract to the same
+        ``_adls_path``, discovered on an ordinary, non-racing redelivery).
+
+        A no-op when the blob doesn't exist yet, or exists with no recorded
+        ``s3_key`` (pre-existing blobs from before this guard existed, or a
+        blank string — nothing to compare against either way).
+        """
+        try:
+            props = await blob_client.get_blob_properties()
+        except ResourceNotFoundError:
+            return
+        existing_s3_key = (props.metadata or {}).get("s3_key")
+        if existing_s3_key and existing_s3_key != s3_key:
+            logger.error(
+                "Blob identity collision at %s/%s: existing blob was written "
+                "for s3_key=%r, this upload is for s3_key=%r — refusing to "
+                "overwrite",
+                self._container_name,
+                file_path,
+                existing_s3_key,
+                s3_key,
+            )
+            raise AdlsBlobIdentityMismatchError(
+                f"Refusing to overwrite {file_path}: existing blob's s3_key "
+                f"({existing_s3_key!r}) does not match this upload's "
+                f"({s3_key!r})"
+            )
+
     async def _commit_with_identity_guard(
         self,
         blob_client: BlobClient,
@@ -147,8 +210,9 @@ class AdlsStore:
         s3_key: str,
         block_ids: list[str],
     ) -> None:
-        """Atomically commit the block list, refusing to overwrite a blob
-        already holding a *different* source identity (``s3_key``).
+        """Atomically commit the block list — the race-proof half of the
+        identity guard (``_check_no_identity_collision`` is the cheap,
+        non-authoritative pre-check; this is what actually closes the race).
 
         A plain read-then-write check (read metadata, decide, then commit)
         has a TOCTOU race: two concurrent uploads to the same path (e.g. two
@@ -160,23 +224,29 @@ class AdlsStore:
           ``match_condition=IfMissing`` (If-None-Match: *). If a concurrent
           writer commits first, this fails server-side.
         - A blob exists with this same ``s3_key`` already in its metadata
-          (a retry/redelivery re-uploading the identical file) -> commit
+          (a retry/redelivery re-uploading the identical file, or an empty
+          ``s3_key`` — treated as "not recorded", same as absent) -> commit
           with ``etag=<props.etag>, match_condition=IfNotModified``
           (If-Match), so this only succeeds if nothing has changed since
           the read.
-        - A blob exists with a *different* ``s3_key`` -> refuse immediately,
-          no commit attempted.
+        - A blob exists with a *different*, non-empty ``s3_key`` -> refuse
+          immediately, no commit attempted.
 
         On a conditional-commit failure (``ResourceExistsError`` — 409, from
         the ``IfMissing`` branch losing a race — or ``ResourceModifiedError``
         — 412, from the ``IfNotModified`` branch losing a race), the
-        properties are re-read exactly once more and the decision is made
-        again: if the winner turns out to share this upload's ``s3_key``,
-        this is just a lost race against an equivalent retry and the commit
-        is attempted once more with the fresh etag; if it's a different
-        ``s3_key``, this raises ``AdlsBlobIdentityMismatchError``.
+        properties are re-read once more and the decision is made again: if
+        the winner turns out to share this upload's ``s3_key``, this is just
+        a lost race against an equivalent retry and the commit is attempted
+        once more with the fresh etag; if it's a different ``s3_key``, this
+        raises ``AdlsBlobIdentityMismatchError``. If *that* retried commit
+        *also* loses the race — real, heavy contention on this exact path
+        rather than an identity conflict — this gives up and raises
+        ``AdlsCommitContentionError`` (transient: see its docstring) instead
+        of exhausting attempts silently or misclassifying the failure as a
+        deterministic identity conflict.
         """
-        for attempt in range(2):
+        for attempt in range(_MAX_COMMIT_ATTEMPTS):
             try:
                 props = await blob_client.get_blob_properties()
             except ResourceNotFoundError:
@@ -186,7 +256,7 @@ class AdlsStore:
                 existing_s3_key = (props.metadata or {}).get("s3_key")
                 etag = props.etag
 
-            if existing_s3_key is not None and existing_s3_key != s3_key:
+            if existing_s3_key and existing_s3_key != s3_key:
                 logger.error(
                     "Blob identity collision at %s/%s: existing blob was "
                     "written for s3_key=%r, this upload is for s3_key=%r — "
@@ -213,8 +283,8 @@ class AdlsStore:
                     block_ids, metadata={"s3_key": s3_key}, **commit_kwargs
                 )
                 return
-            except (ResourceExistsError, ResourceModifiedError):
-                if attempt == 0:
+            except (ResourceExistsError, ResourceModifiedError) as exc:
+                if attempt < _MAX_COMMIT_ATTEMPTS - 1:
                     logger.warning(
                         "Conditional commit to %s/%s lost a race — re-reading "
                         "blob identity once before deciding again",
@@ -222,7 +292,18 @@ class AdlsStore:
                         file_path,
                     )
                     continue
-                raise
+                logger.error(
+                    "Conditional commit to %s/%s lost the race %d times in "
+                    "a row against an equal-identity writer — giving up "
+                    "(transient: safe to redeliver)",
+                    self._container_name,
+                    file_path,
+                    _MAX_COMMIT_ATTEMPTS,
+                )
+                raise AdlsCommitContentionError(
+                    f"Commit to {file_path} lost the conditional-write race "
+                    f"{_MAX_COMMIT_ATTEMPTS} times in a row"
+                ) from exc
 
     async def stream_upload(
         self,
@@ -242,12 +323,18 @@ class AdlsStore:
         file has downloaded successfully. A source-side failure therefore
         leaves no blob, partial or otherwise, behind.
 
-        Blocks are staged unconditionally (staging is provisional — an
-        uncommitted block costs nothing and is never visible); the identity
-        guard against *s3_key* is enforced atomically at commit time — see
-        ``_commit_with_identity_guard``. On a successful commit, *s3_key* is
-        written to the blob's metadata so a *future* upload to the same path
-        can make the same check.
+        The identity guard against *s3_key* runs twice, for two different
+        reasons: a cheap pre-check (``_check_no_identity_collision``)
+        before any block is staged, so an ordinary, non-racing collision is
+        rejected without wasting a stream+stage of the whole file; and the
+        atomic, race-proof conditional commit (``_commit_with_identity_guard``)
+        at the end, which is what actually closes the TOCTOU race between
+        two genuinely concurrent uploads to the same path (the pre-check
+        alone cannot — both could pass it before either commits). A blank
+        (empty-string) recorded ``s3_key`` is treated the same as no
+        recorded ``s3_key`` at all — "not recorded" — by both checks. On a
+        successful commit, *s3_key* is written to the blob's metadata so a
+        *future* upload to the same path can make the same checks.
 
         Args:
             source_url: HTTP(S) URL to download from (typically an S3 URL).
@@ -268,6 +355,9 @@ class AdlsStore:
             AdlsUploadError: If the download or upload fails.
             AdlsBlobIdentityMismatchError: If the target path already holds a
                 blob written for a different ``s3_key``.
+            AdlsCommitContentionError: If the conditional commit loses the
+                race against an equal-identity writer on every attempt —
+                transient, safe to retry.
         """
         owns_http = http_client is None
         if http_client is None:
@@ -293,6 +383,7 @@ class AdlsStore:
                 blob_client = blob_svc.get_blob_client(
                     container=self._container_name, blob=file_path
                 )
+                await self._check_no_identity_collision(blob_client, file_path, s3_key)
 
                 async for chunk in response.aiter_bytes(chunk_size=CHUNK_SIZE):
                     hasher.update(chunk)

@@ -593,6 +593,57 @@ class TestWorkerIntegration:
         assert meta["quality_hint"]["notes"] == []
         assert meta["lineage"]["parent_dataset_version"] is None  # first ingestion
 
+    @pytest.mark.asyncio
+    async def test_worker_passes_the_real_s3_key_to_write_json_not_file_name(
+        self,
+    ) -> None:
+        """F2: write_json's s3_key kwarg must be the work item's s3_key
+        (the full S3 object key) — not file_name (just the basename).
+        They're deliberately different strings in this fixture
+        (_default_work_item's s3_key is f"{prefix}/{site_id}_OEDI/data/
+        {file_name}") so a mix-up is caught here rather than passing
+        coincidentally."""
+        work_item = _default_work_item(site_id=9068, file_name="9068_ac_power_data.csv")
+        assert work_item["s3_key"] != work_item["file_name"]
+        mock_msg = _mock_work_item_msg(work_item)
+
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(return_value=(65000000, "a" * 64, 105121))
+        captured_write_json_kwargs: list[dict] = []
+
+        async def capture_write_json(file_path: str, data: dict, s3_key: str) -> None:
+            captured_write_json_kwargs.append(
+                {"file_path": file_path, "s3_key": s3_key}
+            )
+
+        mock_adls.write_json = capture_write_json
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
+
+        mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        emitter = _mock_emitter()
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)
+
+        assert len(captured_write_json_kwargs) == 1
+        assert captured_write_json_kwargs[0]["s3_key"] == work_item["s3_key"]
+        assert captured_write_json_kwargs[0]["s3_key"] != work_item["file_name"]
+
 
 class TestIncrementalDetection:
     """Incremental file detection: only new/changed files enqueued."""
@@ -1463,10 +1514,22 @@ class TestGuardedRegionCoversInitialSteps:
         mock_msg = MagicMock()
         mock_msg.get_body.side_effect = RuntimeError("body unreadable")
 
-        from function_app import historical_worker
+        captured_stats: list = []
 
-        with pytest.raises(RuntimeError, match="body unreadable"):
-            await historical_worker(mock_msg)
+        with patch(
+            "function_app.emit_dataset_metrics",
+            side_effect=lambda s: captured_stats.append(s),
+        ):
+            from function_app import historical_worker
+
+            with pytest.raises(RuntimeError, match="body unreadable"):
+                await historical_worker(mock_msg)
+
+        # stats is constructed before get_body() is even called, so the
+        # `finally` must still be able to report through it — exactly once,
+        # with the failure counted.
+        assert len(captured_stats) == 1
+        assert captured_stats[0].datasets_failed == 1
 
     @pytest.mark.asyncio
     async def test_create_logger_failure_raises_and_logs_via_fallback(
@@ -1477,6 +1540,8 @@ class TestGuardedRegionCoversInitialSteps:
         work_item = _default_work_item()
         mock_msg = _mock_work_item_msg(work_item)
 
+        captured_stats: list = []
+
         with (
             patch(
                 "function_app.load_historical_config", return_value=_historical_config()
@@ -1484,6 +1549,10 @@ class TestGuardedRegionCoversInitialSteps:
             patch(
                 "function_app.create_logger",
                 side_effect=RuntimeError("logger setup failed"),
+            ),
+            patch(
+                "function_app.emit_dataset_metrics",
+                side_effect=lambda s: captured_stats.append(s),
             ),
             caplog.at_level(logging.ERROR, logger="function_app"),
         ):
@@ -1499,6 +1568,8 @@ class TestGuardedRegionCoversInitialSteps:
             "before config could be loaded" in record.message
             for record in caplog.records
         )
+        assert len(captured_stats) == 1
+        assert captured_stats[0].datasets_failed == 1
 
     @pytest.mark.asyncio
     async def test_stats_construction_failure_raises_and_skips_metrics(self) -> None:

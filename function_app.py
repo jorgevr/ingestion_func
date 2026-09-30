@@ -36,7 +36,7 @@ from azure.servicebus.exceptions import (
 )
 from jsonschema import Draft202012Validator, ValidationError
 
-from src.adls_store import AdlsStore
+from src.adls_store import AdlsCommitContentionError, AdlsStore
 from src.cloudevents_envelope import build_dataset_envelope
 from src.config import load_config, load_historical_config
 from src.file_tracking_store import FileTrackingStore
@@ -251,6 +251,13 @@ _DETERMINISTIC_SERVICE_BUS_ERRORS = (
 
 def _is_transient_single(exc: BaseException) -> bool:
     """Classify one exception (not its cause chain) as transient."""
+    if isinstance(exc, AdlsCommitContentionError):
+        # Explicit, not via the __cause__ walk: its cause is the raw SDK
+        # 409/412 (HttpResponseError), which the branch below would
+        # classify as deterministic — wrong for this case specifically,
+        # where losing an atomic-commit race against an equal-identity
+        # writer twice is contention, not a permanent identity conflict.
+        return True
     if isinstance(exc, ServiceRequestError | ServiceResponseError):
         return True
     if isinstance(exc, HttpResponseError):
