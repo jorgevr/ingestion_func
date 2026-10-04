@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # Not a `services:` container: GitHub Actions service containers run
+      # the image's own CMD as-is with no way to override it, and the
+      # installed azure-storage-blob SDK negotiates a newer Blob Storage
+      # API version than the azurite:latest image currently supports —
+      # every request 400s with "API version ... is not supported by
+      # Azurite" otherwise. --skipApiVersionCheck is Azurite's own
+      # documented fix (named in that same error message), so this starts
+      # it directly with a `docker run` step instead.
+      - name: Start Azurite
+        run: |
+          docker run -d --name azurite \
+            -p 10000:10000 -p 10001:10001 -p 10002:10002 \
+            mcr.microsoft.com/azure-storage/azurite:latest \
+            azurite --skipApiVersionCheck \
+              --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0
+          for i in $(seq 1 30); do
+            if curl -s -o /dev/null http://127.0.0.1:10000/devstoreaccount1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Azurite did not become reachable in time" >&2
+          exit 1
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Test (pytest)
+        env:
+          AZURITE_TEST_CONNECTION: UseDevelopmentStorage=true
+        run: pytest
+
+      - name: Stop Azurite
+        if: always()
+        run: docker rm -f azurite
