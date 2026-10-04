@@ -4,4 +4,11 @@
 pytest>=8.0.0,<9.0.0
 pytest-asyncio>=0.23.0,<1.0.0
 respx>=0.21.0,<1.0.0
-ruff>=0.3.0,<1.0.0
+# Exact-pinned, unlike the ranges above: ruff enables newly stabilized lint
+# rules by default on minor version bumps, so an unpinned range makes
+# `ruff check .` a moving target — code verified clean today can fail in a
+# fresh clone or CI run tomorrow with no code change at all (reproduced:
+# 0.15.2 here passes clean, 0.16.10 resolved fresh from this same range
+# finds 8 new violations). Bump deliberately, fixing whatever the new
+# version's rules flag in the same change.
+ruff==0.15.2
