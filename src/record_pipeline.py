@@ -34,7 +34,7 @@ async def process_record(
     stats: InvocationStats,
     check_idempotency: Callable[..., Awaitable[IdempotencyResult]],
     mark_completed: Callable[..., Awaitable[None]],
-    event_type: str = "raw.pvdaq.generation.v1",
+    event_type: str = "solar.pvdaq.dataset.available",
     source: str = "/energy-ingestion-boundary/pvdaq",
 ) -> None:
     """Process a single validated record through the emission pipeline.

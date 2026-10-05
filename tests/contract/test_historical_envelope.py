@@ -61,21 +61,21 @@ class TestHistoricalEnvelopeContract:
             config=_historical_config(),
             correlation_id=_CORRELATION_ID,
             traceparent=_TRACEPARENT,
-            event_type="raw.pvdaq.historical.v1",
+            event_type="solar.pvdaq.dataset.historical",
             source="/energy-ingestion-boundary/pvdaq-historical",
         )
         jsonschema.validate(instance=envelope, schema=_CE_SCHEMA)
 
-    def test_type_is_raw_pvdaq_historical_v1(self) -> None:
+    def test_type_is_custom_event_type(self) -> None:
         envelope = build_envelope(
             record=_sample_record(),
             config=_historical_config(),
             correlation_id=_CORRELATION_ID,
             traceparent=_TRACEPARENT,
-            event_type="raw.pvdaq.historical.v1",
+            event_type="solar.pvdaq.dataset.historical",
             source="/energy-ingestion-boundary/pvdaq-historical",
         )
-        assert envelope["type"] == "raw.pvdaq.historical.v1"
+        assert envelope["type"] == "solar.pvdaq.dataset.historical"
 
     def test_source_is_pvdaq_historical(self) -> None:
         envelope = build_envelope(
@@ -83,7 +83,7 @@ class TestHistoricalEnvelopeContract:
             config=_historical_config(),
             correlation_id=_CORRELATION_ID,
             traceparent=_TRACEPARENT,
-            event_type="raw.pvdaq.historical.v1",
+            event_type="solar.pvdaq.dataset.historical",
             source="/energy-ingestion-boundary/pvdaq-historical",
         )
         assert envelope["source"] == "/energy-ingestion-boundary/pvdaq-historical"
@@ -94,7 +94,7 @@ class TestHistoricalEnvelopeContract:
             config=_historical_config(),
             correlation_id=_CORRELATION_ID,
             traceparent=_TRACEPARENT,
-            event_type="raw.pvdaq.historical.v1",
+            event_type="solar.pvdaq.dataset.historical",
             source="/energy-ingestion-boundary/pvdaq-historical",
         )
         assert envelope["source_vendor"] == "PVDAQ"
@@ -110,18 +110,23 @@ class TestHistoricalEnvelopeContract:
             config=_historical_config(),
             correlation_id=_CORRELATION_ID,
             traceparent=_TRACEPARENT,
-            event_type="raw.pvdaq.historical.v1",
+            event_type="solar.pvdaq.dataset.historical",
             source="/energy-ingestion-boundary/pvdaq-historical",
         )
         assert envelope["data"] == record
 
-    def test_default_type_backward_compatible(self) -> None:
-        """Without explicit event_type, defaults to feature 001 type."""
+    def test_default_type_is_solar_pvdaq_dataset_available(self) -> None:
+        """Without explicit event_type, defaults to the currently registered type.
+
+        ADR 0002 / topics.md retire ``raw.pvdaq.generation.v1`` and
+        ``raw.pvdaq.historical.v1`` — the default must never fall back to
+        either.
+        """
         envelope = build_envelope(
             record=_sample_record(),
             config=_historical_config(),
             correlation_id=_CORRELATION_ID,
             traceparent=_TRACEPARENT,
         )
-        assert envelope["type"] == "raw.pvdaq.generation.v1"
+        assert envelope["type"] == "solar.pvdaq.dataset.available"
         assert envelope["source"] == "/energy-ingestion-boundary/pvdaq"

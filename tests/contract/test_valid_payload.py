@@ -75,4 +75,4 @@ class TestValidPayloadEndToEnd:
 
         sent_message = mock_sender.send_messages.call_args[0][0]
         assert sent_message.content_type == "application/cloudevents+json"
-        assert sent_message.subject == "raw.pvdaq.generation.v1"
+        assert sent_message.subject == "solar.pvdaq.dataset.available"

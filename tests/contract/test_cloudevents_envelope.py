@@ -49,7 +49,7 @@ class TestCloudEventsContract:
 
         assert envelope["specversion"] == "1.0"
 
-    def test_type_is_raw_pvdaq_generation_v1(
+    def test_type_is_solar_pvdaq_dataset_available(
         self, sample_valid_record: dict, mock_config: Config, correlation_id: str
     ) -> None:
         envelope = build_envelope(
@@ -59,7 +59,8 @@ class TestCloudEventsContract:
             traceparent=_TRACEPARENT,
         )
 
-        assert envelope["type"] == "raw.pvdaq.generation.v1"
+        assert envelope["type"] == "solar.pvdaq.dataset.available"
+        assert not envelope["type"].startswith("raw.")
 
     def test_source_is_energy_ingestion_boundary_pvdaq(
         self, sample_valid_record: dict, mock_config: Config, correlation_id: str
