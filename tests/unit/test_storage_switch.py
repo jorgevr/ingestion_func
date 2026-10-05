@@ -5,16 +5,13 @@ Covers the collapse of the ``STORAGE_EMULATOR`` boolean flag into a single
 connection-string-or-credential switch (``_storage_connection_string``, now
 keyed on ``DATA_STORAGE_CONNECTION``), and that ``AdlsStore.blob_url`` — the
 SDK-built replacement for the old hand-rolled ``_adls_uri`` — keeps
-``storage_path`` valid against the registry contract at
-``../../contracts/dataset-available.v1.json`` even when a path segment
-contains a space.
+``storage_path`` valid against the registry contract's ``data.storage_path``
+rule even when a path segment contains a space.
 """
 
 from __future__ import annotations
 
-import json
 import os
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import jsonschema
@@ -23,11 +20,21 @@ import pytest
 from function_app import _storage_connection_string
 from src.adls_store import AdlsStore
 
-# services/ingestion-func/tests/unit/test_storage_switch.py -> workspace root
-_WORKSPACE_ROOT = Path(__file__).resolve().parents[4]
-_DATASET_AVAILABLE_CONTRACT = (
-    _WORKSPACE_ROOT / "contracts" / "dataset-available.v1.json"
-)
+# A local copy of contracts/dataset-available.v1.json's data.storage_path
+# sub-schema (root workspace repo, Contract Owner-only), not the vendored
+# copy: services/ingestion-func has no schemas/contracts/ directory yet
+# (R2.3's vendoring step — contracts/vendoring.json's "ingestion-func" entry
+# is still empty) — reading the real file would make this test depend on
+# the workspace layout, which fails in this repo's own standalone clone
+# (CI-1). Copied here instead of looked up so this test runs identically in
+# both. Once R2.3 lands the vendored copy, prefer loading it from
+# schemas/contracts/ over this literal; drift between this literal and the
+# registry is caught only by the workspace root's scripts/check-contracts.py
+# (R1.2), not by this service's own CI.
+_STORAGE_PATH_SCHEMA = {
+    "type": "string",
+    "pattern": "^https?://[^ ]+$",
+}
 
 _FAKE_LOCAL_CONNECTION_STRING = (
     "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;"
@@ -160,23 +167,15 @@ class TestBlobUrl:
 
 class TestStoragePathContractValidation:
     """A storage_path built from a filename containing a space must still
-    validate against the registry contract's pattern
-    (``^https?://[^ ]+$`` in ../../contracts/dataset-available.v1.json) —
-    now produced by AdlsStore.blob_url (SDK-built), not a hand-rolled helper."""
-
-    @staticmethod
-    def _storage_path_schema() -> dict:
-        assert _DATASET_AVAILABLE_CONTRACT.exists(), (
-            f"contract not found at {_DATASET_AVAILABLE_CONTRACT} — "
-            "expected the workspace-root registry from R1"
-        )
-        contract = json.loads(_DATASET_AVAILABLE_CONTRACT.read_text(encoding="utf-8"))
-        return contract["properties"]["data"]["properties"]["storage_path"]
+    validate against the registry contract's pattern (``^https?://[^ ]+$``,
+    ``data.storage_path`` in ``contracts/dataset-available.v1.json`` at the
+    workspace root — copied inline above as ``_STORAGE_PATH_SCHEMA``, see
+    that comment) — now produced by AdlsStore.blob_url (SDK-built), not a
+    hand-rolled helper."""
 
     @pytest.mark.asyncio
     async def test_encoded_space_validates_against_contract(self) -> None:
-        schema = self._storage_path_schema()
-        validator = jsonschema.Draft202012Validator(schema)
+        validator = jsonschema.Draft202012Validator(_STORAGE_PATH_SCHEMA)
 
         async with AdlsStore(
             account_url="https://unused.blob.core.windows.net",
@@ -194,8 +193,7 @@ class TestStoragePathContractValidation:
     def test_literal_space_would_fail_contract(self) -> None:
         """Sanity check on the schema itself: an unencoded space is rejected,
         which is exactly the defect this fix closes."""
-        schema = self._storage_path_schema()
-        validator = jsonschema.Draft202012Validator(schema)
+        validator = jsonschema.Draft202012Validator(_STORAGE_PATH_SCHEMA)
 
         unencoded = "https://acct.blob.core.windows.net/bronze/source=pvdaq/dataset=9068_ac power/file.csv"
 
