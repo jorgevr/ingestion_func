@@ -27,8 +27,9 @@
     },
     "type": {
       "type": "string",
-      "pattern": "^raw\\.[a-z]+\\.[a-z_]+\\.v[0-9]+$",
-      "examples": ["raw.pvdaq.generation.v1"]
+      "pattern": "^(?!raw\\.)[a-z]+\\.[a-z]+\\.[a-z_.]+$",
+      "description": "ADR 0002: raw.* types are retired and must never be emitted.",
+      "examples": ["solar.pvdaq.dataset.available"]
     },
     "source": {
       "type": "string",

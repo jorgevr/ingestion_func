@@ -96,7 +96,7 @@ def build_envelope(
     config: _ConfigLike,
     correlation_id: str,
     traceparent: str,
-    event_type: str = "raw.pvdaq.generation.v1",
+    event_type: str = "solar.pvdaq.dataset.available",
     source: str = "/energy-ingestion-boundary/pvdaq",
 ) -> dict:
     """Build a CloudEvents v1.0 envelope wrapping a validated PVDAQ record.
@@ -107,8 +107,10 @@ def build_envelope(
             and mapping_version.
         correlation_id: UUID string for invocation tracing.
         traceparent: W3C Trace Context traceparent header value.
-        event_type: CloudEvents ``type`` field. Defaults to feature 001's
-            ``"raw.pvdaq.generation.v1"``.
+        event_type: CloudEvents ``type`` field. Defaults to the currently
+            registered ``"solar.pvdaq.dataset.available"`` (``topics.md``).
+            ``raw.pvdaq.generation.v1`` is retired per ADR 0002 and must
+            never be passed here.
         source: CloudEvents ``source`` field. Defaults to feature 001's
             ``"/energy-ingestion-boundary/pvdaq"``.
 
