@@ -185,10 +185,9 @@ class TestWorkerIntegration:
         mock_msg = _mock_work_item_msg(work_item)
 
         mock_adls = AsyncMock()
-        mock_adls.stream_upload = AsyncMock(
-            return_value=(65000000, "abc123hash", 105121)
-        )
+        mock_adls.stream_upload = AsyncMock(return_value=(65000000, "a" * 64, 105121))
         mock_adls.write_json = AsyncMock()
+        mock_adls.blob_url = AsyncMock(return_value="http://azurite/bronze/x.csv")
         mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
         mock_adls.__aexit__ = AsyncMock(return_value=False)
 
@@ -230,15 +229,14 @@ class TestWorkerIntegration:
 
     @pytest.mark.asyncio
     async def test_worker_envelope_has_correct_type(self) -> None:
-        """Emitted envelope uses solar.pvdaq.dataset.available type."""
+        """Emitted envelope uses the versioned solar.pvdaq.dataset.available.v1 type (R2.3)."""
         work_item = _default_work_item()
         mock_msg = _mock_work_item_msg(work_item)
 
         mock_adls = AsyncMock()
-        mock_adls.stream_upload = AsyncMock(
-            return_value=(65000000, "abc123hash", 105121)
-        )
+        mock_adls.stream_upload = AsyncMock(return_value=(65000000, "a" * 64, 105121))
         mock_adls.write_json = AsyncMock()
+        mock_adls.blob_url = AsyncMock(return_value="http://azurite/bronze/x.csv")
         mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
         mock_adls.__aexit__ = AsyncMock(return_value=False)
 
@@ -264,7 +262,7 @@ class TestWorkerIntegration:
 
         emitter.emit_cloudevent.assert_called_once()
         envelope = emitter.emit_cloudevent.call_args.kwargs["envelope"]
-        assert envelope["type"] == "solar.pvdaq.dataset.available"
+        assert envelope["type"] == "solar.pvdaq.dataset.available.v1"
 
     @pytest.mark.asyncio
     async def test_worker_envelope_data_block(self) -> None:
@@ -273,10 +271,9 @@ class TestWorkerIntegration:
         mock_msg = _mock_work_item_msg(work_item)
 
         mock_adls = AsyncMock()
-        mock_adls.stream_upload = AsyncMock(
-            return_value=(65000000, "abc123hash", 105121)
-        )
+        mock_adls.stream_upload = AsyncMock(return_value=(65000000, "a" * 64, 105121))
         mock_adls.write_json = AsyncMock()
+        mock_adls.blob_url = AsyncMock(return_value="http://azurite/bronze/x.csv")
         mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
         mock_adls.__aexit__ = AsyncMock(return_value=False)
 
@@ -309,7 +306,7 @@ class TestWorkerIntegration:
         assert "ingestion_id" in data
         assert "source_url" in data
         assert data["file_size"] == 65000000
-        assert data["file_hash"] == "abc123hash"
+        assert data["file_hash"] == "a" * 64
 
     @pytest.mark.asyncio
     async def test_worker_marks_failed_and_dead_letters_without_raising_on_deterministic_upload_error(
@@ -1113,6 +1110,236 @@ class TestCompletedMeansEventPublished:
             await historical_worker(mock_msg)
 
         assert call_order == ["emit_cloudevent", "mark_completed"]
+
+
+class TestEnvelopeCorrelationIdMatchesWorkItem:
+    """R2.3's explicit acceptance: the emitted envelope's correlation_id
+    equals the originating work item's correlation_id — stable across
+    Service Bus redelivery of that same message — and data.ingestion_id is
+    never conflated with it (a fresh per-attempt identifier instead)."""
+
+    @pytest.mark.asyncio
+    async def test_envelope_correlation_id_equals_work_item_correlation_id(
+        self,
+    ) -> None:
+        work_item = _default_work_item()
+        mock_msg = _mock_work_item_msg(work_item)
+
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(return_value=(100, "a" * 64, 10))
+        mock_adls.write_json = AsyncMock()
+        mock_adls.blob_url = AsyncMock(return_value="http://azurite/bronze/x.csv")
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
+
+        mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        emitter = _mock_emitter()
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)
+
+        envelope = emitter.emit_cloudevent.call_args.kwargs["envelope"]
+        assert envelope["correlation_id"] == work_item["correlation_id"]
+        # Never the same field — a fresh per-attempt identifier, distinct
+        # from the work item's stable business key.
+        assert envelope["correlation_id"] != envelope["data"]["ingestion_id"]
+
+    @pytest.mark.asyncio
+    async def test_correlation_id_stable_ingestion_id_fresh_across_redelivery(
+        self,
+    ) -> None:
+        """Deliver the identical work item (same message body, therefore
+        the same correlation_id) twice. The envelope's correlation_id must
+        be identical both times; data.ingestion_id (generated fresh inside
+        historical_worker on every invocation) must differ."""
+        work_item = _default_work_item()
+
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(return_value=(100, "a" * 64, 10))
+        mock_adls.write_json = AsyncMock()
+        mock_adls.blob_url = AsyncMock(return_value="http://azurite/bronze/x.csv")
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
+
+        mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        emitter = _mock_emitter()
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(_mock_work_item_msg(work_item))
+            first_envelope = emitter.emit_cloudevent.call_args.kwargs["envelope"]
+
+            # Redelivery: the identical message body, delivered again.
+            await historical_worker(_mock_work_item_msg(work_item))
+            second_envelope = emitter.emit_cloudevent.call_args.kwargs["envelope"]
+
+        assert first_envelope["correlation_id"] == second_envelope["correlation_id"]
+        assert first_envelope["correlation_id"] == work_item["correlation_id"]
+        assert (
+            first_envelope["data"]["ingestion_id"]
+            != second_envelope["data"]["ingestion_id"]
+        )
+
+
+class TestValidationFailureDeadLetterReasons:
+    """R2.3b F2 + F4: a metadata.json shape violation must never reach
+    write_json, must dead-letter exactly once with its own reason code
+    (not the generic "dataset_failure"), and must count as a dataset
+    failure in metrics. An envelope shape violation gets its own, distinct
+    reason code too — an operator reading the dead-letter queue should be
+    able to tell which artifact's shape was wrong without parsing
+    failure_reason text.
+
+    F2's regression-test requirement (a mutation that removes the
+    pre-write metadata validation must turn this test red) is proven
+    separately — see the R2.3b report for the scratch-worktree mutation
+    run; mutation M6 removes exactly the `try/except` this test's first
+    case depends on.
+    """
+
+    @pytest.mark.asyncio
+    async def test_invalid_metadata_never_written_dead_lettered_once_as_metadata_failure(
+        self,
+    ) -> None:
+        """stream_upload returning a malformed hash makes
+        metadata_dict["ingestion"]["checksum"] violate the vendored
+        metadata-file.v1.json pattern (^[0-9a-f]{64}$) — caught before
+        write_json, never reaching the envelope build at all."""
+        work_item = _default_work_item()
+        mock_msg = _mock_work_item_msg(work_item)
+
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(
+            return_value=(100, "not-a-valid-sha256-hash", 10)
+        )
+        mock_adls.write_json = AsyncMock()
+        mock_adls.blob_url = AsyncMock(return_value="http://azurite/bronze/x.csv")
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
+
+        mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
+        mock_tracker.mark_processing = AsyncMock()
+        mock_tracker.mark_failed = AsyncMock()
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        emitter = _mock_emitter()
+
+        captured_stats: list = []
+
+        with (
+            patch(
+                "function_app.load_historical_config", return_value=_historical_config()
+            ),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+            patch(
+                "function_app.emit_dataset_metrics",
+                side_effect=lambda s: captured_stats.append(s),
+            ),
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)  # must NOT raise (deterministic)
+
+        mock_adls.write_json.assert_not_called()
+        emitter.emit_cloudevent.assert_not_called()
+        emitter.emit_dead_letter.assert_called_once()
+        dead_letter_body = emitter.emit_dead_letter.call_args.kwargs["message_body"]
+        assert dead_letter_body["error_type"] == "metadata_validation_failure"
+
+        assert len(captured_stats) == 1
+        assert captured_stats[0].datasets_failed == 1
+
+    @pytest.mark.asyncio
+    async def test_invalid_envelope_dead_lettered_once_as_envelope_failure(
+        self,
+    ) -> None:
+        """An empty tenant_id passes metadata-file.v1.json (which has no
+        tenant_id field at all) but fails dataset-available.v1.json's
+        tenant_id minLength:1 — isolating a failure that is specific to
+        the envelope schema, reached only after metadata.json already
+        validated and was written successfully."""
+        import dataclasses
+
+        work_item = _default_work_item()
+        mock_msg = _mock_work_item_msg(work_item)
+
+        mock_adls = AsyncMock()
+        mock_adls.stream_upload = AsyncMock(return_value=(100, "a" * 64, 10))
+        mock_adls.write_json = AsyncMock()
+        mock_adls.blob_url = AsyncMock(return_value="http://azurite/bronze/x.csv")
+        mock_adls.__aenter__ = AsyncMock(return_value=mock_adls)
+        mock_adls.__aexit__ = AsyncMock(return_value=False)
+
+        mock_tracker = AsyncMock()
+        mock_tracker.get_versions = AsyncMock(return_value=[])
+        mock_tracker.mark_processing = AsyncMock()
+        mock_tracker.mark_failed = AsyncMock()
+        mock_tracker.mark_completed = AsyncMock()
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        emitter = _mock_emitter()
+        bad_config = dataclasses.replace(_historical_config(), tenant_id="")
+
+        captured_stats: list = []
+
+        with (
+            patch("function_app.load_historical_config", return_value=bad_config),
+            patch("function_app.AdlsStore", return_value=mock_adls),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+            patch(
+                "function_app.emit_dataset_metrics",
+                side_effect=lambda s: captured_stats.append(s),
+            ),
+        ):
+            from function_app import historical_worker
+
+            await historical_worker(mock_msg)  # must NOT raise (deterministic)
+
+        # metadata.json has no tenant_id field — it validated and was
+        # written before the envelope build ever ran.
+        mock_adls.write_json.assert_called_once()
+        emitter.emit_cloudevent.assert_not_called()
+        emitter.emit_dead_letter.assert_called_once()
+        dead_letter_body = emitter.emit_dead_letter.call_args.kwargs["message_body"]
+        assert dead_letter_body["error_type"] == "envelope_validation_failure"
+
+        assert len(captured_stats) == 1
+        assert captured_stats[0].datasets_failed == 1
 
 
 class TestRedeliveryAfterTransientEmitFailure:

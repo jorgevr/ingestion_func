@@ -37,6 +37,14 @@ message), never crosses a boundary, and is therefore not part of the root
 `contracts/` registry either (docs/contracts.md §5). There is no copy under
 `specs/` to keep in sync — update it here directly.
 
+**`schemas/contracts/`**: vendored, byte-for-byte copies of root registry
+contracts (`dataset-available.v1.json`, `metadata-file.v1.json` — ADR 0004,
+R2.3); Contract Owner territory, never hand-edited here, re-vendored from
+the root on drift. A CloudEvent's `dataschema` attribute is an *identifier*
+— it equals the vendored contract's own `$id` so a consumer can tell
+exactly which contract revision produced the envelope — not a URL any
+code actually fetches or resolves at runtime.
+
 **Every schema loaded at runtime must live under this directory.** The
 Dockerfile copies `schemas/` into the image but never `specs/` or `docs/`
 (see `Dockerfile`'s `COPY` lines) — a schema path built from `specs/...` or
