@@ -37,7 +37,7 @@ from azure.servicebus.exceptions import (
 from jsonschema import Draft202012Validator, ValidationError
 
 from src.adls_store import AdlsCommitContentionError, AdlsStore
-from src.cloudevents_envelope import build_dataset_envelope
+from src.cloudevents_envelope import EnvelopeValidationError, build_dataset_envelope
 from src.config import load_config, load_historical_config
 from src.file_tracking_store import FileTrackingStore
 from src.idempotency_store import IdempotencyStore
@@ -185,6 +185,19 @@ class DeadLetterSendError(Exception):
     catches this specifically and re-raises it without attempting a second
     dead-letter send (which would very likely fail identically and could
     turn one delivery into an unbounded loop of dead-letter attempts).
+    """
+
+
+class MetadataValidationError(Exception):
+    """Raised when the metadata.json sidecar fails validation against the
+    vendored contract before it is written (ADR 0004 rule 3; R2.3b F4).
+
+    A distinct type so historical_worker can give it its own dead-letter
+    reason code (``metadata_validation_failure``) rather than lumping it in
+    with ``build_dataset_envelope``'s ``EnvelopeValidationError`` or any
+    other failure under one generic reason — an operator looking at the
+    dead-letter queue should be able to tell which artifact's shape was
+    wrong without reading the failure_reason text.
     """
 
 
@@ -825,8 +838,14 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
                 },
             }
             # ADR 0004 rule 3: validate the sidecar against the vendored
-            # contract at write time, not only in tests.
-            _METADATA_FILE_VALIDATOR.validate(metadata_dict)
+            # contract at write time, not only in tests. Raises
+            # MetadataValidationError (not the raw jsonschema error) so the
+            # except handler below can give this its own dead-letter reason
+            # code, distinct from an envelope validation failure.
+            try:
+                _METADATA_FILE_VALIDATOR.validate(metadata_dict)
+            except ValidationError as exc:
+                raise MetadataValidationError(str(exc)) from exc
             await adls.write_json(meta_path, metadata_dict, s3_key=s3_key)
 
             # Emit dataset-available CloudEvent (US3) — before mark_completed;
@@ -930,11 +949,22 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
                     exc_info=True,
                 )
 
+        # Distinct reason codes for the two known validation-failure shapes
+        # (R2.3b F4) — an operator reading the dead-letter queue can tell
+        # which artifact's shape was wrong without parsing failure_reason.
+        # Anything else keeps the generic "dataset_failure" reason.
+        if isinstance(exc, MetadataValidationError):
+            reason = "metadata_validation_failure"
+        elif isinstance(exc, EnvelopeValidationError):
+            reason = "envelope_validation_failure"
+        else:
+            reason = "dataset_failure"
+
         await _dead_letter(
             config,
             logger,
             correlation_id,
-            reason="dataset_failure",
+            reason=reason,
             detail={
                 "file_reference": s3_key or "unknown",
                 "failure_reason": str(exc),

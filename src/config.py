@@ -11,6 +11,7 @@ Provides two config loaders:
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 
@@ -123,6 +124,26 @@ def _require(name: str) -> str:
     return value.strip()
 
 
+# Mirrors contracts/dataset-available.v1.json's mapping_version pattern
+# (schemas/contracts/dataset-available.v1.json, vendored — R2.3). "unknown"
+# is the explicit sentinel for "no field mapping at dataset level"; any
+# other value must be "v<N>". Checked once at startup rather than left to
+# fail validation per-message inside build_dataset_envelope, naming this
+# variable specifically so a bad value is diagnosable from the host-start
+# failure alone (R2.3b F3).
+_MAPPING_VERSION_PATTERN = re.compile(r"^(v[0-9]+|unknown)$")
+
+
+def _validate_mapping_version(value: str) -> str:
+    """Validate MAPPING_VERSION_PVDAQ, raising ConfigurationError (naming
+    the variable) if it doesn't match ``^(v[0-9]+|unknown)$``."""
+    if not _MAPPING_VERSION_PATTERN.match(value):
+        raise ConfigurationError(
+            f"MAPPING_VERSION_PVDAQ must match ^(v[0-9]+|unknown)$, got: {value!r}"
+        )
+    return value
+
+
 def load_config() -> Config:
     """Load and validate configuration from environment variables.
 
@@ -173,9 +194,9 @@ def load_config() -> Config:
         idempotency_table_name=_require("IDEMPOTENCY_TABLE_NAME"),
         table_storage_uri=_require("TableStorageConnection__tableServiceUri"),
         tenant_id=os.environ.get("TENANT_ID", "research").strip(),
-        mapping_version_pvdaq=os.environ.get(
-            "MAPPING_VERSION_PVDAQ", "unknown"
-        ).strip(),
+        mapping_version_pvdaq=_validate_mapping_version(
+            os.environ.get("MAPPING_VERSION_PVDAQ", "unknown").strip()
+        ),
         schema_version_pvdaq=os.environ.get("SCHEMA_VERSION_PVDAQ", "v1").strip(),
     )
 
@@ -248,8 +269,8 @@ def load_historical_config() -> HistoricalConfig:
         data_storage_account_url=os.environ.get("DATA_STORAGE_ACCOUNT_URL", "").strip(),
         bronze_container=_require("BRONZE_CONTAINER"),
         tenant_id=os.environ.get("TENANT_ID", "default").strip(),
-        mapping_version_pvdaq=os.environ.get(
-            "MAPPING_VERSION_PVDAQ", "unknown"
-        ).strip(),
+        mapping_version_pvdaq=_validate_mapping_version(
+            os.environ.get("MAPPING_VERSION_PVDAQ", "unknown").strip()
+        ),
         schema_version_pvdaq=os.environ.get("SCHEMA_VERSION_PVDAQ", "v1").strip(),
     )

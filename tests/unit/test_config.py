@@ -12,6 +12,7 @@ from src.config import (
     ConfigurationError,
     HistoricalConfig,
     _require,
+    _validate_mapping_version,
     load_config,
     load_historical_config,
 )
@@ -179,11 +180,68 @@ class TestDefaults:
 
     def test_explicit_mapping_version_overrides_default(self) -> None:
         env = _base_env()
-        env["MAPPING_VERSION_PVDAQ"] = "1.2.3"
+        env["MAPPING_VERSION_PVDAQ"] = "v2"
         with patch.dict(os.environ, env, clear=True):
             cfg = load_config()
 
-        assert cfg.mapping_version_pvdaq == "1.2.3"
+        assert cfg.mapping_version_pvdaq == "v2"
+
+
+class TestValidateMappingVersionDirectly:
+    """Direct tests for the _validate_mapping_version helper (R2.3b F3):
+    MAPPING_VERSION_PVDAQ must match ^(v[0-9]+|unknown)$, mirroring
+    contracts/dataset-available.v1.json's mapping_version pattern."""
+
+    @pytest.mark.parametrize("value", ["unknown", "v1", "v2", "v23"])
+    def test_accepts_valid_values(self, value: str) -> None:
+        assert _validate_mapping_version(value) == value
+
+    @pytest.mark.parametrize(
+        "value", ["", "1.2.3", "V1", "version1", "v", "vNaN", " unknown"]
+    )
+    def test_rejects_invalid_values(self, value: str) -> None:
+        with pytest.raises(ConfigurationError, match="MAPPING_VERSION_PVDAQ"):
+            _validate_mapping_version(value)
+
+
+class TestMappingVersionValidatedAtStartup:
+    """R2.3b F3 acceptance: a bad MAPPING_VERSION_PVDAQ fails host start
+    (ConfigurationError from the loader itself, naming the variable) — not
+    a per-message jsonschema failure discovered later inside
+    build_dataset_envelope. Covers both loaders, in both the local
+    (connection-string) and cloud (namespace) Service Bus/storage modes —
+    the bad value must be caught regardless of which mode is active."""
+
+    def test_load_config_local_mode_only_with_bad_mapping_version_raises(
+        self,
+    ) -> None:
+        """load_config, local-only settings (connection string; no cloud
+        namespace at all)."""
+        env = _base_env()
+        del env["ServiceBusConnection__fullyQualifiedNamespace"]
+        env["ServiceBusConnection"] = (
+            "Endpoint=sb://localhost;SharedAccessKeyName=Root;"
+            "SharedAccessKey=test;UseDevelopmentEmulator=true;"
+        )
+        env["MAPPING_VERSION_PVDAQ"] = "not-a-version"
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ConfigurationError, match="MAPPING_VERSION_PVDAQ"),
+        ):
+            load_config()
+
+    def test_load_historical_config_cloud_mode_only_with_bad_mapping_version_raises(
+        self,
+    ) -> None:
+        """load_historical_config, cloud-only settings (namespace +
+        account URL; no connection strings at all)."""
+        env = _historical_env()
+        env["MAPPING_VERSION_PVDAQ"] = "V1"
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ConfigurationError, match="MAPPING_VERSION_PVDAQ"),
+        ):
+            load_historical_config()
 
 
 class TestMissingRequired:

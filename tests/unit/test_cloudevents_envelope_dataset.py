@@ -30,6 +30,7 @@ import pytest
 from src.cloudevents_envelope import (
     _DATASET_AVAILABLE_DATASCHEMA,
     _DATASET_AVAILABLE_VALIDATOR,
+    EnvelopeValidationError,
     _deterministic_event_id,
     build_dataset_envelope,
 )
@@ -279,7 +280,7 @@ class TestBuildDatasetEnvelopeValidatesAgainstContract:
         incomplete_data = _data()
         del incomplete_data["file_hash"]
 
-        with pytest.raises(jsonschema.ValidationError):
+        with pytest.raises(EnvelopeValidationError):
             build_dataset_envelope(
                 data=incomplete_data,
                 config=_historical_config(),

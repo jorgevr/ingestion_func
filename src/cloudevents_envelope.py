@@ -13,12 +13,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+import jsonschema
 from jsonschema import Draft202012Validator
 
 from src.config import Config, HistoricalConfig
 
 # Type alias for configs that provide the metadata fields we need
 _ConfigLike = Config | HistoricalConfig
+
+
+class EnvelopeValidationError(Exception):
+    """Raised when a constructed dataset-available envelope fails
+    validation against the vendored contract (R2.3b F4) — distinct from
+    the generic ``jsonschema.ValidationError`` it wraps so
+    ``historical_worker`` can give it its own dead-letter reason code
+    (``envelope_validation_failure``) rather than lumping it in with every
+    other failure under one generic reason."""
+
 
 # Fixed, arbitrary namespace for deriving dataset-available event ids —
 # never changes; changing it would change every future event's id for a
@@ -116,7 +127,7 @@ def build_dataset_envelope(
         envelope contract.
 
     Raises:
-        jsonschema.ValidationError: If the constructed envelope does not
+        EnvelopeValidationError: If the constructed envelope does not
             validate against the vendored contract.
     """
     envelope = {
@@ -136,7 +147,10 @@ def build_dataset_envelope(
         "traceparent": traceparent,
         "data": data,
     }
-    _DATASET_AVAILABLE_VALIDATOR.validate(envelope)
+    try:
+        _DATASET_AVAILABLE_VALIDATOR.validate(envelope)
+    except jsonschema.ValidationError as exc:
+        raise EnvelopeValidationError(str(exc)) from exc
     return envelope
 
 
