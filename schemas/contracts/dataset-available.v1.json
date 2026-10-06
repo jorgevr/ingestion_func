@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jorgevr/anomalIA-app/contracts/dataset-available.v1.json",
+  "title": "solar.pvdaq.dataset.available.v1",
+  "description": "CloudEvents v1.0 envelope emitted by ingestion-func onto the queue raw-energy-events once an exact source copy of a PVDAQ CSV has landed in the bronze container. Consumed by processing-func. Target state per ADR 0002 (versioned type + dataschema), ADR 0003 (correlation_id + real traceparent) and ADR 0005 (blob-form storage_path).",
+  "type": "object",
+  "required": [
+    "specversion",
+    "type",
+    "source",
+    "id",
+    "time",
+    "datacontenttype",
+    "dataschema",
+    "tenant_id",
+    "source_vendor",
+    "schema_version",
+    "mapping_version",
+    "correlation_id",
+    "ingestion_timestamp",
+    "traceparent",
+    "data"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "specversion": {
+      "type": "string",
+      "const": "1.0",
+      "description": "CloudEvents spec version."
+    },
+    "type": {
+      "type": "string",
+      "const": "solar.pvdaq.dataset.available.v1",
+      "description": "ADR 0002: {domain}.{vendor}.{entity}.{action}.v{major}. The consumer MUST assert this value and dead-letter anything else."
+    },
+    "source": {
+      "type": "string",
+      "const": "/energy-ingestion-boundary/pvdaq",
+      "description": "Logical producer identity. Never names a storage layer (ADR 0002 rule 3)."
+    },
+    "id": {
+      "$ref": "#/$defs/uuid",
+      "description": "Unique event identifier. New on every emission, including re-drives."
+    },
+    "time": {
+      "$ref": "#/$defs/timestamp",
+      "description": "CloudEvents emission timestamp."
+    },
+    "datacontenttype": {
+      "type": "string",
+      "const": "application/json",
+      "description": "Content type of the data member. The Service Bus message itself carries application/cloudevents+json (ADR 0002 rule 4)."
+    },
+    "dataschema": {
+      "type": "string",
+      "const": "https://github.com/jorgevr/anomalIA-app/contracts/dataset-available.v1.json",
+      "description": "ADR 0002 rule 2: pins the exact contract in the registry. Equals this schema's $id. A minor (additive) revision keeps the type string and moves this URI."
+    },
+    "tenant_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Tenant identifier from configuration."
+    },
+    "source_vendor": {
+      "type": "string",
+      "const": "PVDAQ",
+      "description": "Vendor identity; first key of the schema-registry lookup."
+    },
+    "schema_version": {
+      "type": "string",
+      "pattern": "^v[0-9]+$",
+      "description": "Vendor record-schema version; second key of the schema-registry lookup."
+    },
+    "mapping_version": {
+      "type": "string",
+      "pattern": "^(v[0-9]+|unknown)$",
+      "description": "Vendor field-mapping version. 'unknown' is the explicit dataset-level sentinel: no field mapping is applied at this level. ADR 0006 narrows this to ^v[0-9]+$ once per-device mappings are published; until then the sentinel MUST be derived from configuration rather than hardcoded (R2.3)."
+    },
+    "correlation_id": {
+      "$ref": "#/$defs/uuid",
+      "description": "ADR 0003 business key: one per ingested file/batch, stable across retries and re-drives. Also set on the Service Bus message's CorrelationId property."
+    },
+    "ingestion_timestamp": {
+      "$ref": "#/$defs/timestamp",
+      "description": "When ingestion finished writing the source copy to bronze."
+    },
+    "traceparent": {
+      "$ref": "#/$defs/traceparent",
+      "description": "ADR 0003: W3C trace context derived from the live span at emission — never synthesised. Also written to the Service Bus application properties; this envelope copy is the durable record that survives replay."
+    },
+    "data": {
+      "type": "object",
+      "description": "Dataset payload. Open by construction: ADR 0002 rule 2 makes additive data fields a minor version, so a consumer validating against this copy must still accept an event carrying a field it has not seen (for example the device_id of ADR 0006). Unknown ENVELOPE attributes, by contrast, are rejected.",
+      "required": [
+        "site_id",
+        "category",
+        "file_format",
+        "storage_path",
+        "version",
+        "ingestion_id",
+        "source_url",
+        "file_size",
+        "file_hash"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "site_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "PVDAQ site identifier."
+        },
+        "category": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Measurement category, e.g. 'ac_power', 'irradiance'."
+        },
+        "file_format": {
+          "type": "string",
+          "const": "csv",
+          "description": "Bronze holds the source bytes as fetched (ADR 0001)."
+        },
+        "storage_path": {
+          "type": "string",
+          "pattern": "^https?://[^ ]+$",
+          "description": "Absolute blob-endpoint URI of the source copy (ADR 0005): https://{account}.blob.core.windows.net/{container}/{path}, or the Azurite http form locally. The abfss:// scheme is no longer emitted, and spaces must be percent-encoded rather than passed literally."
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Append-only ingestion version of this dataset. Emitted today but rejected by the superseded specs/ contract, which closed data with additionalProperties:false — this contract admits it (R1.1)."
+        },
+        "ingestion_id": {
+          "$ref": "#/$defs/uuid",
+          "description": "Identifies this ingestion run. Equals correlation_id for a single-file ingestion."
+        },
+        "source_url": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Originating OEDI S3 URL."
+        },
+        "file_size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Bytes written to bronze."
+        },
+        "file_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 hex digest computed while streaming."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "description": "Lowercase canonical UUID. The pattern is carried alongside the format so validation is deterministic wherever format assertion is disabled."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$",
+      "description": "RFC 3339 timestamp with an explicit offset."
+    },
+    "traceparent": {
+      "type": "string",
+      "pattern": "^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$",
+      "allOf": [
+        {
+          "not": {
+            "pattern": "^00-0{32}-"
+          },
+          "description": "W3C forbids an all-zero trace-id; it is also the signature of a synthesised context (ADR 0003)."
+        },
+        {
+          "not": {
+            "pattern": "-0{16}-[0-9a-f]{2}$"
+          },
+          "description": "W3C forbids an all-zero parent-id."
+        }
+      ]
+    }
+  }
+}
