@@ -4,3 +4,5 @@
 *.bat text eol=crlf
 *.png binary
 *.jpg binary
+# Vendored contracts must stay byte-identical to the root registry (ADR 0004): pin LF
+schemas/contracts/*.json text eol=lf
