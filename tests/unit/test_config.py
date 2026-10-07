@@ -369,9 +369,9 @@ class TestRequireDirectly:
         ):
             _require("EMPTY_VAR")
 
-    def test_require_returns_stripped_value(self) -> None:
-        with patch.dict(os.environ, {"MY_VAR": "  hello  "}, clear=True):
-            assert _require("MY_VAR") == "hello"
+    # CI-3 scenario (c), throwaway: test_require_returns_stripped_value
+    # temporarily deleted here to prove the collected-count check — will be
+    # restored immediately after the proof run.
 
 
 # ---------------------------------------------------------------------------
