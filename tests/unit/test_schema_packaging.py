@@ -39,10 +39,9 @@ def _dockerfile_copied_sources() -> set[str]:
 def _schema_paths_loaded_by_code() -> dict[str, Path]:
     """Every module-level schema path constant the runtime code resolves."""
     import function_app
-    from src import cloudevents_envelope, schema_validator
+    from src import cloudevents_envelope
 
     return {
-        "src/schema_validator.py:_SCHEMA_PATH": schema_validator._SCHEMA_PATH,
         "function_app.py:_WORK_ITEM_SCHEMA_PATH": function_app._WORK_ITEM_SCHEMA_PATH,
         "function_app.py:_METADATA_FILE_SCHEMA_PATH": (
             function_app._METADATA_FILE_SCHEMA_PATH

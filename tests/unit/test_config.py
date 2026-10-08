@@ -8,183 +8,12 @@ from unittest.mock import patch
 import pytest
 
 from src.config import (
-    Config,
     ConfigurationError,
     HistoricalConfig,
     _require,
     _validate_mapping_version,
-    load_config,
     load_historical_config,
 )
-
-
-def _base_env() -> dict[str, str]:
-    """Return a minimal valid set of environment variables."""
-    return {
-        "PVDAQ_SITE_IDS": "2",
-        "PVDAQ_LOOKBACK_HOURS": "24",
-        "PVDAQ_CRON_SCHEDULE": "0 */15 * * * *",
-        "SERVICE_BUS_QUEUE_NAME": "energy-telemetry-ingested",
-        "DEAD_LETTER_QUEUE_NAME": "pvdaq-dead-letter",
-        "ServiceBusConnection__fullyQualifiedNamespace": "test-sb.servicebus.windows.net",
-        "IDEMPOTENCY_TABLE_NAME": "PvdaqIdempotency",
-        "TableStorageConnection__tableServiceUri": "https://teststorage.table.core.windows.net",
-    }
-
-
-class TestLoadConfigValid:
-    """Tests that valid environment variables produce a correctly typed Config."""
-
-    def test_valid_env_returns_config(self) -> None:
-        env = _base_env()
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert isinstance(cfg, Config)
-        assert cfg.pvdaq_site_ids == [2]
-        assert cfg.pvdaq_lookback_hours == 24
-        assert cfg.pvdaq_cron_schedule == "0 */15 * * * *"
-        assert cfg.service_bus_queue_name == "energy-telemetry-ingested"
-        assert cfg.dead_letter_queue_name == "pvdaq-dead-letter"
-        assert (
-            cfg.service_bus_fully_qualified_namespace
-            == "test-sb.servicebus.windows.net"
-        )
-        assert cfg.idempotency_table_name == "PvdaqIdempotency"
-        assert cfg.table_storage_uri == "https://teststorage.table.core.windows.net"
-
-    def test_lookback_hours_parsed_as_int(self) -> None:
-        env = _base_env()
-        env["PVDAQ_LOOKBACK_HOURS"] = "48"
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert cfg.pvdaq_lookback_hours == 48
-        assert isinstance(cfg.pvdaq_lookback_hours, int)
-
-
-class TestSiteIdsParsing:
-    """Tests for PVDAQ_SITE_IDS comma-separated parsing."""
-
-    def test_single_site_id(self) -> None:
-        env = _base_env()
-        env["PVDAQ_SITE_IDS"] = "2"
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert cfg.pvdaq_site_ids == [2]
-
-    def test_multiple_site_ids(self) -> None:
-        env = _base_env()
-        env["PVDAQ_SITE_IDS"] = "2,34,56"
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert cfg.pvdaq_site_ids == [2, 34, 56]
-
-    def test_site_ids_with_spaces(self) -> None:
-        env = _base_env()
-        env["PVDAQ_SITE_IDS"] = "2, 34"
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert cfg.pvdaq_site_ids == [2, 34]
-
-    def test_empty_site_ids_returns_empty_list(self) -> None:
-        env = _base_env()
-        del env["PVDAQ_SITE_IDS"]
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert cfg.pvdaq_site_ids == []
-
-
-class TestOediDefaults:
-    """Tests that OEDI settings fall back to their defaults."""
-
-    def test_oedi_bucket_url_default(self) -> None:
-        env = _base_env()
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert cfg.oedi_bucket_url == "https://oedi-data-lake.s3.amazonaws.com"
-
-    def test_oedi_systems_key_default(self) -> None:
-        env = _base_env()
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert cfg.oedi_systems_key == "pvdaq/csv/systems_20250729.csv"
-
-    def test_oedi_data_prefix_default(self) -> None:
-        env = _base_env()
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert cfg.oedi_data_prefix == "pvdaq/csv/pvdata"
-
-    def test_site_count_default(self) -> None:
-        env = _base_env()
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert cfg.pvdaq_site_count == 30
-
-    def test_custom_oedi_settings(self) -> None:
-        env = _base_env()
-        env["OEDI_BUCKET_URL"] = "https://custom-bucket.s3.amazonaws.com"
-        env["OEDI_SYSTEMS_KEY"] = "pvdaq/csv/systems_20260101.csv"
-        env["PVDAQ_SITE_COUNT"] = "10"
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert cfg.oedi_bucket_url == "https://custom-bucket.s3.amazonaws.com"
-        assert cfg.oedi_systems_key == "pvdaq/csv/systems_20260101.csv"
-        assert cfg.pvdaq_site_count == 10
-
-
-class TestDefaults:
-    """Tests that optional settings fall back to their documented defaults."""
-
-    def test_tenant_id_defaults_to_research(self) -> None:
-        env = _base_env()
-        env.pop("TENANT_ID", None)
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert cfg.tenant_id == "research"
-
-    def test_mapping_version_defaults_to_unknown(self) -> None:
-        env = _base_env()
-        env.pop("MAPPING_VERSION_PVDAQ", None)
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert cfg.mapping_version_pvdaq == "unknown"
-
-    def test_schema_version_defaults_to_v1(self) -> None:
-        env = _base_env()
-        env.pop("SCHEMA_VERSION_PVDAQ", None)
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert cfg.schema_version_pvdaq == "v1"
-
-    def test_explicit_tenant_id_overrides_default(self) -> None:
-        env = _base_env()
-        env["TENANT_ID"] = "production"
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert cfg.tenant_id == "production"
-
-    def test_explicit_mapping_version_overrides_default(self) -> None:
-        env = _base_env()
-        env["MAPPING_VERSION_PVDAQ"] = "v2"
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert cfg.mapping_version_pvdaq == "v2"
 
 
 class TestValidateMappingVersionDirectly:
@@ -208,27 +37,7 @@ class TestMappingVersionValidatedAtStartup:
     """R2.3b F3 acceptance: a bad MAPPING_VERSION_PVDAQ fails host start
     (ConfigurationError from the loader itself, naming the variable) — not
     a per-message jsonschema failure discovered later inside
-    build_dataset_envelope. Covers both loaders, in both the local
-    (connection-string) and cloud (namespace) Service Bus/storage modes —
-    the bad value must be caught regardless of which mode is active."""
-
-    def test_load_config_local_mode_only_with_bad_mapping_version_raises(
-        self,
-    ) -> None:
-        """load_config, local-only settings (connection string; no cloud
-        namespace at all)."""
-        env = _base_env()
-        del env["ServiceBusConnection__fullyQualifiedNamespace"]
-        env["ServiceBusConnection"] = (
-            "Endpoint=sb://localhost;SharedAccessKeyName=Root;"
-            "SharedAccessKey=test;UseDevelopmentEmulator=true;"
-        )
-        env["MAPPING_VERSION_PVDAQ"] = "not-a-version"
-        with (
-            patch.dict(os.environ, env, clear=True),
-            pytest.raises(ConfigurationError, match="MAPPING_VERSION_PVDAQ"),
-        ):
-            load_config()
+    build_dataset_envelope."""
 
     def test_load_historical_config_cloud_mode_only_with_bad_mapping_version_raises(
         self,
@@ -242,110 +51,6 @@ class TestMappingVersionValidatedAtStartup:
             pytest.raises(ConfigurationError, match="MAPPING_VERSION_PVDAQ"),
         ):
             load_historical_config()
-
-
-class TestMissingRequired:
-    """Tests that missing required settings raise ConfigurationError."""
-
-    def test_missing_service_bus_topic_raises(self) -> None:
-        env = _base_env()
-        del env["SERVICE_BUS_QUEUE_NAME"]
-        with (
-            patch.dict(os.environ, env, clear=True),
-            pytest.raises(ConfigurationError, match="SERVICE_BUS_QUEUE_NAME"),
-        ):
-            load_config()
-
-    def test_missing_lookback_hours_raises(self) -> None:
-        env = _base_env()
-        del env["PVDAQ_LOOKBACK_HOURS"]
-        with (
-            patch.dict(os.environ, env, clear=True),
-            pytest.raises(ConfigurationError, match="PVDAQ_LOOKBACK_HOURS"),
-        ):
-            load_config()
-
-    def test_missing_multiple_settings_lists_all(self) -> None:
-        env = _base_env()
-        del env["SERVICE_BUS_QUEUE_NAME"]
-        del env["DEAD_LETTER_QUEUE_NAME"]
-        with (
-            patch.dict(os.environ, env, clear=True),
-            pytest.raises(ConfigurationError, match="SERVICE_BUS_QUEUE_NAME"),
-        ):
-            load_config()
-
-    def test_empty_string_treated_as_missing(self) -> None:
-        env = _base_env()
-        env["SERVICE_BUS_QUEUE_NAME"] = ""
-        with (
-            patch.dict(os.environ, env, clear=True),
-            pytest.raises(ConfigurationError, match="SERVICE_BUS_QUEUE_NAME"),
-        ):
-            load_config()
-
-    def test_whitespace_only_treated_as_missing(self) -> None:
-        env = _base_env()
-        env["SERVICE_BUS_QUEUE_NAME"] = "   "
-        with (
-            patch.dict(os.environ, env, clear=True),
-            pytest.raises(ConfigurationError, match="SERVICE_BUS_QUEUE_NAME"),
-        ):
-            load_config()
-
-    def test_invalid_site_ids_raises(self) -> None:
-        """Non-integer values in PVDAQ_SITE_IDS raise ConfigurationError."""
-        env = _base_env()
-        env["PVDAQ_SITE_IDS"] = "2,abc,34"
-        with (
-            patch.dict(os.environ, env, clear=True),
-            pytest.raises(ConfigurationError, match="comma-separated list of integers"),
-        ):
-            load_config()
-
-
-class TestServiceBusModes:
-    """load_config: local (connection string) vs cloud (namespace + managed
-    identity) Service Bus modes — regression coverage for src/config.py:234's
-    unconditional _require("ServiceBusConnection__fullyQualifiedNamespace"),
-    which crashed load_config()/load_historical_config() in local mode even
-    though the pre-check correctly treated the setting as optional there."""
-
-    def test_local_mode_connection_string_only_succeeds(self) -> None:
-        """Only ServiceBusConnection set, no …__fullyQualifiedNamespace at all."""
-        env = _base_env()
-        del env["ServiceBusConnection__fullyQualifiedNamespace"]
-        env["ServiceBusConnection"] = (
-            "Endpoint=sb://localhost;SharedAccessKeyName=Root;"
-            "SharedAccessKey=test;UseDevelopmentEmulator=true;"
-        )
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert cfg.service_bus_fully_qualified_namespace == ""
-
-    def test_cloud_mode_namespace_only_succeeds(self) -> None:
-        """Only …__fullyQualifiedNamespace set, no ServiceBusConnection at all."""
-        env = _base_env()
-        with patch.dict(os.environ, env, clear=True):
-            cfg = load_config()
-
-        assert (
-            cfg.service_bus_fully_qualified_namespace
-            == "test-sb.servicebus.windows.net"
-        )
-
-    def test_missing_both_raises(self) -> None:
-        env = _base_env()
-        del env["ServiceBusConnection__fullyQualifiedNamespace"]
-        with (
-            patch.dict(os.environ, env, clear=True),
-            pytest.raises(
-                ConfigurationError,
-                match="ServiceBusConnection__fullyQualifiedNamespace",
-            ),
-        ):
-            load_config()
 
 
 class TestRequireDirectly:
@@ -573,9 +278,9 @@ class TestDataStorageConnectionOrAccountUrlRequired:
 
 
 class TestHistoricalServiceBusModes:
-    """load_historical_config: the same local/cloud Service Bus split as
-    Config, and it must not call _require() on the conditional field —
-    regression coverage for src/config.py:234's unconditional _require bug."""
+    """load_historical_config: the local (connection string) vs cloud
+    (namespace + managed identity) Service Bus split — regression coverage
+    for src/config.py:234's unconditional _require bug."""
 
     def test_local_mode_connection_string_only_succeeds(self) -> None:
         """Only ServiceBusConnection set, no …__fullyQualifiedNamespace at all."""

@@ -1,10 +1,16 @@
-"""Azure Functions entry point for PVDAQ ingestion.
+"""Azure Functions entry point for PVDAQ historical ingestion.
 
 Registers:
-- Feature 001: Timer-triggered daily PVDAQ polling (pvdaq_ingestion)
 - Feature 002: Timer-triggered historical dispatcher + queue-triggered worker
 
 Data source: OEDI Data Lake (public S3 bucket).
+
+Feature 001 (the daily-polling ``pvdaq_ingestion`` timer function, its
+per-record pipeline, and the unversioned dataset-available event type it
+emitted — see ``topics.md``'s Retired Event Types table) was retired in
+R2.9: the PVDAQ source only holds historical data, nothing downstream
+consumed the daily path, and it is not part of this service's documented
+data flow (AGENTS.md §2).
 """
 
 from __future__ import annotations
@@ -13,7 +19,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
@@ -38,24 +44,18 @@ from jsonschema import Draft202012Validator, ValidationError
 
 from src.adls_store import AdlsCommitContentionError, AdlsStore
 from src.cloudevents_envelope import EnvelopeValidationError, build_dataset_envelope
-from src.config import load_config, load_historical_config
+from src.config import load_historical_config
 from src.file_tracking_store import FileTrackingStore
-from src.idempotency_store import IdempotencyStore
 from src.observability import (
     DatasetIngestionStats,
-    InvocationStats,
     create_logger,
     emit_dataset_metrics,
-    emit_invocation_metrics,
-    emit_warning_metric,
 )
-from src.oedi_data_lake import OediAccessError, OediDataLakeClient
 from src.oedi_historical_client import (
     OediHistoricalAccessError,
     OediHistoricalClient,
     extract_category,
 )
-from src.record_pipeline import process_record
 from src.service_bus_emitter import ServiceBusEmitter
 
 app = func.FunctionApp()
@@ -82,7 +82,6 @@ app = func.FunctionApp()
 # built from either looks fine on a laptop and 404s in the container.
 # tests/unit/test_schema_packaging.py guards this at the path level.
 # ---------------------------------------------------------------------------
-load_config()
 load_historical_config()
 
 _WORK_ITEM_SCHEMA_PATH = Path(__file__).parent / "schemas" / "work-item.v1.json"
@@ -323,169 +322,6 @@ def _is_transient(exc: BaseException) -> bool:
     return False
 
 
-def _date_range(lookback_hours: int) -> list[tuple[int, int, int]]:
-    """Return a list of (year, month, day) tuples spanning the lookback window."""
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(hours=lookback_hours)
-    dates: list[tuple[int, int, int]] = []
-    current = start.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_of_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    while current <= end_of_today:
-        dates.append((current.year, current.month, current.day))
-        current += timedelta(days=1)
-    return dates
-
-
-@app.timer_trigger(
-    schedule="%PVDAQ_CRON_SCHEDULE%",
-    arg_name="timer",
-    run_on_startup=False,
-)
-async def pvdaq_ingestion(timer: func.TimerRequest) -> None:
-    """Ingest PVDAQ telemetry data on a CRON schedule.
-
-    Pipeline per invocation:
-    1. Generate correlation_id
-    2. Load config
-    3. Resolve site IDs (explicit list or discover from OEDI systems CSV)
-    4. For each site (sequential), for each date in lookback window:
-       a. Fetch daily CSV from OEDI Data Lake
-       b. For each record:
-          - Validate against pvdaq-v1.json
-          - If valid: idempotency check -> enrich with CloudEvents envelope -> emit
-          - If invalid: dead-letter with error metadata
-    5. Log invocation summary
-    """
-    correlation_id = str(uuid4())
-    logger = create_logger(correlation_id)
-    start_time = time.monotonic()
-
-    # Generate a traceparent for this invocation (no inbound trace context on timer triggers)
-    trace_id = uuid4().hex
-    span_id = uuid4().hex[:16]
-    traceparent = f"00-{trace_id}-{span_id}-01"
-
-    config = load_config()
-
-    stats = InvocationStats(source="PVDAQ", correlation_id=correlation_id)
-
-    # Emit warning if mapping_version is the sentinel value
-    if config.mapping_version_pvdaq == "unknown":
-        emit_warning_metric(
-            metric_name="mapping_version_unknown",
-            details={
-                "mapping_version": config.mapping_version_pvdaq,
-                "vendor": "PVDAQ",
-            },
-        )
-
-    logger.info(
-        "PVDAQ ingestion started — lookback_hours=%d",
-        config.pvdaq_lookback_hours,
-    )
-
-    dates = _date_range(config.pvdaq_lookback_hours)
-    failed_sites: list[int] = []
-
-    async with (
-        OediDataLakeClient(
-            bucket_url=config.oedi_bucket_url,
-            systems_key=config.oedi_systems_key,
-            data_prefix=config.oedi_data_prefix,
-        ) as oedi_client,
-        _make_emitter(config) as emitter,
-        IdempotencyStore(
-            table_name=config.idempotency_table_name,
-            table_service_uri=config.table_storage_uri,
-            connection_string=_storage_connection_string(logger),
-        ) as idem_store,
-    ):
-        # Resolve site IDs: use explicit list if configured, otherwise discover
-        if config.pvdaq_site_ids:
-            site_ids = config.pvdaq_site_ids
-            logger.info("Using %d explicitly configured site IDs", len(site_ids))
-        else:
-            all_sites = await oedi_client.fetch_systems_list()
-            site_ids = all_sites[: config.pvdaq_site_count]
-            logger.info(
-                "Discovered %d sites from OEDI, using first %d",
-                len(all_sites),
-                len(site_ids),
-            )
-
-        for site_id in site_ids:
-            for year, month, day in dates:
-                try:
-                    records = await oedi_client.fetch_daily_site_data(
-                        system_id=site_id,
-                        year=year,
-                        month=month,
-                        day=day,
-                    )
-                except OediAccessError as exc:
-                    logger.error(
-                        "Failed to retrieve data for site %d on %04d-%02d-%02d: %s",
-                        site_id,
-                        year,
-                        month,
-                        day,
-                        exc,
-                    )
-                    if site_id not in failed_sites:
-                        failed_sites.append(site_id)
-                    continue
-
-                if not records:
-                    continue
-
-                stats.number_of_records_retrieved += len(records)
-
-                for record in records:
-                    try:
-                        measdatetime = record.get("measdatetime", "")
-                        record_site_id = record.get("SiteID", 0)
-                        await process_record(
-                            record,
-                            config=config,
-                            correlation_id=correlation_id,
-                            traceparent=traceparent,
-                            emitter=emitter,
-                            idem_store=idem_store,
-                            stats=stats,
-                            check_idempotency=lambda site_id=record_site_id, measdatetime=measdatetime: (
-                                idem_store.check_and_reserve(
-                                    site_id=site_id,
-                                    measdatetime=measdatetime,
-                                    correlation_id=correlation_id,
-                                )
-                            ),
-                            mark_completed=lambda site_id=record_site_id, measdatetime=measdatetime: (
-                                idem_store.mark_completed_for(
-                                    site_id=site_id,
-                                    measdatetime=measdatetime,
-                                )
-                            ),
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Error processing record from site %s",
-                            record.get("SiteID", "unknown"),
-                        )
-
-    stats.duration_ms = (time.monotonic() - start_time) * 1000
-    emit_invocation_metrics(stats)
-
-    logger.info(
-        "PVDAQ ingestion completed — retrieved=%d, valid=%d, invalid=%d, emitted=%d, duplicates=%d, failed_sites=%s",
-        stats.number_of_records_retrieved,
-        stats.number_valid,
-        stats.number_invalid,
-        stats.number_emitted,
-        stats.number_duplicates,
-        failed_sites,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Feature 002: Historical PVDAQ ingestion (fan-out dispatcher + worker)
 # ---------------------------------------------------------------------------
@@ -626,7 +462,7 @@ async def historical_worker(msg: func.ServiceBusMessage) -> None:
     4. Construct the stores, resolve the version, mark file as processing
     5. Stream download from S3 + upload to ADLS Gen2 (one-pass, ~4 MiB memory)
     6. Write the metadata.json sidecar
-    7. Emit the solar.pvdaq.dataset.available CloudEvent
+    7. Emit the solar.pvdaq.dataset.available.v1 CloudEvent
     8. Mark file as completed — LAST, because "completed" must mean "event
        published". A transient failure at any of steps 5-7 leaves the
        tracker showing no completed version, so a redelivery of the same

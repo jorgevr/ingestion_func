@@ -1,102 +1,18 @@
-"""Unit tests for structured observability (T032).
+"""Unit tests for structured observability.
 
-Tests cover: InvocationStats dataclass, emit_invocation_metrics() output,
-mapping_version warning metric, and structured log context fields.
+Tests cover: structured log context fields and exception formatting.
+DatasetIngestionStats / emit_dataset_metrics (feature 002) are covered by
+tests/unit/test_file_tracking_store.py and the historical pipeline
+integration tests. InvocationStats / emit_invocation_metrics /
+emit_warning_metric (feature 001 only) were retired in R2.9 along with
+pvdaq_ingestion.
 """
 
 from __future__ import annotations
 
 import logging
 
-import pytest
-
-from src.observability import (
-    InvocationStats,
-    create_logger,
-    emit_invocation_metrics,
-    emit_warning_metric,
-)
-
-
-class TestInvocationStats:
-    """InvocationStats dataclass accumulates pipeline counters."""
-
-    def test_default_values(self) -> None:
-        stats = InvocationStats(source="PVDAQ", correlation_id="test-corr-id")
-        assert stats.source == "PVDAQ"
-        assert stats.number_of_records_retrieved == 0
-        assert stats.number_valid == 0
-        assert stats.number_invalid == 0
-        assert stats.number_emitted == 0
-        assert stats.number_duplicates == 0
-        assert stats.duration_ms == 0.0
-        assert stats.correlation_id == "test-corr-id"
-
-    def test_increment_counters(self) -> None:
-        stats = InvocationStats(source="PVDAQ", correlation_id="test-corr-id")
-        stats.number_of_records_retrieved = 10
-        stats.number_valid = 8
-        stats.number_invalid = 2
-        stats.number_emitted = 8
-        stats.duration_ms = 1234.5
-
-        assert stats.number_of_records_retrieved == 10
-        assert stats.number_emitted == 8
-
-    def test_historical_source(self) -> None:
-        stats = InvocationStats(source="PVDAQ-historical", correlation_id="hist-corr")
-        assert stats.source == "PVDAQ-historical"
-
-
-class TestEmitInvocationMetrics:
-    """emit_invocation_metrics() produces dict with all FR-009 fields."""
-
-    def test_returns_dict_with_all_fields(self) -> None:
-        stats = InvocationStats(
-            source="PVDAQ",
-            correlation_id="test-corr-id",
-            number_of_records_retrieved=10,
-            number_valid=8,
-            number_invalid=2,
-            number_emitted=8,
-            duration_ms=1234.5,
-        )
-
-        result = emit_invocation_metrics(stats)
-
-        assert result["source"] == "PVDAQ"
-        assert result["number_of_records_retrieved"] == 10
-        assert result["number_valid"] == 8
-        assert result["number_invalid"] == 2
-        assert result["number_emitted"] == 8
-        assert result["duration_ms"] == 1234.5
-        assert result["correlation_id"] == "test-corr-id"
-
-    def test_includes_number_duplicates(self) -> None:
-        stats = InvocationStats(
-            source="PVDAQ",
-            correlation_id="test-corr-id",
-            number_duplicates=3,
-        )
-
-        result = emit_invocation_metrics(stats)
-        assert result["number_duplicates"] == 3
-
-
-class TestWarningMetric:
-    """emit_warning_metric() logs a warning with metric details."""
-
-    def test_emits_warning(self, caplog: pytest.LogCaptureFixture) -> None:
-        with caplog.at_level(logging.WARNING):
-            emit_warning_metric(
-                metric_name="mapping_version_unknown",
-                details={"mapping_version": "unknown", "vendor": "PVDAQ"},
-            )
-
-        assert len(caplog.records) >= 1
-        warning_record = caplog.records[-1]
-        assert warning_record.levelname == "WARNING"
-        assert "mapping_version_unknown" in warning_record.getMessage()
+from src.observability import create_logger
 
 
 class TestExceptionFormatting:
@@ -138,11 +54,11 @@ class TestStructuredLogContext:
         logger = create_logger(
             correlation_id="test-corr-id",
             vendor="PVDAQ",
-            function_name="pvdaq_ingestion",
+            function_name="historical_worker",
         )
 
         assert logger.extra["correlation_id"] == "test-corr-id"
-        assert logger.extra["function_name"] == "pvdaq_ingestion"
+        assert logger.extra["function_name"] == "historical_worker"
         assert logger.extra["vendor"] == "PVDAQ"
 
     def test_historical_worker_context(self) -> None:

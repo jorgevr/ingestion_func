@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.service_bus_emitter import ServiceBusEmitter, build_dead_letter_message
+from src.service_bus_emitter import ServiceBusEmitter
 
 
 def _mock_sender() -> AsyncMock:
@@ -140,26 +140,3 @@ class TestCloseLifecycle:
             assert isinstance(emitter, ServiceBusEmitter)
 
         # close() was called via __aexit__
-
-
-class TestBuildDeadLetterMessage:
-    """build_dead_letter_message creates correct dead-letter payload."""
-
-    def test_all_fields_present(self) -> None:
-        msg = build_dead_letter_message(
-            original_payload={"SiteID": 2, "measdatetime": "2026-01-15T12:00:00"},
-            error_details=[
-                {"message": "missing field", "path": "/SiteID", "validator": "required"}
-            ],
-            correlation_id="test-corr",
-            site_id=2,
-            schema_version="v1",
-        )
-
-        assert msg["error_type"] == "validation_failure"
-        assert msg["correlation_id"] == "test-corr"
-        assert msg["site_id"] == 2
-        assert msg["source_vendor"] == "PVDAQ"
-        assert msg["schema_version"] == "v1"
-        assert len(msg["error_details"]) == 1
-        assert "timestamp" in msg

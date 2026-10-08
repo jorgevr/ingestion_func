@@ -3,8 +3,7 @@
   "functionTimeout": "01:10:00",
   "logging": {
     "logLevel": {
-      "default": "Information",
-      "Function.pvdaq_ingest": "Information"
+      "default": "Information"
     },
     "applicationInsights": {
       "samplingSettings": {
