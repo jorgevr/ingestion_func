@@ -49,11 +49,79 @@ jobs:
       - name: Lint (ruff)
         run: ruff check .
 
+      # CI-3: a skipped test (pytest's own exit code is 0 for a run that
+      # only skips, never fails) or a test quietly disappearing from
+      # collection must not look like "everything ran and passed" — both
+      # are checked explicitly below, each with its own distinct failure
+      # so the three failure modes (a real test failure, a skip, an
+      # under-collection) are never confused with one another in the log.
       - name: Test (pytest)
+        shell: bash
         env:
           AZURITE_TEST_CONNECTION: UseDevelopmentStorage=true
-        run: pytest
+          # Collected-test count with AZURITE_TEST_CONNECTION set and
+          # Azurite reachable (0 skipped) as of 2026-10-08 — update when
+          # adding tests.
+          MIN_EXPECTED_TESTS: 444
+        run: |
+          set -uo pipefail
+          pytest -rs 2>&1 | tee pytest-output.log
+          pytest_exit=${PIPESTATUS[0]}
+          echo "pytest exit code: $pytest_exit"
+
+          collected=$(grep -oE '^collected [0-9]+ item' pytest-output.log | tail -1 | grep -oE '[0-9]+' || true)
+          echo "collected: ${collected:-<none found>} (minimum expected: $MIN_EXPECTED_TESTS)"
+
+          status=0
+
+          if grep -q '^SKIPPED ' pytest-output.log; then
+            echo "::error::pytest reported at least one SKIPPED test — a skip must not count as a pass for this required check. See the SKIPPED lines above (printed because of -rs)."
+            status=1
+          fi
+
+          if [ -z "$collected" ] || [ "$collected" -lt "$MIN_EXPECTED_TESTS" ]; then
+            echo "::error::Collected ${collected:-0} tests, fewer than the expected minimum of $MIN_EXPECTED_TESTS — a test may have been deleted, or collection itself failed."
+            status=1
+          fi
+
+          if [ "$pytest_exit" -ne 0 ]; then
+            echo "::error::pytest exited with a non-zero code ($pytest_exit) — see failures above."
+            status=1
+          fi
+
+          exit "$status"
 
       - name: Stop Azurite
         if: always()
         run: docker rm -f azurite
+
+  # Single required check: green only when every job that runs tests,
+  # lint, or contract checks actually ran and actually passed. `if:
+  # always()` is what lets this job evaluate (and fail loudly) even when
+  # `test` itself failed or was skipped — without it, a failed dependency
+  # would skip `gate` too, and a skipped required check still counts as
+  # "passing" for branch protection, defeating the entire point of this job.
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    needs: [test]
+    if: always()
+    steps:
+      - name: Require every needed job to have succeeded
+        run: |
+          # Add every job name here that runs tests, lint, or contract
+          # checks (not deploy jobs) whenever one is added to this
+          # workflow. "skipped" counts as failure, same as "failure" or
+          # "cancelled" — only an exact "success" passes.
+          declare -A results=(
+            [test]="${{ needs.test.result }}"
+          )
+          status=0
+          for job in "${!results[@]}"; do
+            echo "$job: ${results[$job]}"
+            if [ "${results[$job]}" != "success" ]; then
+              echo "::error::Required job '$job' did not succeed (result: ${results[$job]})"
+              status=1
+            fi
+          done
+          exit "$status"
