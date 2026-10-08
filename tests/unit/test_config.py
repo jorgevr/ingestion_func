@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -337,3 +339,25 @@ class TestMissingBothModesNamesBothKeys:
         message = str(exc_info.value)
         assert "ServiceBusConnection__fullyQualifiedNamespace" in message
         assert "DATA_STORAGE_ACCOUNT_URL" in message
+
+
+class TestLocalSettingsTemplateSatisfiesConfig:
+    """R2.9b item 10: local.settings.json.template's keys (after renaming
+    SERVICE_BUS_TOPIC_NAME -> SERVICE_BUS_QUEUE_NAME and dropping the
+    feature-001-only keys) must satisfy load_historical_config() — no
+    'Missing required configuration setting' — so a fresh clone that copies
+    the template to local.settings.json and fills in placeholders has a
+    config that actually loads."""
+
+    def test_template_values_satisfy_load_historical_config(self) -> None:
+        template_path = (
+            Path(__file__).resolve().parent.parent.parent
+            / "local.settings.json.template"
+        )
+        template = json.loads(template_path.read_text(encoding="utf-8"))
+        env = {k: v for k, v in template["Values"].items()}
+
+        with patch.dict(os.environ, env, clear=True):
+            cfg = load_historical_config()
+
+        assert isinstance(cfg, HistoricalConfig)

@@ -51,7 +51,7 @@ class TestEmitCloudevent:
 
         envelope = {
             "specversion": "1.0",
-            "type": "solar.pvdaq.dataset.available",
+            "type": "solar.pvdaq.dataset.available.v1",
             "source_vendor": "PVDAQ",
             "schema_version": "v1",
             "data": {"site_id": 9068},
@@ -64,7 +64,7 @@ class TestEmitCloudevent:
         sent_message = sender.send_messages.call_args[0][0]
         raw_body = b"".join(sent_message.body)
         body = json.loads(raw_body)
-        assert body["type"] == "solar.pvdaq.dataset.available"
+        assert body["type"] == "solar.pvdaq.dataset.available.v1"
 
 
 class TestGetClientCreatesCredential:
@@ -140,3 +140,28 @@ class TestCloseLifecycle:
             assert isinstance(emitter, ServiceBusEmitter)
 
         # close() was called via __aexit__
+
+
+class TestEmitDeadLetterDefaults:
+    """R2.9b item 8: emit_dead_letter's default subject (``emit_dead_letter``
+    is the only remaining dead-letter send path after the legacy
+    ``build_dead_letter_message`` helper was retired in R2.9a) — every
+    production call site passes ``subject`` explicitly, so this default is
+    only exercised by a caller that omits it."""
+
+    @pytest.mark.asyncio
+    async def test_default_subject_is_validation_failure(self) -> None:
+        sender = _mock_sender()
+        client = _mock_client(queue_sender=sender)
+        emitter = ServiceBusEmitter(
+            fully_qualified_namespace="test.servicebus.windows.net",
+            client=client,
+        )
+
+        await emitter.emit_dead_letter(
+            queue_name="pvdaq-dead-letter",
+            message_body={"error_type": "dataset_failure"},
+        )
+
+        sent_message = sender.send_messages.call_args[0][0]
+        assert sent_message.subject == "validation_failure"

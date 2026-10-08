@@ -4,7 +4,7 @@
     "FUNCTIONS_WORKER_RUNTIME": "python",
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
     "OEDI_BUCKET_URL": "https://oedi-data-lake.s3.amazonaws.com",
-    "SERVICE_BUS_TOPIC_NAME": "raw-energy-events",
+    "SERVICE_BUS_QUEUE_NAME": "raw-energy-events",
     "DEAD_LETTER_QUEUE_NAME": "pvdaq-dead-letter",
     "ServiceBusConnection__fullyQualifiedNamespace": "<namespace>.servicebus.windows.net",
     "TableStorageConnection__tableServiceUri": "https://<account>.table.core.windows.net",

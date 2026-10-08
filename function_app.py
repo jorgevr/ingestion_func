@@ -429,6 +429,21 @@ async def historical_dispatcher(timer: func.TimerRequest) -> None:
                     "enqueued_at": datetime.now(timezone.utc).isoformat(),
                     "last_modified": last_modified,
                 }
+                # Validate against the same work-item schema the worker
+                # enforces (R2.9) — a malformed work item is rejected here,
+                # before it ever reaches the queue, rather than being
+                # dispatched and only caught (dead-lettered) by the worker.
+                try:
+                    _WORK_ITEM_VALIDATOR.validate(work_item)
+                except ValidationError as exc:
+                    logger.error(
+                        "Historical dispatcher: constructed work item failed "
+                        "schema validation — site=%d, file=%s: %s",
+                        site_id,
+                        file_name,
+                        exc.message,
+                    )
+                    continue
                 await emitter.send_queue_message(
                     queue_name=config.pvdaq_historical_queue_name,
                     message_body=work_item,
