@@ -272,6 +272,8 @@ class TestBothCredentialModesRunTheSameUploadPath:
             await store.write_json(
                 "source=pvdaq/dataset=1_ac_power/metadata.json", payload, s3_key=s3_key
             )
+
+        # assert that the same upload path was taken in both modes (overwrite=True, metadata includes s3_key)
         blob_client_cloud.upload_blob.assert_called_once()
         assert blob_client_cloud.upload_blob.call_args.kwargs.get("overwrite") is True
         assert blob_client_cloud.upload_blob.call_args.kwargs.get("metadata") == {
