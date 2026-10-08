@@ -280,6 +280,9 @@ class TestBothCredentialModesRunTheSameUploadPath:
             "s3_key": s3_key
         }
 
+    def test_throwaway_red():
+        assert False
+
 
 class TestBlobIdentityCollisionGuard:
     """R2.1f item 1 (restoring R2.1d's design alongside R2.1e's atomic
