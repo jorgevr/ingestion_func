@@ -280,7 +280,6 @@ class TestBothCredentialModesRunTheSameUploadPath:
             "s3_key": s3_key
         }
 
-
 class TestBlobIdentityCollisionGuard:
     """R2.1f item 1 (restoring R2.1d's design alongside R2.1e's atomic
     commit): the identity guard is now two layers —
