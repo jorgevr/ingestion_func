@@ -54,6 +54,29 @@ class TestMappingVersionValidatedAtStartup:
         ):
             load_historical_config()
 
+    def test_load_historical_config_local_mode_only_with_bad_mapping_version_raises(
+        self,
+    ) -> None:
+        """R2.9c item 3: load_historical_config, local-only settings
+        (connection strings; no cloud namespace/account URL at all) — the
+        mapping_version guard must fire in this mode too, not only cloud
+        mode (the only mode TestMappingVersionValidatedAtStartup covered
+        before this test)."""
+        env = _historical_env()
+        del env["ServiceBusConnection__fullyQualifiedNamespace"]
+        env["ServiceBusConnection"] = (
+            "Endpoint=sb://localhost;SharedAccessKeyName=Root;"
+            "SharedAccessKey=test;UseDevelopmentEmulator=true;"
+        )
+        del env["DATA_STORAGE_ACCOUNT_URL"]
+        env["DATA_STORAGE_CONNECTION"] = "UseDevelopmentStorage=true"
+        env["MAPPING_VERSION_PVDAQ"] = "not-a-version"
+        with (
+            patch.dict(os.environ, env, clear=True),
+            pytest.raises(ConfigurationError, match="MAPPING_VERSION_PVDAQ"),
+        ):
+            load_historical_config()
+
 
 class TestRequireDirectly:
     """Direct tests for the _require helper function."""

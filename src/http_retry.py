@@ -1,7 +1,6 @@
 """Shared HTTP retry helper with exponential backoff.
 
-Used by both OediDataLakeClient (feature 001) and OediHistoricalClient
-(feature 002) to avoid duplicating retry logic.
+Used by OediHistoricalClient (feature 002) to avoid duplicating retry logic.
 """
 
 from __future__ import annotations

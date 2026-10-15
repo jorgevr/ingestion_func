@@ -10,9 +10,11 @@ pvdaq_ingestion.
 
 from __future__ import annotations
 
+import io
+import json
 import logging
 
-from src.observability import create_logger
+from src.observability import _JsonFormatter, create_logger
 
 
 class TestExceptionFormatting:
@@ -79,3 +81,29 @@ class TestStructuredLogContext:
         )
 
         assert logger.extra["function_name"] == "historical_dispatcher"
+
+    def test_log_record_emits_correlation_context_as_json(self) -> None:
+        """R2.9c item 2: drives _CorrelatedAdapter.process's extras
+        injection (observability.py:51-56) through an actual logger.info()
+        call, and _JsonFormatter's hasattr branches that pick those extras
+        back up (observability.py:35,37,39) — previously 0% coverage
+        because every other caller either reads ``logger.extra`` directly
+        (never logs through it) or patches create_logger with a MagicMock."""
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(_JsonFormatter())
+
+        logger = create_logger(
+            correlation_id="corr-xyz", vendor="PVDAQ", function_name="historical_worker"
+        )
+        logger.logger.addHandler(handler)
+        try:
+            logger.info("doing work")
+        finally:
+            logger.logger.removeHandler(handler)
+
+        emitted = json.loads(stream.getvalue().strip())
+        assert emitted["correlation_id"] == "corr-xyz"
+        assert emitted["function_name"] == "historical_worker"
+        assert emitted["vendor"] == "PVDAQ"
+        assert emitted["message"] == "doing work"

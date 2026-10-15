@@ -6,6 +6,7 @@ import httpx
 import pytest
 import respx
 
+from src.http_retry import get_with_retry
 from src.oedi_historical_client import OediHistoricalAccessError, OediHistoricalClient
 
 BUCKET_URL = "https://oedi-data-lake.s3.amazonaws.com"
@@ -231,6 +232,43 @@ class TestStreamCsvRows:
         async for row in client.stream_csv_rows(s3_key):
             rows.append(row)
         assert rows == []
+
+
+class _FlakyConnectTransport(httpx.AsyncBaseTransport):
+    """Raises httpx.ConnectError on the first *fail_times* requests, then
+    returns *response* — used to drive get_with_retry's connection-error
+    retry arm (src/http_retry.py:70-82) without mocking at the respx layer,
+    since that arm triggers on a transport-level exception, not an HTTP
+    response respx can return."""
+
+    def __init__(self, fail_times: int, response: httpx.Response) -> None:
+        self.calls = 0
+        self.fail_times = fail_times
+        self.response = response
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise httpx.ConnectError("connection refused")
+        return self.response
+
+
+class TestGetWithRetryConnectionErrors:
+    """R2.9c item 1: src/http_retry.py:70-82 (the ConnectError/TimeoutError
+    retry arm) had 0% coverage — every existing retry test here drives the
+    5xx-status-code arm instead."""
+
+    @pytest.mark.asyncio
+    async def test_connect_error_retries_twice_then_succeeds(self) -> None:
+        url = "https://example.test/flaky"
+        success = httpx.Response(200, request=httpx.Request("GET", url))
+        transport = _FlakyConnectTransport(fail_times=2, response=success)
+
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            result = await get_with_retry(http_client, url)
+
+        assert transport.calls == 3
+        assert result.status_code == 200
 
 
 class TestOediHistoricalClientLifecycle:
