@@ -7,6 +7,7 @@ Tests cover:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -108,6 +109,50 @@ class TestDispatcherIntegration:
         assert "category" in work_item
         assert "correlation_id" in work_item
         assert "enqueued_at" in work_item
+        # R2.9b item 7
+        assert first_call.kwargs["subject"] == "historical_work_item"
+
+    @pytest.mark.asyncio
+    async def test_dispatcher_rejects_malformed_work_item_before_send(self) -> None:
+        """R2.9b item 6: a work item that fails schema validation (here,
+        site_id=0 violates work-item.v1.json's ``minimum: 1``) is rejected
+        before send_queue_message is ever called — not dispatched and only
+        caught downstream by the worker."""
+        files = [_file_info(0, "0_ac_power_data.csv")]
+
+        mock_oedi = AsyncMock()
+        mock_oedi.list_csv_files = AsyncMock(side_effect=[files])
+        mock_oedi.__aenter__ = AsyncMock(return_value=mock_oedi)
+        mock_oedi.__aexit__ = AsyncMock(return_value=False)
+
+        mock_tracker = AsyncMock()
+        mock_tracker.get_unprocessed_files = AsyncMock(side_effect=[files])
+        mock_tracker.mark_queued = AsyncMock()
+        mock_tracker.__aenter__ = AsyncMock(return_value=mock_tracker)
+        mock_tracker.__aexit__ = AsyncMock(return_value=False)
+
+        mock_emitter = AsyncMock()
+        mock_emitter.send_queue_message = AsyncMock()
+        mock_emitter.__aenter__ = AsyncMock(return_value=mock_emitter)
+        mock_emitter.__aexit__ = AsyncMock(return_value=False)
+
+        config = dataclasses.replace(
+            _historical_config(), pvdaq_historical_site_ids=[0]
+        )
+
+        with (
+            patch("function_app.load_historical_config", return_value=config),
+            patch("function_app.OediHistoricalClient", return_value=mock_oedi),
+            patch("function_app.FileTrackingStore", return_value=mock_tracker),
+            patch("function_app.ServiceBusEmitter", return_value=mock_emitter),
+            patch("function_app.create_logger", return_value=MagicMock()),
+        ):
+            from function_app import historical_dispatcher
+
+            timer = MagicMock()
+            await historical_dispatcher(timer)
+
+        mock_emitter.send_queue_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_dispatcher_skips_already_processed(self) -> None:

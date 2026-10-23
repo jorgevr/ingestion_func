@@ -1,50 +1,18 @@
 """Service Bus SDK sender for PVDAQ ingestion function.
 
-Sends validated CloudEvents to a Service Bus topic, and routes validation
+Sends validated CloudEvents to a Service Bus topic, and routes dataset
 failures to a dead-letter queue.
 """
 
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from types import TracebackType
 from typing import Any, Self
 
 from azure.identity.aio import DefaultAzureCredential
 from azure.servicebus import ServiceBusMessage
 from azure.servicebus.aio import ServiceBusClient, ServiceBusSender
-
-
-def build_dead_letter_message(
-    original_payload: dict,
-    error_details: list[dict],
-    correlation_id: str,
-    site_id: int | None,
-    schema_version: str,
-) -> dict:
-    """Construct a dead-letter message matching the dead-letter-message.json contract.
-
-    Args:
-        original_payload: The raw PVDAQ record that failed validation.
-        error_details: List of validation error dicts (message, path, validator).
-        correlation_id: Invocation correlation ID for tracing.
-        site_id: PVDAQ site ID if available, otherwise ``None``.
-        schema_version: Schema version used for validation (e.g. ``"v1"``).
-
-    Returns:
-        A dict conforming to ``specs/001-pvdaq-ingestion/contracts/dead-letter-message.json``.
-    """
-    return {
-        "original_payload": original_payload,
-        "error_type": "validation_failure",
-        "error_details": error_details,
-        "correlation_id": correlation_id,
-        "site_id": site_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "source_vendor": "PVDAQ",
-        "schema_version": schema_version,
-    }
 
 
 class ServiceBusEmitter:

@@ -1,9 +1,9 @@
 """OEDI Data Lake client for PVDAQ historical CSV files (feature 002).
 
 Lists and streams CSV files from the 2023-solar-data-prize prefix on
-the public S3 bucket at https://oedi-data-lake.s3.amazonaws.com.
+the public S3 bucket at https://oedi-data-lake.s3.amazonaws.com. Key
+characteristics of this client:
 
-Key differences from the feature 001 ``OediDataLakeClient``:
 - Uses S3 ListObjectsV2 XML API to discover files
 - Streams CSV rows via chunked byte download (bounded memory)
 - Handles pagination for large site listings

@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.service_bus_emitter import ServiceBusEmitter, build_dead_letter_message
+from src.service_bus_emitter import ServiceBusEmitter
 
 
 def _mock_sender() -> AsyncMock:
@@ -51,7 +51,7 @@ class TestEmitCloudevent:
 
         envelope = {
             "specversion": "1.0",
-            "type": "solar.pvdaq.dataset.available",
+            "type": "solar.pvdaq.dataset.available.v1",
             "source_vendor": "PVDAQ",
             "schema_version": "v1",
             "data": {"site_id": 9068},
@@ -64,7 +64,7 @@ class TestEmitCloudevent:
         sent_message = sender.send_messages.call_args[0][0]
         raw_body = b"".join(sent_message.body)
         body = json.loads(raw_body)
-        assert body["type"] == "solar.pvdaq.dataset.available"
+        assert body["type"] == "solar.pvdaq.dataset.available.v1"
 
 
 class TestGetClientCreatesCredential:
@@ -142,24 +142,26 @@ class TestCloseLifecycle:
         # close() was called via __aexit__
 
 
-class TestBuildDeadLetterMessage:
-    """build_dead_letter_message creates correct dead-letter payload."""
+class TestEmitDeadLetterDefaults:
+    """R2.9b item 8: emit_dead_letter's default subject (``emit_dead_letter``
+    is the only remaining dead-letter send path after the legacy
+    ``build_dead_letter_message`` helper was retired in R2.9a) — every
+    production call site passes ``subject`` explicitly, so this default is
+    only exercised by a caller that omits it."""
 
-    def test_all_fields_present(self) -> None:
-        msg = build_dead_letter_message(
-            original_payload={"SiteID": 2, "measdatetime": "2026-01-15T12:00:00"},
-            error_details=[
-                {"message": "missing field", "path": "/SiteID", "validator": "required"}
-            ],
-            correlation_id="test-corr",
-            site_id=2,
-            schema_version="v1",
+    @pytest.mark.asyncio
+    async def test_default_subject_is_validation_failure(self) -> None:
+        sender = _mock_sender()
+        client = _mock_client(queue_sender=sender)
+        emitter = ServiceBusEmitter(
+            fully_qualified_namespace="test.servicebus.windows.net",
+            client=client,
         )
 
-        assert msg["error_type"] == "validation_failure"
-        assert msg["correlation_id"] == "test-corr"
-        assert msg["site_id"] == 2
-        assert msg["source_vendor"] == "PVDAQ"
-        assert msg["schema_version"] == "v1"
-        assert len(msg["error_details"]) == 1
-        assert "timestamp" in msg
+        await emitter.emit_dead_letter(
+            queue_name="pvdaq-dead-letter",
+            message_body={"error_type": "dataset_failure"},
+        )
+
+        sent_message = sender.send_messages.call_args[0][0]
+        assert sent_message.subject == "validation_failure"

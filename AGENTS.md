@@ -10,11 +10,17 @@ emitted to Service Bus (`raw-energy-events` queue and dead-letter queue).
 
 ## 2. Structure
 
-- `function_app.py` — entry points: `pvdaq_ingestion` (timer, daily), `historical_dispatcher`
-  (timer, discovers historical files), `historical_worker` (Service Bus queue trigger, streams
-  S3 → ADLS per file).
-- `src/` — implementation: OEDI clients, ADLS/table/Service Bus stores, schema validation,
-  the shared `record_pipeline.py` (validate → dead-letter → idempotency → emit), observability.
+- `function_app.py` — entry points: `historical_dispatcher` (timer, discovers historical
+  files via S3 ListObjectsV2, validates + enqueues one work item per file) and
+  `historical_worker` (Service Bus queue trigger: streams S3 → ADLS per file, writes the
+  `metadata.json` sidecar, builds + validates the dataset-available CloudEvent, emits it,
+  then marks the file completed). The legacy `pvdaq_ingestion` daily-polling function and
+  its per-record pipeline were retired in R2.9 — the PVDAQ source holds only historical
+  data, and nothing downstream consumed it.
+- `src/` — implementation: `oedi_historical_client.py` (S3 listing + streaming),
+  `adls_store.py`/`file_tracking_store.py`/`service_bus_emitter.py` (ADLS/table/Service Bus
+  stores), `cloudevents_envelope.py` (dataset-available envelope builder, contract-validated),
+  `config.py`, `observability.py`.
 - `schemas/` — JSON Schema contracts (shared — see §5).
 - `tests/unit/`, `tests/contract/`, `tests/integration/` — see §3.
 - `specs/` — spec-kit feature specs.
@@ -28,20 +34,26 @@ Run from this directory (repo root; tests import `src.*`).
 | Setup | `pip install -r requirements-dev.txt` | Works. |
 | Lint | `ruff check .` | Works — passes clean. `ruff.toml` excludes `.claude/` and `specs/`. |
 | Format check | `ruff format --check .` | Works — passes clean (same excludes). |
-| Unit + contract tests | `pytest tests/unit tests/contract` | Works — 173 passed. |
-| All tests | `pytest` | Works — 197 passed. `tests/integration/` is fully mocked (respx/`AsyncMock`); no live Azurite/Service Bus needed to pass today. |
+| Unit + contract tests | `pytest tests/unit tests/contract` | Works — 281 passed. `tests/contract/` holds `test_cloudevents_envelope_dataset.py` (the dataset-available envelope vs. the vendored contract) — moved here from `tests/unit/` in R2.9c; it was an empty package before that. |
+| All tests | `pytest` | Works — 332 passed. Almost all of `tests/integration/` is mocked (respx/`AsyncMock`); one test (`test_adls_store_azurite.py`, marked `azurite`) needs a live Azurite and is skipped unless `AZURITE_TEST_CONNECTION` is set. |
 | Run locally | `func start` | **Not run.** Needs Azurite + Service Bus emulator from the workspace root `docker-compose.yml`. |
 
 No separate build step (Python, no compile).
 
 ## 4. Conventions
 
-- **Shared pipeline, not per-function duplication:** both timer functions funnel
-  per-record work through `src/record_pipeline.py::process_record` (validate → dead-letter
-  → idempotency check → build CloudEvents envelope → emit → mark completed).
-- **Idempotency:** write-before-emit via `IdempotencyStore` (Azure Table Storage conditional
-  insert, `IdempotencyResult.NEW/DUPLICATE/RETRY_EMIT`). Historical file processing uses the
-  same pattern via `FileTrackingStore` (`mark_queued` before send, `mark_completed` after).
+- **One dataset-level pipeline, inline in `function_app.py`:** there is no separate
+  per-record pipeline module anymore (`src/record_pipeline.py` and its `process_record`
+  were retired in R2.9 along with `pvdaq_ingestion`). `historical_dispatcher` validates
+  each work item against `schemas/work-item.v1.json` immediately before
+  `send_queue_message`; `historical_worker` runs one guarded sequence per message:
+  parse body → validate work item → stream S3→ADLS → write + validate `metadata.json`
+  → build + validate the dataset-available CloudEvent → emit → mark completed (last,
+  so "completed" means "event published").
+- **Idempotency:** file-level only, via `FileTrackingStore` (Azure Table Storage) —
+  `mark_queued` before the dispatcher sends a work item, `mark_processing`/`mark_completed`/
+  `mark_failed` around the worker's run. There is no per-record idempotency store anymore
+  (`src/idempotency_store.py` was feature-001-only and was retired in R2.9).
 - **Retries:** outbound HTTP to OEDI goes through `src/http_retry.py::get_with_retry`
   (shared helper, exponential backoff, 3 retries, 404s returned as-is) — do not
   reimplement retry loops in new OEDI clients.
@@ -49,11 +61,16 @@ No separate build step (Python, no compile).
   `DefaultAzureCredential` (async) — no connection strings/keys in code.
 - **Logging:** structured JSON only, via `src/observability.py::create_logger`
   (`_CorrelatedAdapter`), never bare `print`/`logging.getLogger` in function code —
-  every log line carries `correlation_id`, `function_name`, `vendor`. Metrics are
-  emitted through `emit_dataset_metrics`/`emit_invocation_metrics`/`emit_warning_metric`,
-  not ad hoc log statements. No OpenTelemetry/App Insights SDK is wired in yet.
-- **Validation failures never raise into the trigger:** invalid records are routed to
-  the dead-letter queue (`build_dead_letter_message`) instead of failing the invocation.
+  every log line carries `correlation_id`, `function_name`, `vendor`. Dataset-level
+  metrics are emitted through `emit_dataset_metrics`, not ad hoc log statements. No
+  OpenTelemetry/App Insights SDK is wired in yet.
+- **Validation/processing failures never raise into the trigger:** every dead-letter send
+  routes through `function_app.py::_dead_letter`, a single choke point that tags the
+  message with a distinct reason code (`malformed_body`, `validation_failure`,
+  `metadata_validation_failure`, `envelope_validation_failure`, `dataset_failure`) instead
+  of failing the invocation outright. A transient failure in the dead-letter send itself
+  (`DeadLetterSendError`) re-raises so the original message is redelivered rather than
+  silently dropped.
 
 ## 5. Boundaries
 

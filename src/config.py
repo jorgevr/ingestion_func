@@ -3,9 +3,9 @@
 Reads all settings from os.environ, parses typed values, and raises
 ConfigurationError on missing required settings.
 
-Provides two config loaders:
-- load_config(): Feature 001 — daily PVDAQ polling
-- load_historical_config(): Feature 002 — historical PVDAQ CSV ingestion
+Provides load_historical_config() for feature 002 (historical PVDAQ CSV
+ingestion). Feature 001's daily-polling Config/load_config() was retired in
+R2.9 along with the pvdaq_ingestion function.
 """
 
 from __future__ import annotations
@@ -17,36 +17,6 @@ from dataclasses import dataclass
 
 class ConfigurationError(Exception):
     """Raised when a required configuration setting is missing or invalid."""
-
-
-@dataclass(frozen=True)
-class Config:
-    """Typed configuration for the PVDAQ ingestion function."""
-
-    # OEDI Data Lake settings
-    oedi_bucket_url: str
-    oedi_systems_key: str
-    oedi_data_prefix: str
-
-    # Site selection (optional explicit list; if empty, discover from systems CSV)
-    pvdaq_site_ids: list[int]
-    pvdaq_site_count: int
-    pvdaq_lookback_hours: int
-    pvdaq_cron_schedule: str
-
-    # Service Bus
-    service_bus_queue_name: str
-    dead_letter_queue_name: str
-    service_bus_fully_qualified_namespace: str
-
-    # Idempotency
-    idempotency_table_name: str
-    table_storage_uri: str
-
-    # Metadata
-    tenant_id: str
-    mapping_version_pvdaq: str
-    schema_version_pvdaq: str
 
 
 @dataclass(frozen=True)
@@ -83,15 +53,6 @@ class HistoricalConfig:
     mapping_version_pvdaq: str
     schema_version_pvdaq: str
 
-
-_REQUIRED_SETTINGS: list[str] = [
-    "PVDAQ_LOOKBACK_HOURS",
-    "PVDAQ_CRON_SCHEDULE",
-    "SERVICE_BUS_QUEUE_NAME",
-    "DEAD_LETTER_QUEUE_NAME",
-    "IDEMPOTENCY_TABLE_NAME",
-    "TableStorageConnection__tableServiceUri",
-]
 
 # Required only when ServiceBusConnection (connection string) is not set
 _REQUIRED_WHEN_NO_CONN_STR: list[str] = [
@@ -142,63 +103,6 @@ def _validate_mapping_version(value: str) -> str:
             f"MAPPING_VERSION_PVDAQ must match ^(v[0-9]+|unknown)$, got: {value!r}"
         )
     return value
-
-
-def load_config() -> Config:
-    """Load and validate configuration from environment variables.
-
-    Returns:
-        A fully populated Config instance.
-
-    Raises:
-        ConfigurationError: If any required setting is missing or invalid.
-    """
-    missing = [
-        name for name in _REQUIRED_SETTINGS if not os.environ.get(name, "").strip()
-    ]
-    if not os.environ.get("ServiceBusConnection", "").strip():
-        missing += [
-            n for n in _REQUIRED_WHEN_NO_CONN_STR if not os.environ.get(n, "").strip()
-        ]
-    if missing:
-        raise ConfigurationError(
-            f"Missing required configuration setting(s): {', '.join(missing)}"
-        )
-
-    # PVDAQ_SITE_IDS is optional — if not set, sites will be discovered from OEDI systems CSV
-    raw_site_ids = os.environ.get("PVDAQ_SITE_IDS", "").strip()
-    site_ids = _parse_site_ids(raw_site_ids) if raw_site_ids else []
-
-    return Config(
-        oedi_bucket_url=os.environ.get(
-            "OEDI_BUCKET_URL", "https://oedi-data-lake.s3.amazonaws.com"
-        ).strip(),
-        oedi_systems_key=os.environ.get(
-            "OEDI_SYSTEMS_KEY", "pvdaq/csv/systems_20250729.csv"
-        ).strip(),
-        oedi_data_prefix=os.environ.get("OEDI_DATA_PREFIX", "pvdaq/csv/pvdata").strip(),
-        pvdaq_site_ids=site_ids,
-        pvdaq_site_count=int(os.environ.get("PVDAQ_SITE_COUNT", "30").strip()),
-        pvdaq_lookback_hours=int(_require("PVDAQ_LOOKBACK_HOURS")),
-        pvdaq_cron_schedule=_require("PVDAQ_CRON_SCHEDULE"),
-        service_bus_queue_name=_require("SERVICE_BUS_QUEUE_NAME"),
-        dead_letter_queue_name=_require("DEAD_LETTER_QUEUE_NAME"),
-        # Not _require(): the "missing" check above already guarantees at
-        # least one of ServiceBusConnection / …__fullyQualifiedNamespace is
-        # set; when the former (a connection string) covers it, this may
-        # legitimately be blank — _make_emitter re-checks ServiceBusConnection
-        # directly and never reads this field in that branch.
-        service_bus_fully_qualified_namespace=os.environ.get(
-            "ServiceBusConnection__fullyQualifiedNamespace", ""
-        ).strip(),
-        idempotency_table_name=_require("IDEMPOTENCY_TABLE_NAME"),
-        table_storage_uri=_require("TableStorageConnection__tableServiceUri"),
-        tenant_id=os.environ.get("TENANT_ID", "research").strip(),
-        mapping_version_pvdaq=_validate_mapping_version(
-            os.environ.get("MAPPING_VERSION_PVDAQ", "unknown").strip()
-        ),
-        schema_version_pvdaq=os.environ.get("SCHEMA_VERSION_PVDAQ", "v1").strip(),
-    )
 
 
 _HISTORICAL_REQUIRED_SETTINGS: list[str] = [
@@ -257,7 +161,11 @@ def load_historical_config() -> HistoricalConfig:
         pvdaq_historical_queue_name=_require("PVDAQ_HISTORICAL_QUEUE_NAME"),
         service_bus_queue_name=_require("SERVICE_BUS_QUEUE_NAME"),
         dead_letter_queue_name=_require("DEAD_LETTER_QUEUE_NAME"),
-        # Not _require() — see load_config() above for the same reasoning.
+        # Not _require(): the "missing" check above already guarantees at
+        # least one of ServiceBusConnection / …__fullyQualifiedNamespace is
+        # set; when the former (a connection string) covers it, this may
+        # legitimately be blank — _make_emitter re-checks ServiceBusConnection
+        # directly and never reads this field in that branch.
         service_bus_fully_qualified_namespace=os.environ.get(
             "ServiceBusConnection__fullyQualifiedNamespace", ""
         ).strip(),

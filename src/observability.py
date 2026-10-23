@@ -2,8 +2,8 @@
 
 Emits JSON-formatted log entries that include correlation_id, function_name,
 and vendor in every message.  Provides a factory function to create
-preconfigured LoggerAdapter instances, plus custom metrics for FR-009
-telemetry.
+preconfigured LoggerAdapter instances, plus custom metrics for FR-011
+(dataset-level) telemetry.
 """
 
 from __future__ import annotations
@@ -77,14 +77,14 @@ def _ensure_handler() -> None:
 def create_logger(
     correlation_id: str,
     vendor: str = "PVDAQ",
-    function_name: str = "pvdaq_ingestion",
+    function_name: str = "historical_worker",
 ) -> logging.LoggerAdapter:
     """Create a structured logger with correlation context.
 
     Args:
         correlation_id: Unique identifier for tracing a single invocation.
         vendor: Data vendor name (default ``"PVDAQ"``).
-        function_name: Name of the Azure Function (default ``"pvdaq_ingestion"``).
+        function_name: Name of the Azure Function (default ``"historical_worker"``).
 
     Returns:
         A ``logging.LoggerAdapter`` that injects *correlation_id*,
@@ -103,49 +103,7 @@ def create_logger(
     )
 
 
-@dataclass
-class InvocationStats:
-    """Accumulates pipeline counters for a single invocation.
-
-    Used by ``emit_invocation_metrics`` to produce the FR-009 telemetry
-    summary at the end of each invocation.
-    """
-
-    source: str
-    correlation_id: str
-    number_of_records_retrieved: int = 0
-    number_valid: int = 0
-    number_invalid: int = 0
-    number_emitted: int = 0
-    number_duplicates: int = 0
-    duration_ms: float = 0.0
-
-
 _metrics_logger = logging.getLogger("ingestion.metrics")
-
-
-def emit_invocation_metrics(stats: InvocationStats) -> dict[str, Any]:
-    """Log a structured telemetry summary for the completed invocation.
-
-    Args:
-        stats: Accumulated counters from pipeline execution.
-
-    Returns:
-        The telemetry dict (for testing / further processing).
-    """
-    metrics: dict[str, Any] = {
-        "source": stats.source,
-        "number_of_records_retrieved": stats.number_of_records_retrieved,
-        "number_valid": stats.number_valid,
-        "number_invalid": stats.number_invalid,
-        "number_emitted": stats.number_emitted,
-        "number_duplicates": stats.number_duplicates,
-        "duration_ms": stats.duration_ms,
-        "correlation_id": stats.correlation_id,
-    }
-
-    _metrics_logger.info("Invocation metrics: %s", json.dumps(metrics, default=str))
-    return metrics
 
 
 @dataclass
@@ -187,15 +145,3 @@ def emit_dataset_metrics(stats: DatasetIngestionStats) -> dict[str, Any]:
     }
     _metrics_logger.info("Dataset metrics: %s", json.dumps(metrics, default=str))
     return metrics
-
-
-def emit_warning_metric(metric_name: str, details: dict[str, Any]) -> None:
-    """Log a warning-level metric for operational alerting.
-
-    Args:
-        metric_name: Name of the warning metric (e.g. ``mapping_version_unknown``).
-        details: Contextual key-value pairs for the warning.
-    """
-    _metrics_logger.warning(
-        "Warning metric [%s]: %s", metric_name, json.dumps(details, default=str)
-    )
