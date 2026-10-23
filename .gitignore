@@ -53,3 +53,4 @@ Thumbs.db
 cov_annotate/
 
 .agents/
+.codex/
