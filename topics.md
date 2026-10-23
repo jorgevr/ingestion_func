@@ -19,9 +19,10 @@ for downstream processing layers.
 
 | Event Type | Retired | Notes |
 | --- | --- | --- |
+| `raw.pvdaq.generation.v1` | 2026-03-09 | Superseded by `solar.pvdaq.dataset.available.v1` |
 | `raw.pvdaq.historical.v1` | 2026-03-09 | Superseded by `solar.pvdaq.dataset.available.v1` |
+| `solar.pvdaq.dataset.available` (unversioned) | 2026-10-05 | Superseded by `solar.pvdaq.dataset.available.v1` (ADR 0002, R2.3) |
 
-The unversioned `solar.pvdaq.dataset.available` type and the `raw.pvdaq.generation.v1` type it
-superseded were both emitted only by `pvdaq_ingestion` (feature 001, daily polling), which was
-retired entirely in R2.9 — neither type is emitted by any surviving code path, so their rows
-were removed rather than added here.
+`pvdaq_ingestion` (feature 001, daily polling), the only emitter of the first and third rows
+above, was retired entirely in R2.9 — their rows remain listed here as retired rather than
+being removed.
