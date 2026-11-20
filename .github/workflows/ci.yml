@@ -49,6 +49,9 @@ jobs:
       - name: Lint (ruff)
         run: ruff check .
 
+      - name: Format check (ruff)
+        run: ruff format --check .
+
       # CI-3: a skipped test (pytest's own exit code is 0 for a run that
       # only skips, never fails) or a test quietly disappearing from
       # collection must not look like "everything ran and passed" — both
